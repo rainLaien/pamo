@@ -44,11 +44,37 @@ We offer three meshes stored under `./mesh` folder (from [DTC dataset](https://a
 python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 ```
 
-- **`--input`**: Specify the path to the input mesh file. If not provided, it defaults to `./mesh/crab.obj`.
+- **`--input`**: Specify the path to the input mesh file. OBJ, STL, and PLY triangle meshes are supported. STL and PLY inputs are automatically cleaned by welding duplicate vertices and removing duplicate or degenerate faces. Point-cloud-only PLY files are not supported. If not provided, it defaults to `./mesh/crab.obj`.
+- **`--output`**: Specify the output mesh path. Use a `.ply` suffix to export PLY geometry.
 - **`--ratio`**: Set the simplification ratio to control the target reduction in the number of triangles. For example, `--ratio 0.001` (default) means reducing the number of triangles to 0.1% of the original.
 - **`--min-vertex`**: Add this flag to constrain the minimum number of vertices after simplification, default=0.
 - **`--disable_stage1`**: Add this flag to skip the remeshing process (stage 1), default=false.
 - **`--disable_stage3`**: Add this flag to skip the safe projection process (stage 3), default=false.
+- **`--remesh-only`**: Run only the SDF remeshing stage, without simplification or safe projection.
+- **`--remesh-resolution`**: Set the SDF grid resolution used by `--remesh-only`. Supported values are 64, 128, and 256; higher values preserve more detail but use more GPU memory.
+
+For STL input and output:
+```
+python example.py --input ./model.stl --output ./examples/model_pamo.stl --ratio 0.001
+```
+
+For PLY input and output:
+```
+python example.py --input ./model.ply --output ./examples/model_pamo.ply --ratio 0.001
+```
+
+For remeshing without simplification:
+```
+python example.py --input ./model.stl --output ./examples/model_remeshed.stl --remesh-only --remesh-resolution 256
+```
+
+PLY meshes use the same remesh-only operation:
+```
+python example.py --input ./examples/geom_runner_sys.ply --output ./examples/geom_runner_sys_remeshed.ply --remesh-only --remesh-resolution 128
+```
+
+The remesh-only operation uses an SDF and Dual Marching Cubes. It is designed to produce a watertight remesh, so it may close holes or otherwise change the input topology.
+PLY vertex colors and other custom attributes are not preserved; PaMO currently processes and exports mesh geometry only.
 
 ## Usage
 ### Import
@@ -64,6 +90,13 @@ pamo = PaMO(input_mesh, use_stage1=True, use_stage3=True)
 Performs mesh optimization to reduce the complexity of the mesh while preserving essential details according to specified parameters.
 ```
 pamo.run(points, triangles, ratio, tolerance=4, threshold=1e-3, iter=100000)
+```
+
+### Remesh Only
+Runs only the SDF and Dual Marching Cubes remeshing stage.
+```
+pamo = PaMO(input_mesh, use_stage1=True, use_stage3=False)
+verts, faces = pamo.remesh_only(points, triangles, resolution=256)
 ```
 
 #### Parameters

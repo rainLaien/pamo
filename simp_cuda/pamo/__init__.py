@@ -47,10 +47,18 @@ class PaMO(nn.Module):
         # vol2mesh params
         self.vol2mesh = DMC(dtype=torch.float32).cuda()
         # mesh2vol params
-        self.R = 256
-        self.band = 3 / self.R # 3
-        self.margin = self.band * 2 + 1 #2
+        self.set_remesh_resolution(256)
         self.target_faces = None
+
+    def set_remesh_resolution(self, resolution):
+        """Set the SDF grid resolution and its dependent normalization values."""
+        resolution = int(resolution)
+        if resolution <= 0:
+            raise ValueError("Remesh resolution must be a positive integer.")
+
+        self.R = resolution
+        self.band = 3 / self.R
+        self.margin = self.band * 2 + 1
 
     def tri_area(self, v0, v1, v2):
         cross_prod = torch.cross(v1 - v0, v2 - v0)
@@ -92,10 +100,41 @@ class PaMO(nn.Module):
         
         return v, f
 
+    @torch.no_grad()
+    def remesh_only(self, points, triangles, resolution=256):
+        """Run only the SDF and Dual Marching Cubes remeshing stage."""
+        self.set_remesh_resolution(resolution)
+        print("Remesh resolution : {}".format(self.R))
+
+        tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(
+            points,
+            triangles,
+            self.band,
+            self.margin,
+        )
+        tris = torch.as_tensor(tris, dtype=torch.float32, device=points.device)
+
+        start_stage1 = time.time()
+        verts, faces = self.remesh(tris, tris_min, tris_max, tris_mean)
+        end_stage1 = time.time()
+        print(f"Time for Remeshing: {end_stage1 - start_stage1} sec")
+
+        verts = verts.cpu().numpy() + tris_mean
+        faces = faces.cpu().numpy()
+        return verts, faces
+
     def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3, iter=1000000, min_verts=10000000000):
         
         self.target_faces = max(int(ratio * len(triangles)), min_verts)
         print("Target faces : {}".format(self.target_faces))
+
+        if self.use_stage1:
+            remesh_resolution = 256
+            if self.target_faces <= 1000:
+                remesh_resolution = 128
+            if self.target_faces <= 50:
+                remesh_resolution = 64
+            self.set_remesh_resolution(remesh_resolution)
 
         # scale the input mesh
         tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(points, triangles, self.band, self.margin)
@@ -103,12 +142,6 @@ class PaMO(nn.Module):
 
         # stage1 (Remeshing)
         if self.use_stage1:
-            # Default 256
-            if self.target_faces <= 1000:
-                self.R = 128
-            if self.target_faces <= 50:
-                self.R = 64
-
             start_stage1 = time.time()
             verts, faces = self.remesh(tris, tris_min, tris_max, tris_mean)
             end_stage1 = time.time()
