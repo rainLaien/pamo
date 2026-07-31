@@ -1,0 +1,1061 @@
+version: 1
+project: "pamo_cavity_joint_optimizer"
+status: "planning"
+objective: "在保留 PaMO SDF/DualMC、LBVH/Undo 和安全投影能力的基础上，引入 Cavity 事务模型、显式特征约束、maxSurfDist、多类拓扑操作，并在质量收益验证后实现 Patch/Ribbon GPU 后端。"
+
+documents:
+  architecture: "doc/PaMO_Cavity_联合改善架构.md"
+  pamo_analysis: "doc/PaMO_论文算法中文分析.md"
+  cavity_analysis: "doc/Dynamic_Mesh_Processing_on_the_GPU_算法流程中文总结.md"
+
+principles:
+  - "旧版 PaMO.run() 必须保持兼容并可作为基线回退。"
+  - "先验证 Cavity-lite 的质量收益，再投入完整 Patch/Ribbon 重写。"
+  - "所有硬约束先于软成本；不能为了达到目标面数而静默违反安全约束。"
+  - "每个拒绝、撤销和停止条件必须具有机器可读原因。"
+  - "exact、repair、original surface 和 feature curve 的语义必须显式区分。"
+  - "最终提交检查点必须无检测到的自交。"
+
+defaults:
+  backend: "global"
+  sdf_mode: "auto"
+  feature_angle_degrees: 30.0
+  target_length_mode: "constant"
+  max_surface_distance_unit: "relative_bbox"
+  deterministic: true
+  global_collision_every_epochs: 1
+  projection_every_epochs: 5
+  final_safe_projection_steps: 5
+  patch_initial_faces: 256
+  patch_growth_factor: 2.0
+
+quality_gates:
+  correctness:
+    - "回归集中硬特征误折叠和误翻转数量为 0。"
+    - "最终输出自交对数量为 0。"
+    - "Undo 后网格必须恢复到拓扑等价且属性一致的状态。"
+    - "所有活动面索引有效、面积非零且不存在 NaN/Inf。"
+  geometry:
+    - "配置 maxSurfDist 时，所有验收采样不得超过阈值加数值容差。"
+    - "相同目标面数下，CD/HD 不得超过基线允许回归比例。"
+    - "输出必须报告 feature recall、corner retention 和 feature curve distance。"
+  performance:
+    - "Cavity-lite 在 medium 基准上的 Stage 2 时间不得超过旧路径的 1.25 倍，除非质量门槛显著改善并记录豁免。"
+    - "Patch backend 在 large 基准上的动态拓扑吞吐量必须高于 Cavity-lite 后才允许默认启用。"
+    - "所有性能结果必须记录 GPU、CUDA、输入规模、配置和峰值显存。"
+
+milestones:
+  - id: "M0"
+    name: "基线、API 与可观测性"
+    exit_criteria:
+      - "固定回归输入与旧 PaMO 输出。"
+      - "能够生成统一质量和性能报告。"
+      - "新配置对象和兼容策略评审完成。"
+
+  - id: "M1"
+    name: "Cavity-lite 事务化 Collapse"
+    exit_criteria:
+      - "当前 edge collapse 通过 OperationRecord 执行。"
+      - "CommitJournal 和通用 Undo 闭环通过测试。"
+      - "LBVH 相交结果能够映射到 operation ID。"
+
+  - id: "M2"
+    name: "硬特征与曲面距离约束"
+    exit_criteria:
+      - "FeatureGraph lineage 在 collapse 后保持一致。"
+      - "maxSurfDist 支持 world、relative_bbox 和 voxel 单位。"
+      - "硬特征误操作为 0。"
+
+  - id: "M3"
+    name: "多操作与拓扑-几何交替优化"
+    exit_criteria:
+      - "支持 split、collapse、flip 和 constrained relocate。"
+      - "TargetLengthField 可驱动自适应操作。"
+      - "能够周期性执行短投影并最终执行完整安全投影。"
+
+  - id: "M4"
+    name: "完整 Patch/Ribbon GPU 后端"
+    exit_criteria:
+      - "Patch、Ribbon、队列、锁、MIS、扩张和切分均可运行。"
+      - "批次全局 LBVH 验收和 operation-level Undo 通过。"
+      - "large 基准达到性能门槛。"
+
+  - id: "M5"
+    name: "验证、优化与发布"
+    exit_criteria:
+      - "质量、安全、性能消融完成。"
+      - "新后端具备明确回退策略。"
+      - "文档、示例、测试和迁移说明齐全。"
+
+tasks:
+  - id: "BASE-001"
+    milestone: "M0"
+    priority: "P0"
+    status: "todo"
+    size: "M"
+    depends_on: []
+    summary: "建立统一的运行报告和指标采集"
+    description: "为当前 run、remesh、simplification 和 safe projection 路径记录分阶段时间、面数、CD、HD、最小角、edge CV、流形、封闭、自交、Undo 次数和峰值显存。"
+    files:
+      - "simp_cuda/pamo/reporting.py"
+      - "simp_cuda/pamo/__init__.py"
+      - "example.py"
+    deliverables:
+      - "OptimizationReport 数据结构"
+      - "JSON/控制台报告导出"
+      - "旧路径基线报告"
+    acceptance:
+      - "相同输入与 seed 下报告字段稳定。"
+      - "关闭报告时不改变算法输出。"
+      - "报告明确标注 sdf_mode 和坐标归一化尺度。"
+    tests:
+      - "报告序列化 round-trip"
+      - "空网格和最小合法网格字段完整性"
+    risks:
+      - "指标计算本身影响性能；默认区分轻量运行指标和昂贵评估指标。"
+
+  - id: "BASE-002"
+    milestone: "M0"
+    priority: "P0"
+    status: "todo"
+    size: "M"
+    depends_on: []
+    summary: "建立最小几何回归集"
+    description: "新增可提交的小型合成网格和期望清单，覆盖封闭、开放、非流形、自交、尖脊、角点、孔洞、薄壳、共面重叠和极瘦三角形。"
+    files:
+      - "simp_cuda/tests/assets/"
+      - "simp_cuda/tests/fixtures.yaml"
+      - "simp_cuda/tests/test_regression_inputs.py"
+    deliverables:
+      - "固定输入网格"
+      - "每个网格的预期属性和允许误差"
+    acceptance:
+      - "所有 fixture 都能被当前加载器读取。"
+      - "每个 fixture 具有明确的 manifold/watertight/intersection 预期。"
+    tests:
+      - "fixture schema 校验"
+      - "几何属性自检"
+    risks:
+      - "二进制资产难审查；优先使用小型 ASCII OBJ/PLY 或程序生成并固定哈希。"
+
+  - id: "API-001"
+    milestone: "M0"
+    priority: "P0"
+    status: "todo"
+    size: "S"
+    depends_on: []
+    summary: "定义 DynamicOptimizeConfig 和兼容策略"
+    description: "定义新 API、默认值、单位、模式和版本字段；旧 run() 行为保持不变。"
+    files:
+      - "simp_cuda/pamo/dynamic_config.py"
+      - "simp_cuda/pamo/__init__.py"
+      - "example.py"
+    deliverables:
+      - "DynamicOptimizeConfig"
+      - "配置校验和错误消息"
+      - "CLI 到配置对象的映射"
+    acceptance:
+      - "maxSurfDist 必须显式带单位。"
+      - "未知配置和互斥模式立即报错。"
+      - "旧命令行参数行为不变。"
+    tests:
+      - "默认配置"
+      - "非法单位和负长度"
+      - "互斥选项"
+    risks:
+      - "配置过多；第一版只暴露稳定参数，高级参数放 experimental 命名空间。"
+
+  - id: "BUILD-001"
+    milestone: "M0"
+    priority: "P0"
+    status: "todo"
+    size: "S"
+    depends_on: []
+    summary: "让 CUDA 扩展支持分目录源码和测试构建"
+    description: "将 setup.py 从只收集 src/*.cu 改为递归收集受控源码目录，补充 src/dynamic、src/patch include 路径，并保留 Windows/Linux 构建参数。"
+    files:
+      - "simp_cuda/setup.py"
+      - "simp_cuda/src/pybind.cpp"
+    deliverables:
+      - "递归但可控的 CUDA source manifest"
+      - "debug/test build 开关"
+      - "干净环境构建说明"
+    acceptance:
+      - "旧扩展在未加入新 kernel 时仍可构建和导入。"
+      - "src/dynamic 下的 smoke kernel 可被编译、绑定和调用。"
+      - "构建日志列出实际参与编译的源文件。"
+    tests:
+      - "python setup.py build_ext smoke"
+      - "import pamo._C"
+      - "Windows/Linux 配置检查"
+    risks:
+      - "递归 glob 误收测试或实验源码；使用显式目录白名单而非无条件收集所有 .cu。"
+
+  - id: "CORE-001"
+    milestone: "M1"
+    priority: "P0"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "API-001"
+      - "BUILD-001"
+    summary: "定义稳定元素句柄和 OperationRecord"
+    description: "实现带 generation 的元素句柄、操作类型、读写集合、affected AABB、状态和拒绝原因；先支持 EDGE_COLLAPSE。"
+    files:
+      - "simp_cuda/src/dynamic/element_handle.cuh"
+      - "simp_cuda/src/dynamic/operation.cuh"
+      - "simp_cuda/src/dynamic/operation_kernels.cu"
+    deliverables:
+      - "ElementHandle"
+      - "OperationRecord SoA GPU 存储"
+      - "OperationStatus 和 RejectReason"
+    acceptance:
+      - "槽位复用后旧句柄不能访问新元素。"
+      - "操作状态转换只能沿允许路径发生。"
+      - "结构支持批量 GPU 读写且无未对齐字段。"
+    tests:
+      - "generation 失效测试"
+      - "状态机测试"
+      - "GPU/CPU 结构布局一致性"
+    risks:
+      - "AoS 影响 coalescing；实现时优先 SoA，对外提供逻辑视图。"
+
+  - id: "CORE-002"
+    milestone: "M1"
+    priority: "P0"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "CORE-001"
+    summary: "实现 CommitJournal 和通用事务快照"
+    description: "记录操作前后的顶点、面、活动位、属性、affected AABB 和 operation ID，支持批次验收前保留快照。"
+    files:
+      - "simp_cuda/src/dynamic/commit_journal.cuh"
+      - "simp_cuda/src/dynamic/commit_journal.cu"
+    deliverables:
+      - "CommitJournal GPU 存储"
+      - "批次 begin/commit/discard API"
+      - "快照容量和溢出处理"
+    acceptance:
+      - "单操作和多操作 journal 均可逆。"
+      - "容量不足时拒绝操作，不允许部分写入。"
+      - "全局验收前不得覆盖快照。"
+    tests:
+      - "随机操作序列 rollback"
+      - "容量边界"
+      - "重复 Undo 幂等性"
+    risks:
+      - "显存增加；设置批次上限并统计快照字节数。"
+
+  - id: "CORE-003"
+    milestone: "M1"
+    priority: "P0"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "CORE-001"
+      - "CORE-002"
+    summary: "把当前 edge collapse 适配为 Cavity-lite 操作"
+    description: "复用现有 QEM、边长、skinny cost、AtomicMin 和 Link Condition，将选中边转换为 OperationRecord，并通过事务执行器修改网格。"
+    files:
+      - "simp_cuda/src/cusimp_free.cu"
+      - "simp_cuda/src/dynamic/collapse_operator.cuh"
+      - "simp_cuda/src/dynamic/collapse_operator.cu"
+    deliverables:
+      - "Collapse candidate adapter"
+      - "Transactional collapse kernel"
+      - "旧/新路径切换开关"
+    acceptance:
+      - "关闭新约束时，输出面数和质量与旧路径在允许差异内。"
+      - "每个修改面写入 face_last_operation。"
+      - "Link Condition 失败具有明确 reject reason。"
+    tests:
+      - "四面体合法/非法折叠"
+      - "共享邻域冲突"
+      - "旧路径对照"
+    risks:
+      - "并行执行顺序改变输出；采用固定 edge ID 打破平局并记录确定性级别。"
+
+  - id: "CORE-004"
+    milestone: "M1"
+    priority: "P0"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "CORE-002"
+      - "CORE-003"
+    summary: "用 operation-level Undo 替换折叠专用恢复"
+    description: "将相交三角形映射到 operation ID，按逆提交顺序撤销，循环检测直到无自交，并保留 invalid/cooldown 语义。"
+    files:
+      - "simp_cuda/src/cusimp_free.cu"
+      - "simp_cuda/src/dynamic/undo.cuh"
+      - "simp_cuda/src/dynamic/undo.cu"
+      - "simp_cuda/src/bvh/self_intersect.cuh"
+    deliverables:
+      - "operation ID 回溯"
+      - "通用 Undo kernel"
+      - "cooldown 状态"
+    acceptance:
+      - "Undo 后拓扑、位置和属性恢复一致。"
+      - "重复检测直至自交对为 0。"
+      - "无法确定因果时采取保守撤销并记录原因。"
+    tests:
+      - "一轮、两轮和三轮 Undo 合成用例"
+      - "两个操作共同导致相交"
+      - "Undo 后再次选择 cooldown"
+    risks:
+      - "误撤销扩大；后续通过更细的 face provenance 缩小集合。"
+
+  - id: "SAFE-001"
+    milestone: "M1"
+    priority: "P0"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "CORE-001"
+    summary: "实现统一局部不变量检查"
+    description: "为所有操作提供索引、活动位、重复顶点、面积、定向、Link Condition 和局部碰撞检查接口。"
+    files:
+      - "simp_cuda/src/dynamic/local_checks.cuh"
+      - "simp_cuda/src/dynamic/local_checks.cu"
+    deliverables:
+      - "LocalCheckResult"
+      - "尺度相关面积阈值"
+      - "可复用局部检查 kernel"
+    acceptance:
+      - "每类失败映射到唯一 RejectReason。"
+      - "检查不修改正式网格状态。"
+      - "退化输入不产生 NaN。"
+    tests:
+      - "翻面"
+      - "零面积"
+      - "重复索引"
+      - "非法活动句柄"
+    risks:
+      - "局部碰撞不完备；仍保留全局 LBVH 作为最终安全网。"
+
+  - id: "COLL-001"
+    milestone: "M1"
+    priority: "P0"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "CORE-001"
+    summary: "扩展 LBVH 输出以携带 operation provenance"
+    description: "相交检测结果除 triangle pair 外，同时返回 face_last_operation 和 affected AABB，供通用 Undo 使用。"
+    files:
+      - "simp_cuda/src/bvh/query.cuh"
+      - "simp_cuda/src/bvh/self_intersect.cuh"
+      - "simp_cuda/src/dynamic/collision_bridge.cu"
+    deliverables:
+      - "CollisionRecord"
+      - "triangle-to-operation 映射"
+      - "批次碰撞统计"
+    acceptance:
+      - "未修改旧面使用 operation ID 0 或明确 sentinel。"
+      - "同一相交对去重。"
+      - "现有混合精度判定结果不回归。"
+    tests:
+      - "共面共享顶点"
+      - "共享边正常/异常"
+      - "非共面相交"
+    risks:
+      - "记录额外字段增加带宽；仅在新后端启用。"
+
+  - id: "FEATURE-001"
+    milestone: "M2"
+    priority: "P0"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "BASE-002"
+      - "API-001"
+    summary: "统一 FeatureGraph 提取和 lineage"
+    description: "整合 feature_edges.py 与 original_constrained.py 的规则，支持角度特征、边界、非流形边、显式用户边、feature chain 和 corner。"
+    files:
+      - "simp_cuda/pamo/feature_graph.py"
+      - "simp_cuda/pamo/feature_edges.py"
+      - "simp_cuda/pamo/original_constrained.py"
+    deliverables:
+      - "FeatureGraph"
+      - "feature chain/corner 分类"
+      - "显式边优先级规则"
+    acceptance:
+      - "输入边界和非流形边默认进入硬约束。"
+      - "特征链分支点被分类为 corner。"
+      - "固定 seed 下输出稳定。"
+    tests:
+      - "立方体"
+      - "楔体"
+      - "开放方片"
+      - "T 形特征交汇"
+    risks:
+      - "噪声扫描网格过度分类；允许角度、长度和连通分量过滤。"
+
+  - id: "FEATURE-002"
+    milestone: "M2"
+    priority: "P0"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "CORE-001"
+      - "FEATURE-001"
+    summary: "将 FeatureGraph 属性注册到 GPU 动态网格"
+    description: "添加 vertex feature class、edge feature ID、parent lineage 和 feature parameter，并定义 split/collapse/flip 更新规则。"
+    files:
+      - "simp_cuda/src/dynamic/feature_data.cuh"
+      - "simp_cuda/src/dynamic/feature_data.cu"
+      - "simp_cuda/src/pybind.cpp"
+    deliverables:
+      - "GPU feature arrays"
+      - "Python 注册接口"
+      - "lineage 更新 kernel"
+    acceptance:
+      - "普通操作不能跨 feature partition。"
+      - "角点默认不可删除。"
+      - "特征子边继承 parent ID。"
+    tests:
+      - "CPU/GPU 属性一致性"
+      - "split lineage"
+      - "collapse lineage"
+    risks:
+      - "边重建改变 edge ID；依赖稳定 parent lineage 而非瞬时 edge index。"
+
+  - id: "SURF-001"
+    milestone: "M2"
+    priority: "P0"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "API-001"
+    summary: "定义统一 SurfaceConstraint 查询层"
+    description: "统一原始三角形最近点、SDF 值/梯度、精确零面、repair envelope 和 feature curve 投影，返回明确语义。"
+    files:
+      - "simp_cuda/pamo/surface_constraints.py"
+      - "simp_cuda/pamo/sdf_field.py"
+      - "simp_cuda/src/dynamic/surface_query.cuh"
+      - "simp_cuda/src/dynamic/surface_query.cu"
+    deliverables:
+      - "SurfaceQueryResult"
+      - "原始网格 BVH 查询"
+      - "SDF 和 feature 投影适配器"
+    acceptance:
+      - "repair 零面不得标记为 original surface。"
+      - "所有距离在归一化空间计算并可还原世界单位。"
+      - "查询失败返回 validity，不产生未定义坐标。"
+    tests:
+      - "单位立方体最近点"
+      - "精确/repair 语义"
+      - "坐标缩放往返"
+    risks:
+      - "原始网格可能自交或非流形；最近点允许，但有向符号只在有效输入使用。"
+
+  - id: "SURF-002"
+    milestone: "M2"
+    priority: "P0"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "CORE-001"
+      - "SURF-001"
+    summary: "实现 maxSurfDist 局部硬验收"
+    description: "检查新顶点、新边中点、新三角形重心和自适应额外采样，支持 world、relative_bbox、voxel 单位。"
+    files:
+      - "simp_cuda/src/dynamic/surface_distance_check.cuh"
+      - "simp_cuda/src/dynamic/surface_distance_check.cu"
+      - "simp_cuda/pamo/dynamic_config.py"
+    deliverables:
+      - "距离单位转换"
+      - "操作级最大偏差"
+      - "SURFACE_DISTANCE reject reason"
+    acceptance:
+      - "超过阈值的操作在正式提交前拒绝。"
+      - "报告最大采样位置和 primitive ID。"
+      - "禁用阈值时不执行昂贵查询。"
+    tests:
+      - "三种单位等价性"
+      - "三角形内部超限但顶点不过限"
+      - "高曲率自适应采样"
+    risks:
+      - "采样不是严格 Hausdorff；报告中明确 sampled guarantee。"
+
+  - id: "FEATURE-003"
+    milestone: "M2"
+    priority: "P0"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "CORE-003"
+      - "FEATURE-002"
+      - "SURF-002"
+      - "SAFE-001"
+    summary: "实现 feature-aware、distance-aware collapse"
+    description: "为折叠生成中点、QEM、原曲面、SDF 和 feature curve 候选位置，执行硬特征与 maxSurfDist 过滤后选择最低合法成本。"
+    files:
+      - "simp_cuda/src/dynamic/collapse_operator.cu"
+      - "simp_cuda/src/dynamic/feature_rules.cuh"
+    deliverables:
+      - "多目标位置评分"
+      - "硬特征 collapse 规则"
+      - "角点保护"
+    acceptance:
+      - "跨特征折叠为 0。"
+      - "角点误删除为 0。"
+      - "所有接受操作满足 sampled maxSurfDist。"
+    tests:
+      - "立方体尖边"
+      - "同链折叠"
+      - "跨链拒绝"
+      - "候选位置择优"
+    risks:
+      - "约束过强导致目标面数不可达；必须返回 termination reason。"
+
+  - id: "CAV-001"
+    milestone: "M2"
+    priority: "P0"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "BASE-001"
+      - "CORE-004"
+      - "SAFE-001"
+      - "COLL-001"
+      - "FEATURE-003"
+    summary: "完成 Cavity-lite Collapse 端到端路径"
+    description: "从候选生成、冲突选择、事务执行、局部检查、批量提交、全局 LBVH、Undo 到报告形成可选新后端。"
+    files:
+      - "simp_cuda/pamo/dynamic_optimize.py"
+      - "simp_cuda/pamo/__init__.py"
+      - "simp_cuda/src/pybind.cpp"
+    deliverables:
+      - "pamo.dynamic_optimize() 初版"
+      - "backend=global"
+      - "OptimizationReport"
+    acceptance:
+      - "M1/M2 correctness quality gates 全部通过。"
+      - "旧 run() 输出不变。"
+      - "无法达到目标面数时返回明确原因。"
+    tests:
+      - "完整小型回归集"
+      - "旧/新后端对照"
+      - "确定性重复运行"
+    risks:
+      - "Python 外层循环产生同步开销；先建立基线，再决定是否下沉编排。"
+
+  - id: "OPS-001"
+    milestone: "M3"
+    priority: "P1"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "FEATURE-001"
+      - "SURF-001"
+    summary: "实现 TargetLengthField"
+    description: "支持 constant、curvature 和外部 field 模式，提供 feature/boundary override 和 split/collapse 滞回阈值。"
+    files:
+      - "simp_cuda/pamo/target_length.py"
+      - "simp_cuda/src/dynamic/target_length.cuh"
+    deliverables:
+      - "TargetLengthField"
+      - "曲率到长度映射"
+      - "滞回配置"
+    acceptance:
+      - "平面区域输出常量长度。"
+      - "高曲率区域目标长度单调减小。"
+      - "split_ratio 大于 collapse_ratio。"
+    tests:
+      - "平面"
+      - "球面"
+      - "尖脊"
+      - "外部 field 插值"
+    risks:
+      - "曲率噪声；增加平滑和上下限。"
+
+  - id: "OPS-002"
+    milestone: "M3"
+    priority: "P1"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "CAV-001"
+      - "OPS-001"
+      - "FEATURE-002"
+      - "SURF-002"
+    summary: "实现事务化 edge split"
+    description: "支持普通边和特征边分裂，新顶点投影到正确约束表面，子边继承 feature lineage。"
+    files:
+      - "simp_cuda/src/dynamic/split_operator.cuh"
+      - "simp_cuda/src/dynamic/split_operator.cu"
+    deliverables:
+      - "Split candidate"
+      - "Split journal/undo"
+      - "Feature lineage update"
+    acceptance:
+      - "分裂后拓扑合法且无退化面。"
+      - "特征子边 parent ID 正确。"
+      - "Undo 完整恢复。"
+    tests:
+      - "边界边"
+      - "内部边"
+      - "特征边"
+      - "Undo"
+    risks:
+      - "数组容量增长；操作注册前预留并检查容量。"
+
+  - id: "OPS-003"
+    milestone: "M3"
+    priority: "P1"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "CAV-001"
+      - "OPS-001"
+      - "FEATURE-002"
+      - "SURF-002"
+    summary: "实现事务化 edge flip"
+    description: "按价数、最小角和局部能量生成候选；禁止翻转特征、边界和非流形边。"
+    files:
+      - "simp_cuda/src/dynamic/flip_operator.cuh"
+      - "simp_cuda/src/dynamic/flip_operator.cu"
+    deliverables:
+      - "Flip candidate"
+      - "Flip journal/undo"
+      - "局部质量评分"
+    acceptance:
+      - "硬特征翻转数量为 0。"
+      - "接受的 flip 必须改善配置的主质量指标。"
+      - "Undo 完整恢复。"
+    tests:
+      - "Delaunay 对角"
+      - "价数改善"
+      - "特征拒绝"
+      - "翻面拒绝"
+    risks:
+      - "不同质量目标冲突；配置单一主目标并记录次要指标。"
+
+  - id: "OPS-004"
+    milestone: "M3"
+    priority: "P1"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "CAV-001"
+      - "FEATURE-002"
+      - "SURF-001"
+      - "SAFE-001"
+    summary: "实现 constrained vertex relocation"
+    description: "普通顶点切向移动后投影到曲面，特征顶点沿 feature curve，角点固定，并使用局部步长和碰撞检查。"
+    files:
+      - "simp_cuda/src/dynamic/relocate_operator.cuh"
+      - "simp_cuda/src/dynamic/relocate_operator.cu"
+    deliverables:
+      - "Relocate candidate"
+      - "feature-aware 投影"
+      - "局部 backtracking"
+    acceptance:
+      - "角点位移为 0。"
+      - "特征顶点不离开对应曲线容差。"
+      - "接受移动不翻面、不退化。"
+    tests:
+      - "平面平滑"
+      - "特征链滑动"
+      - "角点固定"
+      - "backtracking"
+    risks:
+      - "局部平滑与最终 IPC 重复；通过消融确定默认轮数。"
+
+  - id: "PROJ-001"
+    milestone: "M3"
+    priority: "P1"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "BASE-001"
+    summary: "增加论文一致的双向 Safe Projection 配置"
+    description: "显式启用并测试 GT2Mesh 距离能量，保留当前兼容配置，记录时间、显存、CD、HD 和最小角消融。"
+    files:
+      - "simp_cuda/safe_project/src/pamo_safe_project/config.py"
+      - "simp_cuda/safe_project/src/pamo_safe_project/system.py"
+      - "simp_cuda/safe_project/tests/test_bidirectional_distance.py"
+    deliverables:
+      - "paper 模式"
+      - "compat 模式"
+      - "双向距离消融报告"
+    acceptance:
+      - "paper 模式包含 Mesh2GT 和 GT2Mesh。"
+      - "两种模式可由配置明确选择。"
+      - "不静默改变旧默认。"
+    tests:
+      - "缺失区域由 GT2Mesh 拉回"
+      - "能量分量报告"
+      - "显存容量边界"
+    risks:
+      - "GT2Mesh 成本和显存较高；允许降低 sample 数并报告。"
+
+  - id: "OPT-001"
+    milestone: "M3"
+    priority: "P1"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "OPS-002"
+      - "OPS-003"
+      - "OPS-004"
+      - "PROJ-001"
+    summary: "实现 topology/projection epoch 编排"
+    description: "按策略交替 split、collapse、flip、relocate、全局碰撞验收和短 Safe Projection，最终执行完整 Safe Projection。"
+    files:
+      - "simp_cuda/pamo/dynamic_optimize.py"
+      - "simp_cuda/pamo/dynamic_config.py"
+    deliverables:
+      - "Epoch scheduler"
+      - "自适应 projection trigger"
+      - "停止原因"
+    acceptance:
+      - "每个 topology epoch 后全局自交为 0。"
+      - "projection 后更新目标和 BVH。"
+      - "连续无进展时终止，不无限循环。"
+    tests:
+      - "达到目标"
+      - "目标不可达"
+      - "碰撞率触发提前投影"
+      - "split/collapse 滞回"
+    risks:
+      - "策略空间过大；第一版使用固定顺序和少量参数。"
+
+  - id: "PATCH-001"
+    milestone: "M4"
+    priority: "P2"
+    status: "todo"
+    size: "XL"
+    depends_on:
+      - "CORE-001"
+      - "OPT-001"
+    summary: "实现 Patch FE/EV、active bitset 和局部索引"
+    description: "建立可容纳动态操作的 Patch 存储、16 位局部索引、属性数组、owner/version 和容量管理。"
+    files:
+      - "simp_cuda/src/patch/patch_mesh.cuh"
+      - "simp_cuda/src/patch/patch_mesh.cu"
+      - "simp_cuda/src/patch/patch_allocator.cuh"
+    deliverables:
+      - "PatchMesh"
+      - "全局网格导入/导出"
+      - "容量统计"
+    acceptance:
+      - "导入导出拓扑等价。"
+      - "活动元素查询正确。"
+      - "容量不足不越界。"
+    tests:
+      - "小网格 round-trip"
+      - "非流形输入查询"
+      - "容量边界"
+    risks:
+      - "与当前邻接布局差异大；作为独立 backend 实现。"
+
+  - id: "PATCH-002"
+    milestone: "M4"
+    priority: "P2"
+    status: "todo"
+    size: "XL"
+    depends_on:
+      - "PATCH-001"
+    summary: "实现初始分区、Ribbon、owner 映射和属性迁移"
+    description: "构建约 256-face Patch、单圈 Ribbon、neighbor stash 和动态哈希映射，支持 owned/ribbon 转换。"
+    files:
+      - "simp_cuda/src/patch/partition.cu"
+      - "simp_cuda/src/patch/ribbon_hash.cuh"
+      - "simp_cuda/src/patch/ribbon_hash.cu"
+    deliverables:
+      - "Patch partitioner"
+      - "Ribbon hash"
+      - "owner/local index 映射"
+    acceptance:
+      - "跨 Patch 查询与全局邻接一致。"
+      - "owner 迁移后属性不丢失。"
+      - "哈希负载超限时明确失败或扩容。"
+    tests:
+      - "跨 Patch 一环"
+      - "owner 转移"
+      - "Ribbon 插入/删除"
+    risks:
+      - "哈希和共享内存占用影响 occupancy；建立容量模型。"
+
+  - id: "PATCH-003"
+    milestone: "M4"
+    priority: "P2"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "PATCH-002"
+    summary: "实现 GPU Patch 队列、锁和推测回滚"
+    description: "实现 block leader 出队、Patch 锁、失败重入队、neighbor lock 和共享内存副本丢弃。"
+    files:
+      - "simp_cuda/src/patch/patch_queue.cuh"
+      - "simp_cuda/src/patch/patch_lock.cuh"
+      - "simp_cuda/src/patch/patch_scheduler.cu"
+    deliverables:
+      - "GPU queue"
+      - "deadlock-aware lock"
+      - "调度统计"
+    acceptance:
+      - "竞争时保证前进。"
+      - "锁失败不会修改全局 Patch。"
+      - "队列最终处理所有可处理 Patch。"
+    tests:
+      - "双 Patch 互锁"
+      - "高竞争"
+      - "失败重调度"
+    risks:
+      - "活锁或饥饿；加入重试计数和诊断。"
+
+  - id: "PATCH-004"
+    milestone: "M4"
+    priority: "P2"
+    status: "todo"
+    size: "XL"
+    depends_on:
+      - "PATCH-003"
+      - "OPS-002"
+      - "OPS-003"
+      - "OPS-004"
+    summary: "实现 Patch 内 Cavity 注册、冲突图和贪心极大独立集"
+    description: "将四类 OperationRecord 转为 Cavity read/write/remove/boundary set，在共享内存选择不可继续扩充的无冲突集合。"
+    files:
+      - "simp_cuda/src/patch/cavity_registry.cuh"
+      - "simp_cuda/src/patch/cavity_mis.cu"
+      - "simp_cuda/src/patch/cavity_execute.cu"
+    deliverables:
+      - "Cavity registry"
+      - "Greedy MIS"
+      - "共享内存操作执行"
+    acceptance:
+      - "选中集合不存在读写冲突。"
+      - "集合为极大集合，不错误宣称最大集合。"
+      - "确定性模式使用稳定优先级。"
+    tests:
+      - "人工冲突图"
+      - "collapse/split/flip 混合冲突"
+      - "确定性"
+    risks:
+      - "显式冲突图过大；必要时使用元素 owner 传播而非完整邻接表。"
+
+  - id: "PATCH-005"
+    milestone: "M4"
+    priority: "P2"
+    status: "todo"
+    size: "XL"
+    depends_on:
+      - "PATCH-002"
+      - "PATCH-003"
+      - "PATCH-004"
+    summary: "实现跨 Patch 扩张、容量检查和切分"
+    description: "锁定邻居后迁移元素所有权、连接关系和属性；容量不足时取消本次操作并在批次末切分 Patch。"
+    files:
+      - "simp_cuda/src/patch/patch_expand.cu"
+      - "simp_cuda/src/patch/patch_split.cu"
+    deliverables:
+      - "Patch expansion"
+      - "Patch slicing"
+      - "Ribbon/owner 修复"
+    acceptance:
+      - "扩张后 Cavity 完全位于单 Patch。"
+      - "切分后全局拓扑等价。"
+      - "容量不足时没有部分提交。"
+    tests:
+      - "跨边界 collapse"
+      - "跨边界 split"
+      - "强制切分"
+    risks:
+      - "切分算法和属性迁移复杂；先限制单批扩张规模。"
+
+  - id: "PATCH-006"
+    milestone: "M4"
+    priority: "P2"
+    status: "todo"
+    size: "XL"
+    depends_on:
+      - "COLL-001"
+      - "PATCH-004"
+      - "PATCH-005"
+    summary: "实现 Patch 批次提交、全局 LBVH barrier 和跨 Patch Undo"
+    description: "多个 Patch 提交形成一个 batch，统一 refit/rebuild LBVH，检测全局自交并按 operation ID 撤销后再开始下一批。"
+    files:
+      - "simp_cuda/src/patch/batch_commit.cu"
+      - "simp_cuda/src/patch/global_validation.cu"
+      - "simp_cuda/src/patch/patch_undo.cu"
+    deliverables:
+      - "Batch barrier"
+      - "Global collision validation"
+      - "Cross-patch Undo"
+    acceptance:
+      - "验收前 journal 不释放。"
+      - "Undo 后 Patch owner/Ribbon/属性一致。"
+      - "下一批开始前全局自交为 0。"
+    tests:
+      - "两个远拓扑 Patch 的空间碰撞"
+      - "跨 Patch Undo"
+      - "连续多批"
+    risks:
+      - "全局 barrier 限制吞吐；后续研究增量 BVH 和区域化验证。"
+
+  - id: "QA-001"
+    milestone: "M5"
+    priority: "P0"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "CAV-001"
+      - "OPT-001"
+    summary: "建立端到端正确性与特征回归套件"
+    description: "运行所有 fixture，验证面数、拓扑、安全、距离、feature recall、corner retention、确定性和停止原因。"
+    files:
+      - "simp_cuda/tests/test_dynamic_optimize.py"
+      - "simp_cuda/tests/test_feature_preservation.py"
+      - "simp_cuda/tests/test_surface_bounds.py"
+    deliverables:
+      - "CPU/GPU 自动化测试"
+      - "回归阈值文件"
+      - "失败工件保存"
+    acceptance:
+      - "P0 correctness gates 全部通过。"
+      - "失败时保存输入、配置、operation log 和输出。"
+      - "测试可选择跳过无 CUDA 环境。"
+    tests:
+      - "pytest 全套"
+    risks:
+      - "GPU 浮点非确定性；区分拓扑确定性与数值容差。"
+
+  - id: "QA-002"
+    milestone: "M5"
+    priority: "P1"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "BASE-001"
+      - "QA-001"
+      - "PATCH-006"
+    summary: "建立三后端质量与性能基准"
+    description: "比较 legacy、Cavity-lite 和 Patch backend，在 small/medium/large 输入上运行质量、特征、安全、时间和显存消融。"
+    files:
+      - "benchmarks/run_dynamic_benchmarks.py"
+      - "benchmarks/configs/"
+      - "benchmarks/README.md"
+    deliverables:
+      - "可复现实验命令"
+      - "CSV/JSON 结果"
+      - "自动生成对比表"
+    acceptance:
+      - "记录完整环境元数据。"
+      - "每种配置至少多次运行并报告离散程度。"
+      - "性能门槛自动判定。"
+    tests:
+      - "benchmark smoke test"
+      - "结果 schema 校验"
+    risks:
+      - "大型资产不可提交；记录公开来源、哈希和下载说明。"
+
+  - id: "QA-003"
+    milestone: "M5"
+    priority: "P1"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "QA-002"
+    summary: "完成消融、默认值和回退决策"
+    description: "评估 exact/repair、feature、maxSurfDist、双向距离、局部投影频率、batch size、Patch size 和 global collision 频率。"
+    files:
+      - "doc/PaMO_Cavity_实验报告.md"
+      - "simp_cuda/pamo/dynamic_config.py"
+    deliverables:
+      - "消融报告"
+      - "推荐默认配置"
+      - "自动回退规则"
+    acceptance:
+      - "每个默认值都有数据依据。"
+      - "small mesh 回退策略明确。"
+      - "未达到性能门槛时 Patch backend 保持 experimental。"
+    tests:
+      - "默认配置快照"
+      - "回退条件"
+    risks:
+      - "数据集偏差；至少包含扫描、生成、CAD 风格和薄壳模型。"
+
+  - id: "PERF-001"
+    milestone: "M5"
+    priority: "P2"
+    status: "todo"
+    size: "L"
+    depends_on:
+      - "QA-002"
+    summary: "优化热点和显存"
+    description: "根据 profile 优化邻接重建、candidate generation、journal、LBVH refit、Patch hash、kernel fusion 和同步点。"
+    files:
+      - "simp_cuda/src/"
+      - "simp_cuda/safe_project/src/"
+      - "benchmarks/"
+    deliverables:
+      - "Nsight profile"
+      - "热点优化补丁"
+      - "显存容量模型"
+    acceptance:
+      - "每项优化有前后 profile。"
+      - "不以关闭安全检查换取性能。"
+      - "large 基准达到发布门槛。"
+    tests:
+      - "性能回归"
+      - "正确性回归"
+    risks:
+      - "过早优化；必须在 QA-002 后按数据执行。"
+
+  - id: "REL-001"
+    milestone: "M5"
+    priority: "P1"
+    status: "todo"
+    size: "M"
+    depends_on:
+      - "QA-003"
+      - "PERF-001"
+    summary: "发布文档、示例和迁移说明"
+    description: "补充 CLI/API 示例、约束语义、失败原因、后端选择、性能预期和已知局限。"
+    files:
+      - "README.md"
+      - "doc/PaMO_Cavity_用户指南.md"
+      - "examples/"
+    deliverables:
+      - "用户指南"
+      - "迁移说明"
+      - "示例配置"
+    acceptance:
+      - "示例命令可在干净环境执行。"
+      - "文档明确 sampled maxSurfDist 与严格 Hausdorff 的差异。"
+      - "文档明确 Patch backend 的稳定性级别。"
+    tests:
+      - "文档命令 smoke test"
+    risks:
+      - "实现变化导致文档过期；示例纳入 CI。"
+
+recommended_first_sprint:
+  goal: "完成可测量的 Cavity-lite Collapse 骨架，不改变默认输出。"
+  tasks:
+    - "BASE-001"
+    - "BASE-002"
+    - "API-001"
+    - "BUILD-001"
+    - "CORE-001"
+    - "SAFE-001"
+  exit_criteria:
+    - "能在 GPU 上创建 collapse OperationRecord。"
+    - "能记录候选、选择、拒绝和旧路径的基线指标。"
+    - "尚未启用事务写入时，默认 PaMO 行为完全不变。"
+
+recommended_second_sprint:
+  goal: "完成事务化 collapse、通用 Undo 和碰撞 provenance。"
+  tasks:
+    - "CORE-002"
+    - "CORE-003"
+    - "CORE-004"
+    - "COLL-001"
+  exit_criteria:
+    - "事务化 collapse 可选运行。"
+    - "相交三角形能够回溯并撤销 operation。"
+    - "回归集最终自交数为 0。"

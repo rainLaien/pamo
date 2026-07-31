@@ -50,8 +50,37 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--min-vertex`**: Add this flag to constrain the minimum number of vertices after simplification, default=0.
 - **`--disable_stage1`**: Add this flag to skip the remeshing process (stage 1), default=false.
 - **`--disable_stage3`**: Add this flag to skip the safe projection process (stage 3), default=false.
-- **`--remesh-only`**: Run only the SDF remeshing stage, without simplification or safe projection.
-- **`--remesh-resolution`**: Set the SDF grid resolution used by `--remesh-only`. Supported values are 64, 128, and 256; higher values preserve more detail but use more GPU memory.
+- **`--remesh-only`**: Run only the SDF remeshing stage, without simplification or safe projection. Valid closed inputs use the original signed `SDF=0` surface by default.
+- **`--feature-remesh`**: Run SDF remeshing followed by safe projection back toward the original mesh. This closes the surface without simplification and preserves planes, sharp edges, and other geometric features better than `--remesh-only`.
+- **`--feature-optimize`**: Run the joint feature-preserving quality pipeline: SDF quality relocation, safe projection, optional feature-chain densification, corner/curve-constrained relocation, and quality-driven flips of non-feature edges.
+- **`--surface-sample-remesh`**: Bypass SDF topology. Sample points directly on original triangles with CUDA area sampling and radius filtering, locally retriangulate source faces, collapse short edges only inside a smooth patch, bisect long edges, and run conflict-free CUDA quality flips. Detected feature-chain vertices are explicitly locked; smooth interior vertices may be removed to improve uniformity.
+- **`--remesh-resolution`**: Set the SDF grid resolution used by the remesh modes. Supported values are 64, 128, and 256; higher values preserve more detail but use more GPU memory.
+- **`--sdf-mode`**: Select `auto`, `exact`, or `repair`, default=`auto`. `auto` uses the original signed zero surface for watertight, consistently wound inputs and explicitly falls back to a repair envelope otherwise. `exact` rejects open or invalid inputs. `repair` extracts a 0.9-voxel unsigned-distance envelope.
+- **`--projection-iterations`**: Set the number of safe-projection iterations used by `--feature-remesh`, default=5.
+- **`--feature-edge-target-length`**: Enable feature-edge-only densification and set its maximum target edge length in the input mesh's coordinate units.
+- **`--feature-edge-angle`**: Detect input feature edges whose dihedral angle is at least this value, default=45 degrees. Input boundary edges are also treated as features.
+- **`--feature-edges`**: Optionally provide a text file containing explicit input edge vertex-index pairs instead of automatic angle detection.
+- **`--feature-edge-match-tolerance`**: Set the maximum distance used to match SDF-remeshed edges to original feature curves. The default is three SDF voxels.
+- **`--feature-edge-max-splits`**: Set a safety limit on inserted feature-edge vertices, default=100000.
+- **`--sdf-optimize`**: Run SDF remeshing followed by topology-preserving tangential mesh optimization. It changes vertex positions only: no simplification, edge collapse, face-count change, or connectivity change.
+- **`--sdf-optimize-iterations`**: Set the number of tangential optimization iterations, default=20.
+- **`--sdf-smoothing-step`**: Set the tangential relocation step in `(0, 1]`, default=0.2.
+- **`--sdf-projection-steps`**: Set the number of SDF Newton projection steps after each relocation, default=3.
+- **`--sdf-feature-angle`**: Lock vertices on edges of the extracted SDF mesh sharper than this angle, default=45 degrees.
+- **`--feature-quality-iterations`**: Set original-surface constrained relocation iterations used by `--feature-optimize`, default=5.
+- **`--feature-quality-step`**: Set the feature-constrained relocation step in `(0, 1]`, default=0.2.
+- **`--feature-flip-passes`**: Set the number of quality-driven non-feature edge-flip passes, default=2.
+- **`--surface-sample-count`**: Requested candidate-point budget for original-surface sampling. Dense input meshes should use a conservative value; adding too many points over-refines the mesh.
+- **`--surface-poisson-radius`**: Optional world-space minimum sample spacing. By default it is derived from surface area and `--surface-sample-count`.
+- **`--surface-flip-passes`**: Number of conflict-free CUDA edge-flip batches for sampled remeshing, default=5.
+- **`--surface-max-edge-ratio`**: Hard output edge-length bound divided by the Poisson radius, default=2.0. The two-radius default avoids over-refining narrow walls while still eliminating extreme long edges.
+- **`--surface-min-edge-ratio`**: Short-edge collapse threshold divided by the Poisson radius, default=0.5. Collapses must remain inside one smooth patch and improve local quality.
+- **`--surface-split-passes`**: Maximum conflict-free CUDA long-edge split batches, default=64.
+- **`--surface-collapse-passes`**: Maximum feature-safe CUDA short-edge collapse batches before refinement, default=24; a smaller cleanup phase also runs after splitting.
+- **`--original-constrained-remesh`**: Preserve the original triangle connectivity as a hard constraint skeleton. No input edge is collapsed or flipped. Edges sharper than the feature threshold, boundaries, and non-manifold edges remain explicit edge chains and may only be split collinearly.
+- **`--constraint-feature-angle`**: Mark every original manifold edge whose adjacent-face dihedral is strictly greater than this angle as a hard feature, default=5 degrees.
+- **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. If the current longest edge already satisfies it, no vertices or faces are inserted.
+- **`--constraint-max-splits`**: Safety limit for longest-edge bisection, default=100000. The operation fails instead of returning a mesh which violates the requested maximum length.
 
 For STL input and output:
 ```
@@ -63,9 +92,27 @@ For PLY input and output:
 python example.py --input ./model.ply --output ./examples/model_pamo.ply --ratio 0.001
 ```
 
+For feature-safe original-surface CUDA sampling without SDF topology:
+```
+python example.py \
+  --input ./model.stl \
+  --output ./examples/model_surface_sampled.stl \
+  --surface-sample-remesh \
+  --surface-sample-count 5000 \
+  --feature-edge-angle 30 \
+  --surface-max-edge-ratio 2.0 \
+  --surface-min-edge-ratio 0.5 \
+  --surface-flip-passes 32
+```
+
+The directly executable validation command is:
+```
+bash ./examples/test_surface_sample_remesh.sh
+```
+
 For remeshing without simplification:
 ```
-python example.py --input ./model.stl --output ./examples/model_remeshed.stl --remesh-only --remesh-resolution 256
+python example.py --input ./model.stl --output ./examples/model_remeshed.stl --remesh-only --remesh-resolution 256 --sdf-mode exact
 ```
 
 PLY meshes use the same remesh-only operation:
@@ -73,8 +120,196 @@ PLY meshes use the same remesh-only operation:
 python example.py --input ./examples/geom_runner_sys.ply --output ./examples/geom_runner_sys_remeshed.ply --remesh-only --remesh-resolution 128
 ```
 
-The remesh-only operation uses an SDF and Dual Marching Cubes. It is designed to produce a watertight remesh, so it may close holes or otherwise change the input topology.
+The remesh-only operation computes unsigned distance on the GPU and uses a
+fast-winding classification for a reliable inside-negative sign. In `exact`
+mode it extracts the original `SDF=0` surface: there is no hidden
+`0.9 / resolution` isovalue shift. DMC vertices are projected back to the
+trilinearly interpolated zero set, and the DMC `(R - 1)` grid coordinates are
+converted to the SDF cell-center coordinates before returning world-space
+vertices.
+
+`repair` has deliberately different semantics. It extracts the level set at
+an unsigned distance of 0.9 voxel, producing a closed offset envelope for
+open or invalid inputs. This can close holes and change topology, and it is
+not expected to coincide with the original surface. On an already closed
+mesh it may produce both an inner and an outer envelope, so use `exact` when
+surface fidelity is the goal.
+
+For the repository test STL:
+```
+python example.py \
+  --input ./examples/111.stl \
+  --output ./examples/111_remeshed.stl \
+  --remesh-only \
+  --remesh-resolution 128 \
+  --sdf-mode exact
+```
+
 PLY vertex colors and other custom attributes are not preserved; PaMO currently processes and exports mesh geometry only.
+
+For watertight SDF remeshing with better feature preservation:
+```
+python example.py --input ./model.stl --output ./examples/model_feature_remeshed.stl --feature-remesh --remesh-resolution 256 --projection-iterations 5
+```
+
+To automatically detect sharp edges and only densify those feature edges:
+```
+python example.py \
+  --input ./model.stl \
+  --output ./examples/model_feature_dense.stl \
+  --feature-remesh \
+  --remesh-resolution 128 \
+  --projection-iterations 5 \
+  --feature-edge-angle 45 \
+  --feature-edge-target-length 0.5
+```
+
+The target length uses the same coordinate units as the input mesh. During
+feature-edge densification, matched edges can only be split: they are never
+collapsed, flipped, or smoothed away from the original feature curve. New
+vertices are projected onto the exact nearest original feature segment; a
+midpoint spatial index accelerates the query without imposing a fixed-candidate
+approximation.
+
+To specify feature edges explicitly, use a UTF-8 text file with one zero-based
+vertex-index pair per line. Commas, whitespace, blank lines, and `#` comments
+are accepted:
+```
+# feature_edges.txt
+12 13
+13, 14
+14 15
+```
+
+Then run:
+```
+python example.py \
+  --input ./model.ply \
+  --output ./examples/model_feature_dense.ply \
+  --feature-remesh \
+  --remesh-resolution 128 \
+  --feature-edges ./feature_edges.txt \
+  --feature-edge-target-length 0.5
+```
+
+Explicit indices refer to the cleaned input mesh seen by PaMO. Because STL
+files do not store shared vertex indices and are welded during loading,
+automatic angle detection is normally preferable for STL.
+
+Feature remeshing keeps the SDF-generated connectivity and applies PaMO's
+intersection-aware safe projection toward the input surface. It preserves
+existing planar caps and sharp edges better than SDF remeshing alone. Regions
+newly filled by the SDF have no corresponding surface in the input, so their
+exact shape cannot be recovered from projection alone.
+
+The first feature-edge densification implementation is conservative: it only
+splits remeshed edges that already form an explicit sharp edge near an original
+feature curve. It does not cut a feature curve through the interior of an
+existing output triangle. This preserves the SDF mesh topology, but a feature
+which is completely blurred away by a low-resolution SDF cannot be recreated
+by densification alone; increase `--remesh-resolution` in that case.
+
+For joint feature preservation and triangle-quality optimization:
+```
+python example.py \
+  --input ./model.stl \
+  --output ./examples/model_feature_optimized.stl \
+  --feature-optimize \
+  --remesh-resolution 128 \
+  --sdf-mode exact \
+  --feature-edge-angle 30 \
+  --feature-edge-target-length 8 \
+  --sdf-optimize-iterations 5 \
+  --feature-quality-iterations 3 \
+  --feature-flip-passes 1
+```
+
+The joint mode fixes mapped feature corners, permits feature-chain vertices to
+move only on original feature segments, and projects ordinary relocated
+vertices back to the original triangle surface. Edge flips are accepted only
+for non-feature manifold edges when the local minimum triangle quality
+improves without reversing or degenerating either triangle. This first version
+keeps the base face count stable except for explicitly requested feature-edge
+splits; it does not yet perform edge collapse. It requires an exact-compatible
+watertight input because projecting a repair envelope to an incomplete
+original surface would invalidate the repaired regions.
+
+For direct SDF-constrained quality optimization without simplification:
+```
+python example.py \
+  --input ./model.stl \
+  --output ./examples/model_sdf_optimized.stl \
+  --sdf-optimize \
+  --remesh-resolution 128 \
+  --sdf-optimize-iterations 20 \
+  --sdf-smoothing-step 0.2 \
+  --sdf-projection-steps 3
+```
+
+This mode keeps the SDF-extracted faces and connectivity fixed. Each iteration
+moves vertices tangentially toward their one-ring neighbor centroid, then uses
+the sampled SDF gradient to project them back to the zero level set. Its
+backtracking line search accepts a step only when a scale-invariant combination
+of edge-length variation and triangle shape improves, the SDF residual remains
+bounded, and no triangle flips or degenerates. Sharp, boundary, and
+non-manifold vertices are locked. The mode improves triangle distribution
+while preserving the SDF surface, including regions that did not exist in an
+open input mesh.
+
+Only features already represented by the sampled SDF can be preserved by this
+mode. A feature narrower than a voxel cannot be reconstructed by SDF
+optimization; use a higher `--remesh-resolution` or combine the result with
+the original-mesh feature projection when strict planes or sharp curves are
+required.
+
+For strict longest-edge refinement constrained by the original STL:
+```
+python example.py \
+  --input ./model.stl \
+  --output ./examples/model_original_constrained.stl \
+  --original-constrained-remesh \
+  --sdf-mode exact \
+  --constraint-feature-angle 5 \
+  --constraint-max-edge-length 0.5
+```
+
+The strict implementation deliberately does not use DMC connectivity. DMC
+constructs a new triangulation and therefore cannot guarantee that an original
+feature edge remains an explicit edge; snapping nearby DMC vertices only gives
+an approximation. With exact `SDF=0` semantics, the original piecewise-linear
+surface is already the zero surface, so this mode retains its connectivity as
+the constraint skeleton and refines it directly.
+
+Every edge is preserved geometrically. If a hard edge is longer than the
+global length bound, it is replaced only by two collinear child edges and its
+lineage is validated after refinement. Long non-feature edges are bisected in
+the same conforming operation. There is no edge collapse, edge flip, smoothing,
+or nearest-edge matching.
+
+Because an unsigned-distance repair envelope has different topology and is
+offset from the original surface, strict edge identity and repair-envelope
+closure cannot both be guaranteed. `--original-constrained-remesh` therefore
+requires a watertight, consistently wound input and exact mode. Open inputs
+must first be repaired into a valid closed mesh before strict refinement.
+
+### Example smoke-test scripts
+
+The scripts in `examples/` use the watertight `222.stl` input and write results
+to `examples/test_outputs/`. They require no arguments and are intended as
+direct functional smoke tests:
+```
+bash examples/test_remesh_only.sh
+bash examples/test_feature_remesh.sh
+bash examples/test_feature_optimize.sh
+bash examples/test_sdf_optimize.sh
+bash examples/test_original_constrained.sh
+bash examples/test_full_pipeline.sh
+```
+
+Run every mode in sequence with:
+```
+bash examples/test_all.sh
+```
 
 ## Usage
 ### Import
@@ -97,6 +332,66 @@ Runs only the SDF and Dual Marching Cubes remeshing stage.
 ```
 pamo = PaMO(input_mesh, use_stage1=True, use_stage3=False)
 verts, faces = pamo.remesh_only(points, triangles, resolution=256)
+```
+
+### Feature Remesh
+Runs SDF remeshing followed by safe projection, without simplification.
+```
+pamo = PaMO(input_mesh, use_stage1=True, use_stage3=True)
+verts, faces = pamo.feature_remesh(
+    points,
+    triangles,
+    resolution=256,
+    projection_iterations=5,
+    feature_edge_target_length=0.5,
+    feature_edge_angle=45.0,
+)
+```
+
+### Feature Optimize
+Runs the combined feature-preserving quality pipeline.
+```
+pamo = PaMO(input_mesh, use_stage1=True, use_stage3=True)
+verts, faces = pamo.feature_optimize(
+    points,
+    triangles,
+    resolution=128,
+    projection_iterations=2,
+    feature_edge_target_length=8.0,
+    feature_edge_angle=30.0,
+    sdf_iterations=5,
+    quality_iterations=3,
+    flip_passes=1,
+    sdf_mode="exact",
+)
+```
+
+### SDF Optimize
+Runs SDF remeshing followed by topology-preserving tangential optimization.
+```
+pamo = PaMO(input_mesh, use_stage1=True, use_stage3=False)
+verts, faces = pamo.sdf_optimize(
+    points,
+    triangles,
+    resolution=128,
+    iterations=20,
+    smoothing_step=0.2,
+    projection_steps=3,
+    feature_angle=45.0,
+)
+```
+
+### Original-constrained Remesh
+Runs strict original-connectivity refinement with hard feature lineages.
+```
+pamo = PaMO(input_mesh, use_stage1=True, use_stage3=False)
+verts, faces = pamo.original_constrained_remesh(
+    points,
+    triangles,
+    sdf_mode="exact",
+    feature_angle=5.0,
+    max_edge_length=0.5,
+)
 ```
 
 #### Parameters

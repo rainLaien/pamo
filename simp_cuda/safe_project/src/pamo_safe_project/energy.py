@@ -16,6 +16,7 @@ from .kernels.energy_kernels.collision_energy import *
 from .kernels.energy_kernels.contact_detection import *
 from .kernels.geometry_kernels import *
 from .kernels.utils_kernels import *
+from .hinge_topology import build_hinge_topology
 
 # from .kernels.utils_kernels import block_spd_project_kernel
 from .utils import wp_slice
@@ -605,41 +606,67 @@ class HingeEnergyCalculator(EnergyCalculator):
             self.rest_elens = wp.zeros(ME, dtype=wp.float32)
             self.blocks = wp.zeros((ME, 4, 4), dtype=wp.mat33)
             self.block_indices = wp.zeros((ME, 4), dtype=wp.int32)
+        self.n_hinges = 0
 
     def preprocess(self, V, F):
         s = self.system
-        c = s.config
+        topology = build_hinge_topology(F)
+        if topology.unique_edge_count != s.n_edges:
+            raise RuntimeError(
+                "Hinge topology found "
+                f"{topology.unique_edge_count} unique edges, but the system "
+                f"registered {s.n_edges}"
+            )
 
-        hinge_counter = wp.zeros(1, dtype=wp.int32)
+        self.n_hinges = topology.indices.shape[0]
+        max_hinges = self.block_indices.shape[0]
+        if self.n_hinges > max_hinges:
+            raise ValueError(
+                f"Mesh has {self.n_hinges} hinges, exceeding the configured "
+                f"capacity of {max_hinges}; increase max_particles"
+            )
 
+        excluded = (
+            topology.boundary_edge_count
+            + topology.nonmanifold_edge_count
+            + topology.inconsistent_winding_edge_count
+        )
+        if excluded:
+            logger.warning(
+                "Excluded edges from hinge energy: "
+                f"{topology.boundary_edge_count} boundary, "
+                f"{topology.nonmanifold_edge_count} non-manifold, "
+                f"{topology.inconsistent_winding_edge_count} with "
+                "inconsistent face winding"
+            )
+
+        if self.n_hinges == 0:
+            return
+
+        wp_slice(self.block_indices, 0, self.n_hinges).assign(topology.indices)
         wp.launch(
-            kernel=hinge_preprocess_slow_kernel,
-            dim=(s.n_triangles, s.n_triangles),
+            kernel=hinge_rest_geometry_kernel,
+            dim=self.n_hinges,
             inputs=[
                 s.q_rest,
-                s.triangles,
+                self.block_indices,
             ],
             outputs=[
-                hinge_counter,
-                self.block_indices,
                 self.rest_angles,
                 self.rest_elens,
             ],
             device=s.device,
         )
 
-        n_hinges = hinge_counter.numpy()[0]
-        assert (
-            n_hinges == s.n_edges
-        ), f"Number of hinges {n_hinges} != number of edges {s.n_edges}"
-
     def compute_energy(self, x: wp.array, energy: wp.array):
         s = self.system
         c = s.config
+        if self.n_hinges == 0:
+            return
 
         wp.launch(
             kernel=hinge_energy_kernel,
-            dim=s.n_edges,
+            dim=self.n_hinges,
             inputs=[
                 x,
                 self.block_indices,
@@ -658,10 +685,12 @@ class HingeEnergyCalculator(EnergyCalculator):
     ):
         s = self.system
         c = s.config
+        if self.n_hinges == 0:
+            return
         
         wp.launch(
             kernel=hinge_diff_kernel,
-            dim=s.n_edges,
+            dim=self.n_hinges,
             inputs=[
                 x,
                 self.block_indices,
@@ -679,7 +708,7 @@ class HingeEnergyCalculator(EnergyCalculator):
         )
         wp.launch(
             kernel=block_spd_project_kernel,
-            dim=s.n_edges,
+            dim=self.n_hinges,
             inputs=[
                 self.blocks,
                 c.spd_max_iters,
@@ -689,11 +718,12 @@ class HingeEnergyCalculator(EnergyCalculator):
         
     def compute_hess_dx(self, x: wp.array, dx: wp.array, hess_dx: wp.array):
         s = self.system
-        c = s.config
+        if self.n_hinges == 0:
+            return
         
         wp.launch(
             kernel=hinge_hess_dx_kernel,
-            dim=s.n_edges,
+            dim=self.n_hinges,
             inputs=[
                 self.block_indices,
                 self.blocks,
@@ -1106,4 +1136,3 @@ class CollisionWoBufferEnergyCalculator(EnergyCalculator):
             ],
             device=s.device,
         )
-

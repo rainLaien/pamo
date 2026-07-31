@@ -19,42 +19,25 @@ def compute_hinge_angle(x0: wp.vec3, x1: wp.vec3, x2: wp.vec3, x3: wp.vec3):
 
 
 @wp.kernel
-def hinge_preprocess_slow_kernel(
+def hinge_rest_geometry_kernel(
     x_rest: wp.array(dtype=wp.vec3),
-    triangles: wp.array(dtype=wp.int32, ndim=2),
-    hinge_counter: wp.array(dtype=wp.int32),
     hinge_indices: wp.array(dtype=wp.int32, ndim=2),
     rest_angles: wp.array(dtype=wp.float32),
     rest_elens: wp.array(dtype=wp.float32),
 ):
-    t0, t1 = wp.tid()
+    hinge_id = wp.tid()
+    i0 = hinge_indices[hinge_id, 0]
+    i1 = hinge_indices[hinge_id, 1]
+    i2 = hinge_indices[hinge_id, 2]
+    i3 = hinge_indices[hinge_id, 3]
 
-    for e0 in range(3):
-        for e1 in range(3):
-            i00 = triangles[t0, e0]
-            i01 = triangles[t0, (e0 + 1) % 3]
-            i10 = triangles[t1, e1]
-            i11 = triangles[t1, (e1 + 1) % 3]
+    x0 = x_rest[i0]
+    x1 = x_rest[i1]
+    x2 = x_rest[i2]
+    x3 = x_rest[i3]
 
-            if i00 == i11 and i01 == i10 and i00 < i01:
-                i0 = triangles[t0, (e0 + 2) % 3]
-                i1 = i00
-                i2 = i01
-                i3 = triangles[t1, (e1 + 2) % 3]
-
-                hinge_id = wp.atomic_add(hinge_counter, 0, 1)
-                hinge_indices[hinge_id, 0] = i0
-                hinge_indices[hinge_id, 1] = i1
-                hinge_indices[hinge_id, 2] = i2
-                hinge_indices[hinge_id, 3] = i3
-
-                x0 = x_rest[i0]
-                x1 = x_rest[i1]
-                x2 = x_rest[i2]
-                x3 = x_rest[i3]
-
-                rest_angles[hinge_id] = compute_hinge_angle(x0, x1, x2, x3)
-                rest_elens[hinge_id] = wp.length(x1 - x2)
+    rest_angles[hinge_id] = compute_hinge_angle(x0, x1, x2, x3)
+    rest_elens[hinge_id] = wp.length(x1 - x2)
 
 
 @wp.kernel
