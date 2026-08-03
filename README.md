@@ -53,7 +53,7 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--remesh-only`**: Run only the SDF remeshing stage, without simplification or safe projection. Valid closed inputs use the original signed `SDF=0` surface by default.
 - **`--feature-remesh`**: Run SDF remeshing followed by safe projection back toward the original mesh. This closes the surface without simplification and preserves planes, sharp edges, and other geometric features better than `--remesh-only`.
 - **`--feature-optimize`**: Run the joint feature-preserving quality pipeline: SDF quality relocation, safe projection, optional feature-chain densification, corner/curve-constrained relocation, and quality-driven flips of non-feature edges.
-- **`--surface-sample-remesh`**: Bypass SDF topology. Sample points directly on original triangles with CUDA area sampling and radius filtering, locally retriangulate source faces, collapse short edges only inside a smooth patch, bisect long edges, and run conflict-free CUDA quality flips. Detected feature-chain vertices are explicitly locked; smooth interior vertices may be removed to improve uniformity.
+- **`--surface-sample-remesh`**: Bypass SDF topology. Sample points directly on original triangles with CUDA area sampling and radius filtering, locally retriangulate source faces, collapse short edges only inside a smooth patch, bisect long edges, and run conflict-free CUDA quality flips. Detected feature-chain vertices are explicitly locked. High-quality source faces are refinement-only by default, and curved neighborhoods are protected by source-normal and source-plane deviation checks.
 - **`--remesh-resolution`**: Set the SDF grid resolution used by the remesh modes. Supported values are 64, 128, and 256; higher values preserve more detail but use more GPU memory.
 - **`--sdf-mode`**: Select `auto`, `exact`, or `repair`, default=`auto`. `auto` uses the original signed zero surface for watertight, consistently wound inputs and explicitly falls back to a repair envelope otherwise. `exact` rejects open or invalid inputs. `repair` extracts a 0.9-voxel unsigned-distance envelope.
 - **`--projection-iterations`**: Set the number of safe-projection iterations used by `--feature-remesh`, default=5.
@@ -77,6 +77,11 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--surface-min-edge-ratio`**: Short-edge collapse threshold divided by the Poisson radius, default=0.5. Collapses must remain inside one smooth patch and improve local quality.
 - **`--surface-split-passes`**: Maximum conflict-free CUDA long-edge split batches, default=64.
 - **`--surface-collapse-passes`**: Maximum feature-safe CUDA short-edge collapse batches before refinement, default=24; a smaller cleanup phase also runs after splitting.
+- **`--surface-protect-source-quality`**: Make original triangles at or above this normalized quality refinement-only: they may be split, but their source lineage cannot be collapsed, flipped, or relaxed. The default is `0.8`; use `0` to disable this protection.
+- **`--surface-max-normal-deviation`**: Maximum source-normal cone half-angle, in degrees, allowed in a collapse one-ring. The default is `5`; smaller values preserve rounded regions more aggressively.
+- **`--surface-max-deviation-ratio`**: Maximum source-plane deviation introduced by collapse or flip, divided by the Poisson radius. The default is `0.05`; smaller values prevent flat chords across rounded regions more aggressively.
+- **`--surface-min-collapse-quality`**: Also make edges adjacent to triangles below this normalized quality eligible for controlled collapse, even when the edge is not shorter than the minimum edge ratio. The default is `0.25`; use `0` to keep short-edge-only behavior.
+- **`--surface-coplanar-angle`**: Treat adjacent source faces within this normal angle as one coplanar patch for source-edge refinement. Internal coplanar edges are no longer subdivided as hard source boundaries; the default is `1` degree.
 - **`--original-constrained-remesh`**: Preserve the original triangle connectivity as a hard constraint skeleton. No input edge is collapsed or flipped. Edges sharper than the feature threshold, boundaries, and non-manifold edges remain explicit edge chains and may only be split collinearly.
 - **`--constraint-feature-angle`**: Mark every original manifold edge whose adjacent-face dihedral is strictly greater than this angle as a hard feature, default=5 degrees.
 - **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. If the current longest edge already satisfies it, no vertices or faces are inserted.
@@ -102,6 +107,9 @@ python example.py \
   --feature-edge-angle 30 \
   --surface-max-edge-ratio 2.0 \
   --surface-min-edge-ratio 0.5 \
+  --surface-protect-source-quality 0.8 \
+  --surface-max-normal-deviation 5 \
+  --surface-max-deviation-ratio 0.05 \
   --surface-flip-passes 32
 ```
 

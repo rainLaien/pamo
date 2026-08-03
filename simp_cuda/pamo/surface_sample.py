@@ -416,6 +416,37 @@ def original_surface_patch_ids(faces, vertex_count, feature_edges):
     return labels.astype(np.int64, copy=False)
 
 
+def coplanar_internal_edges(
+    mesh,
+    feature_edges=None,
+    angle_degrees=1.0,
+):
+    """Return manifold source edges that are coplanar and non-feature."""
+    angle_degrees = float(angle_degrees)
+    if not 0.0 <= angle_degrees < 180.0:
+        raise ValueError("Coplanar edge angle must be in [0, 180).")
+    adjacency_edges = np.asarray(mesh.face_adjacency_edges, dtype=np.int64)
+    adjacency_angles = np.asarray(mesh.face_adjacency_angles, dtype=np.float64)
+    if len(adjacency_edges) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    coplanar = adjacency_angles <= np.deg2rad(angle_degrees)
+    if feature_edges is not None and len(feature_edges):
+        feature_keys = set(
+            map(
+                tuple,
+                np.sort(np.asarray(feature_edges, dtype=np.int64), axis=1),
+            )
+        )
+        coplanar &= np.asarray(
+            [tuple(edge) not in feature_keys for edge in adjacency_edges],
+            dtype=bool,
+        )
+    return np.unique(
+        np.sort(adjacency_edges[coplanar], axis=1),
+        axis=0,
+    )
+
+
 def subdivide_original_faces(
     vertices,
     faces,
@@ -424,6 +455,7 @@ def subdivide_original_faces(
     sample_barycentric,
     edge_target_length=None,
     eligible_face_mask=None,
+    protected_internal_edges=None,
 ):
     """
     Insert samples into their original triangles and retriangulate locally.
@@ -497,6 +529,19 @@ def subdivide_original_faces(
         edge_inverse,
         np.tile(eligible_face_mask, 3),
     )
+    if protected_internal_edges is not None and len(protected_internal_edges):
+        protected_keys = {
+            tuple(edge)
+            for edge in np.sort(
+                np.asarray(protected_internal_edges, dtype=np.int64),
+                axis=1,
+            )
+        }
+        protected_edge_mask = np.asarray(
+            [tuple(edge) in protected_keys for edge in unique_edges],
+            dtype=bool,
+        )
+        edge_is_safe &= ~protected_edge_mask
     active_edge_ids = active_edge_ids[edge_is_safe[active_edge_ids]]
     edge_point_ids = {}
     edge_point_parameters = {}
@@ -841,6 +886,7 @@ def _gpu_split_long_edges(
     support_face_ids,
     maximum_edge_length,
     maximum_passes,
+    protected_edges=None,
 ):
     """
     Bisect conflict-free long edges until the requested bound is reached.
@@ -861,6 +907,14 @@ def _gpu_split_long_edges(
     face_patch_ids = face_patch_ids.clone()
     face_source_ids = face_source_ids.clone()
     support_face_ids = support_face_ids.clone()
+    if protected_edges is not None:
+        protected_edges = protected_edges.to(
+            device=faces.device,
+            dtype=torch.long,
+        )
+        protected_edges = torch.sort(protected_edges, dim=1).values
+    else:
+        protected_edges = None
     total_splits = 0
 
     for _ in range(maximum_passes):
@@ -874,6 +928,21 @@ def _gpu_split_long_edges(
             (edge_lengths > maximum_edge_length)
             & (topology["counts"] <= 2)
         ).reshape(-1)
+        if protected_edges is not None and len(candidate_groups):
+            protected_edge_keys = (
+                protected_edges[:, 0] * len(vertices)
+                + protected_edges[:, 1]
+            )
+            edge_keys = (
+                topology["edges"][:, 0] * len(vertices)
+                + topology["edges"][:, 1]
+            )
+            candidate_groups = candidate_groups[
+                ~torch.isin(
+                    edge_keys[candidate_groups],
+                    protected_edge_keys,
+                )
+            ]
         if len(candidate_groups) == 0:
             return (
                 vertices,
@@ -1196,6 +1265,10 @@ def _gpu_evaluate_collapse_direction(
     candidate_face_pairs,
     remove_first,
     maximum_edge_length,
+    face_source_ids=None,
+    source_face_origins=None,
+    source_face_normals=None,
+    maximum_surface_deviation=None,
 ):
     """Validate one endpoint choice for every short-edge candidate."""
     candidate_ids = candidate_face_pairs[:, 0]
@@ -1249,10 +1322,36 @@ def _gpu_evaluate_collapse_direction(
     )
     old_quality = _triangle_quality_torch(vertices, old_faces)
     new_quality = _triangle_quality_torch(vertices, new_faces)
+    surface_deviation_invalid = torch.zeros(
+        len(new_faces),
+        dtype=torch.bool,
+        device=faces.device,
+    )
+    if (
+        maximum_surface_deviation is not None
+        and face_source_ids is not None
+        and source_face_origins is not None
+        and source_face_normals is not None
+    ):
+        active_source_ids = face_source_ids[face_ids[nondegenerate]]
+        source_origins = source_face_origins[active_source_ids]
+        source_normals = source_face_normals[active_source_ids]
+        plane_distances = (
+            (
+                new_triangles
+                - source_origins[:, None, :]
+            )
+            * source_normals[:, None, :]
+        ).sum(dim=2).abs()
+        surface_deviation_invalid = (
+            plane_distances.amax(dim=1)
+            > float(maximum_surface_deviation)
+        )
     invalid_face = (
         ~torch.isfinite(new_edge_lengths).all(dim=1)
         | (new_cross_squared <= minimum_cross_squared)
         | (orientation <= 0.0)
+        | surface_deviation_invalid
         | (
             new_edge_lengths.amax(dim=1)
             > torch.maximum(
@@ -1317,24 +1416,48 @@ def _gpu_collapse_short_edges(
     minimum_edge_length,
     maximum_edge_length,
     passes,
+    protected_source_face_mask=None,
+    source_face_origins=None,
+    source_face_normals=None,
+    maximum_normal_deviation_degrees=None,
+    maximum_surface_deviation=None,
+    minimum_collapse_quality=0.0,
 ):
     """
     Collapse independent short edges inside smooth patches on CUDA.
 
     Hard-edge and boundary vertices are locked. The endpoint retained by each
     collapse is already on the original STL, avoiding an off-surface midpoint.
-    Link-condition, orientation, quality, and maximum-edge checks are applied
-    before each parallel batch.
+    Link-condition, source-lineage protection, source-normal cone, surface
+    deviation, orientation, quality, and maximum-edge checks are applied before
+    each parallel batch.
     """
     minimum_edge_length = float(minimum_edge_length)
     maximum_edge_length = float(maximum_edge_length)
     passes = int(passes)
+    minimum_collapse_quality = float(minimum_collapse_quality)
     if minimum_edge_length < 0.0:
         raise ValueError("Minimum surface edge length must be non-negative.")
     if maximum_edge_length <= 0.0:
         raise ValueError("Maximum surface edge length must be positive.")
     if passes < 0:
         raise ValueError("Surface collapse passes must be non-negative.")
+    if not 0.0 <= minimum_collapse_quality <= 1.0:
+        raise ValueError("Minimum collapse quality must be in [0, 1].")
+    if (
+        maximum_normal_deviation_degrees is not None
+        and not 0.0 <= float(maximum_normal_deviation_degrees) <= 180.0
+    ):
+        raise ValueError(
+            "Maximum collapse normal deviation must be in [0, 180] degrees."
+        )
+    if (
+        maximum_surface_deviation is not None
+        and float(maximum_surface_deviation) < 0.0
+    ):
+        raise ValueError(
+            "Maximum collapse surface deviation must be non-negative."
+        )
     if minimum_edge_length == 0.0 or passes == 0:
         return (
             vertices,
@@ -1350,6 +1473,21 @@ def _gpu_collapse_short_edges(
     face_patch_ids = face_patch_ids.clone()
     face_source_ids = face_source_ids.clone()
     support_face_ids = support_face_ids.clone()
+    if protected_source_face_mask is not None:
+        protected_source_face_mask = protected_source_face_mask.to(
+            device=faces.device,
+            dtype=torch.bool,
+        )
+    if source_face_origins is not None:
+        source_face_origins = source_face_origins.to(
+            device=vertices.device,
+            dtype=vertices.dtype,
+        )
+    if source_face_normals is not None:
+        source_face_normals = source_face_normals.to(
+            device=vertices.device,
+            dtype=vertices.dtype,
+        )
     total_collapses = 0
 
     for _ in range(passes):
@@ -1391,9 +1529,20 @@ def _gpu_collapse_short_edges(
             - vertices[manifold_edges[:, 0]],
             dim=1,
         )
+        face_quality = _triangle_quality_torch(vertices, faces)
+        adjacent_quality = torch.minimum(
+            face_quality[first_faces],
+            face_quality[second_faces],
+        )
         candidate_mask = (
             same_patch
-            & (edge_lengths < minimum_edge_length)
+            & (
+                (edge_lengths < minimum_edge_length)
+                | (
+                    adjacent_quality
+                    < minimum_collapse_quality
+                )
+            )
             & ~(
                 locked[manifold_edges[:, 0]]
                 & locked[manifold_edges[:, 1]]
@@ -1456,9 +1605,62 @@ def _gpu_collapse_short_edges(
             pair_candidates,
             patch_mismatch.to(torch.long),
         )
-        patch_valid = mismatch_counts == 0
-        if not bool(patch_valid.all()):
-            valid_ids = torch.nonzero(patch_valid).reshape(-1)
+        topology_valid = mismatch_counts == 0
+        pair_source_ids = face_source_ids[pair_faces]
+        if protected_source_face_mask is not None:
+            protected_counts = torch.zeros(
+                len(candidate_edges),
+                dtype=torch.long,
+                device=faces.device,
+            )
+            protected_counts.index_add_(
+                0,
+                pair_candidates,
+                protected_source_face_mask[pair_source_ids].to(torch.long),
+            )
+            topology_valid &= protected_counts == 0
+        if (
+            source_face_normals is not None
+            and maximum_normal_deviation_degrees is not None
+            and float(maximum_normal_deviation_degrees) < 180.0
+        ):
+            pair_normals = source_face_normals[pair_source_ids]
+            normal_sums = torch.zeros(
+                (len(candidate_edges), 3),
+                dtype=vertices.dtype,
+                device=vertices.device,
+            )
+            normal_sums.index_add_(0, pair_candidates, pair_normals)
+            cone_axes = normal_sums / torch.linalg.norm(
+                normal_sums,
+                dim=1,
+                keepdim=True,
+            ).clamp_min(torch.finfo(vertices.dtype).eps)
+            alignments = (
+                pair_normals * cone_axes[pair_candidates]
+            ).sum(dim=1)
+            minimum_alignment = torch.ones(
+                len(candidate_edges),
+                dtype=vertices.dtype,
+                device=vertices.device,
+            )
+            minimum_alignment.scatter_reduce_(
+                0,
+                pair_candidates,
+                alignments,
+                reduce="amin",
+                include_self=True,
+            )
+            cosine_limit = float(
+                np.cos(
+                    np.deg2rad(
+                        float(maximum_normal_deviation_degrees)
+                    )
+                )
+            )
+            topology_valid &= minimum_alignment >= cosine_limit
+        if not bool(topology_valid.all()):
+            valid_ids = torch.nonzero(topology_valid).reshape(-1)
             old_to_new = torch.full(
                 (len(candidate_edges),),
                 -1,
@@ -1470,18 +1672,18 @@ def _gpu_collapse_short_edges(
                 dtype=torch.long,
                 device=faces.device,
             )
-            keep_pairs = patch_valid[candidate_face_pairs[:, 0]]
+            keep_pairs = topology_valid[candidate_face_pairs[:, 0]]
             candidate_face_pairs = candidate_face_pairs[keep_pairs]
             candidate_face_pairs[:, 0] = old_to_new[
                 candidate_face_pairs[:, 0]
             ]
-            keep_footprints = patch_valid[footprint_pairs[:, 0]]
+            keep_footprints = topology_valid[footprint_pairs[:, 0]]
             footprint_pairs = footprint_pairs[keep_footprints]
             footprint_pairs[:, 0] = old_to_new[
                 footprint_pairs[:, 0]
             ]
-            candidate_edges = candidate_edges[patch_valid]
-            candidate_lengths = candidate_lengths[patch_valid]
+            candidate_edges = candidate_edges[topology_valid]
+            candidate_lengths = candidate_lengths[topology_valid]
         if len(candidate_edges) == 0:
             break
 
@@ -1497,6 +1699,10 @@ def _gpu_collapse_short_edges(
             candidate_face_pairs,
             remove_first,
             maximum_edge_length,
+            face_source_ids=face_source_ids,
+            source_face_origins=source_face_origins,
+            source_face_normals=source_face_normals,
+            maximum_surface_deviation=maximum_surface_deviation,
         )
         second_valid, second_energy = _gpu_evaluate_collapse_direction(
             vertices,
@@ -1505,6 +1711,10 @@ def _gpu_collapse_short_edges(
             candidate_face_pairs,
             ~remove_first,
             maximum_edge_length,
+            face_source_ids=face_source_ids,
+            source_face_origins=source_face_origins,
+            source_face_normals=source_face_normals,
+            maximum_surface_deviation=maximum_surface_deviation,
         )
         first_valid &= ~locked[candidate_edges[:, 0]]
         second_valid &= ~locked[candidate_edges[:, 1]]
@@ -1607,10 +1817,56 @@ def _gpu_flip_quality_edges(
     passes,
     maximum_edge_length=None,
     protected_vertex_mask=None,
+    face_source_ids=None,
+    protected_source_face_mask=None,
+    source_face_origins=None,
+    source_face_normals=None,
+    maximum_normal_deviation_degrees=None,
+    maximum_surface_deviation=None,
+    protected_edges=None,
 ):
-    """Flip conflict-free same-patch edges in parallel on the GPU."""
+    """Flip conflict-free same-patch, source-safe edges on the GPU."""
     faces = faces.clone()
     face_patch_ids = face_patch_ids.to(device=faces.device, dtype=torch.long)
+    if face_source_ids is not None:
+        face_source_ids = face_source_ids.to(
+            device=faces.device,
+            dtype=torch.long,
+        )
+    if protected_source_face_mask is not None:
+        protected_source_face_mask = protected_source_face_mask.to(
+            device=faces.device,
+            dtype=torch.bool,
+        )
+    if source_face_origins is not None:
+        source_face_origins = source_face_origins.to(
+            device=vertices.device,
+            dtype=vertices.dtype,
+        )
+    if source_face_normals is not None:
+        source_face_normals = source_face_normals.to(
+            device=vertices.device,
+            dtype=vertices.dtype,
+        )
+    if protected_edges is not None:
+        protected_edges = torch.sort(
+            protected_edges.to(device=faces.device, dtype=torch.long),
+            dim=1,
+        ).values
+    if (
+        maximum_normal_deviation_degrees is not None
+        and not 0.0 <= float(maximum_normal_deviation_degrees) <= 180.0
+    ):
+        raise ValueError(
+            "Maximum flip normal deviation must be in [0, 180] degrees."
+        )
+    if (
+        maximum_surface_deviation is not None
+        and float(maximum_surface_deviation) < 0.0
+    ):
+        raise ValueError(
+            "Maximum flip surface deviation must be non-negative."
+        )
     vertex_count = len(vertices)
     total_flips = 0
     epsilon = torch.finfo(vertices.dtype).eps
@@ -1664,6 +1920,24 @@ def _gpu_flip_quality_edges(
         second_end = directed_edges[second_entries, 1]
         first_opposite = opposite[first_entries]
         second_opposite = opposite[second_entries]
+        coplanar_source_edge = torch.zeros(
+            len(manifold),
+            dtype=torch.bool,
+            device=faces.device,
+        )
+        if protected_edges is not None and len(protected_edges):
+            current_edge_keys = (
+                torch.minimum(first_start, first_end) * vertex_count
+                + torch.maximum(first_start, first_end)
+            )
+            protected_edge_keys = (
+                protected_edges[:, 0] * vertex_count
+                + protected_edges[:, 1]
+            )
+            coplanar_source_edge = torch.isin(
+                current_edge_keys,
+                protected_edge_keys,
+            )
 
         valid = (
             (second_start == first_end)
@@ -1674,6 +1948,35 @@ def _gpu_flip_quality_edges(
                 == face_patch_ids[second_faces]
             )
         )
+        if (
+            face_source_ids is not None
+            and protected_source_face_mask is not None
+        ):
+            first_sources = face_source_ids[first_faces]
+            second_sources = face_source_ids[second_faces]
+            valid &= ~(
+                protected_source_face_mask[first_sources]
+                | protected_source_face_mask[second_sources]
+            )
+        if (
+            face_source_ids is not None
+            and source_face_normals is not None
+            and maximum_normal_deviation_degrees is not None
+            and float(maximum_normal_deviation_degrees) < 90.0
+        ):
+            first_sources = face_source_ids[first_faces]
+            second_sources = face_source_ids[second_faces]
+            source_alignment = (
+                source_face_normals[first_sources]
+                * source_face_normals[second_sources]
+            ).sum(dim=1)
+            pairwise_limit = min(
+                180.0,
+                2.0 * float(maximum_normal_deviation_degrees),
+            )
+            valid &= source_alignment >= float(
+                np.cos(np.deg2rad(pairwise_limit))
+            )
         if protected_vertex_mask is not None:
             valid &= ~(
                 protected_vertex_mask[first_start]
@@ -1743,6 +2046,35 @@ def _gpu_flip_quality_edges(
                 > minimum_cross_squared
             )
         )
+        if (
+            maximum_surface_deviation is not None
+            and face_source_ids is not None
+            and source_face_origins is not None
+            and source_face_normals is not None
+        ):
+            first_sources = face_source_ids[first_faces]
+            second_sources = face_source_ids[second_faces]
+            first_distances = (
+                (
+                    vertices[replacement_first]
+                    - source_face_origins[first_sources, None, :]
+                )
+                * source_face_normals[first_sources, None, :]
+            ).sum(dim=2).abs()
+            second_distances = (
+                (
+                    vertices[replacement_second]
+                    - source_face_origins[second_sources, None, :]
+                )
+                * source_face_normals[second_sources, None, :]
+            ).sum(dim=2).abs()
+            geometry_valid &= (
+                first_distances.amax(dim=1)
+                <= float(maximum_surface_deviation)
+            ) & (
+                second_distances.amax(dim=1)
+                <= float(maximum_surface_deviation)
+            )
         old_quality_first = _triangle_quality_torch(vertices, old_first)
         old_quality_second = _triangle_quality_torch(vertices, old_second)
         new_quality_first = _triangle_quality_torch(
@@ -1768,6 +2100,23 @@ def _gpu_flip_quality_edges(
                 >= old_quality_first + old_quality_second - 1e-10
             )
         )
+        if bool(coplanar_source_edge[candidate_ids].any()):
+            coplanar_candidates = coplanar_source_edge[candidate_ids]
+            old_edge_start = torch.minimum(first_start, first_end)
+            old_edge_end = torch.maximum(first_start, first_end)
+            new_edge_start = torch.minimum(first_opposite, second_opposite)
+            new_edge_end = torch.maximum(first_opposite, second_opposite)
+            old_keys = old_edge_start * vertex_count + old_edge_end
+            new_keys = new_edge_start * vertex_count + new_edge_end
+            equal_or_better = (
+                (new_minimum >= old_minimum - 1e-8)
+                & (
+                    new_quality_first + new_quality_second
+                    >= old_quality_first + old_quality_second - 1e-8
+                )
+                & (new_keys > old_keys)
+            )
+            quality_valid |= coplanar_candidates & equal_or_better
         valid_candidates = torch.nonzero(
             geometry_valid & quality_valid
         ).reshape(-1)
@@ -1845,6 +2194,88 @@ def _project_to_support_triangles(points, support_triangles):
     return (support_triangles * barycentric[:, :, None]).sum(dim=1)
 
 
+def _gpu_source_sensitive_vertex_mask(
+    faces,
+    face_source_ids,
+    source_face_normals,
+    protected_source_face_mask=None,
+    maximum_normal_deviation_degrees=None,
+):
+    """
+    Mark vertices whose incident source lineage must not be optimized.
+
+    Vertices touching a refinement-only source face are always marked. Vertices
+    shared by source faces outside the requested normal cone are also marked so
+    relaxation cannot pull a source-edge sample into just one side of a rounded
+    region.
+    """
+    vertex_count = int(faces.max().item()) + 1 if len(faces) else 0
+    sensitive = torch.zeros(
+        vertex_count,
+        dtype=torch.bool,
+        device=faces.device,
+    )
+    face_source_ids = face_source_ids.to(
+        device=faces.device,
+        dtype=torch.long,
+    )
+    if protected_source_face_mask is not None:
+        protected_source_face_mask = protected_source_face_mask.to(
+            device=faces.device,
+            dtype=torch.bool,
+        )
+        protected_faces = protected_source_face_mask[face_source_ids]
+        if bool(protected_faces.any()):
+            sensitive[faces[protected_faces].reshape(-1)] = True
+    if (
+        source_face_normals is None
+        or maximum_normal_deviation_degrees is None
+        or float(maximum_normal_deviation_degrees) >= 180.0
+        or len(faces) == 0
+    ):
+        return sensitive
+
+    source_face_normals = source_face_normals.to(
+        device=faces.device,
+    )
+    incidence_vertices = faces.reshape(-1)
+    incidence_sources = face_source_ids[:, None].expand(-1, 3).reshape(-1)
+    incidence_normals = source_face_normals[incidence_sources]
+    normal_sums = torch.zeros(
+        (vertex_count, 3),
+        dtype=incidence_normals.dtype,
+        device=faces.device,
+    )
+    normal_sums.index_add_(0, incidence_vertices, incidence_normals)
+    cone_axes = normal_sums / torch.linalg.norm(
+        normal_sums,
+        dim=1,
+        keepdim=True,
+    ).clamp_min(torch.finfo(incidence_normals.dtype).eps)
+    alignments = (
+        incidence_normals * cone_axes[incidence_vertices]
+    ).sum(dim=1)
+    minimum_alignment = torch.ones(
+        vertex_count,
+        dtype=incidence_normals.dtype,
+        device=faces.device,
+    )
+    minimum_alignment.scatter_reduce_(
+        0,
+        incidence_vertices,
+        alignments,
+        reduce="amin",
+        include_self=True,
+    )
+    cosine_limit = float(
+        np.cos(
+            np.deg2rad(float(maximum_normal_deviation_degrees))
+        )
+    )
+    sensitive |= minimum_alignment < cosine_limit
+    return sensitive
+
+
 def _gpu_relax_inserted_vertices(
     vertices,
     faces,
@@ -1853,14 +2284,31 @@ def _gpu_relax_inserted_vertices(
     support_face_ids,
     iterations,
     smoothing_step,
+    protected_source_face_mask=None,
+    protected_vertex_mask=None,
 ):
-    """Move only inserted points, keeping them on their original triangles."""
+    """Move unprotected inserted points on their original source triangles."""
     current = vertices.clone()
     support_face_ids = support_face_ids.to(
         device=vertices.device,
         dtype=torch.long,
     )
-    movable = torch.nonzero(support_face_ids >= 0).reshape(-1)
+    movable_mask = support_face_ids >= 0
+    if protected_source_face_mask is not None:
+        protected_source_face_mask = protected_source_face_mask.to(
+            device=vertices.device,
+            dtype=torch.bool,
+        )
+        supported = torch.nonzero(movable_mask).reshape(-1)
+        movable_mask[supported] &= ~protected_source_face_mask[
+            support_face_ids[supported]
+        ]
+    if protected_vertex_mask is not None:
+        movable_mask &= ~protected_vertex_mask.to(
+            device=vertices.device,
+            dtype=torch.bool,
+        )
+    movable = torch.nonzero(movable_mask).reshape(-1)
     if len(movable) == 0:
         return current, 0
 
@@ -1944,12 +2392,20 @@ def surface_sample_remesh(
     minimum_edge_ratio=0.5,
     split_passes=64,
     collapse_passes=24,
+    protected_source_quality=0.8,
+    maximum_normal_deviation_degrees=5.0,
+    maximum_surface_deviation_ratio=0.05,
+    minimum_collapse_quality=0.25,
+    coplanar_angle_degrees=1.0,
 ):
     """
     Sample the original surface, locally retriangulate, and optimize on CUDA.
 
     Feature edges remain exact. Long edges are bisected before topology
-    optimization; short edges are collapsed only inside one smooth patch.
+    optimization. High-quality source faces are refinement-only, while
+    collapse and flip operations are bounded by a source-normal cone and a
+    source-plane deviation tolerance to prevent rounded regions from being
+    replaced by flat chords.
     """
     if not vertices.is_cuda or not faces.is_cuda:
         raise ValueError("Surface sample remeshing requires CUDA tensors.")
@@ -1965,6 +2421,15 @@ def surface_sample_remesh(
     minimum_edge_ratio = float(minimum_edge_ratio)
     split_passes = int(split_passes)
     collapse_passes = int(collapse_passes)
+    protected_source_quality = float(protected_source_quality)
+    maximum_normal_deviation_degrees = float(
+        maximum_normal_deviation_degrees
+    )
+    maximum_surface_deviation_ratio = float(
+        maximum_surface_deviation_ratio
+    )
+    minimum_collapse_quality = float(minimum_collapse_quality)
+    coplanar_angle_degrees = float(coplanar_angle_degrees)
     if not 0.0 <= minimum_source_quality < 1.0:
         raise ValueError("Minimum source quality must be in [0, 1).")
     if minimum_source_area_ratio < 0.0:
@@ -1981,6 +2446,20 @@ def surface_sample_remesh(
             "Surface split passes must be positive and collapse passes "
             "must be non-negative."
         )
+    if not 0.0 <= protected_source_quality <= 1.0:
+        raise ValueError("Protected source quality must be in [0, 1].")
+    if not 0.0 <= maximum_normal_deviation_degrees <= 180.0:
+        raise ValueError(
+            "Maximum source-normal deviation must be in [0, 180] degrees."
+        )
+    if maximum_surface_deviation_ratio < 0.0:
+        raise ValueError(
+            "Maximum surface-deviation ratio must be non-negative."
+        )
+    if not 0.0 <= minimum_collapse_quality <= 1.0:
+        raise ValueError("Minimum collapse quality must be in [0, 1].")
+    if not 0.0 <= coplanar_angle_degrees < 180.0:
+        raise ValueError("Coplanar angle must be in [0, 180).")
 
     reference_vertices = np.asarray(reference_mesh.vertices, dtype=np.float64)
     reference_faces = np.asarray(reference_mesh.faces, dtype=np.int64)
@@ -1989,6 +2468,11 @@ def surface_sample_remesh(
         feature_edges=feature_edges,
         angle_degrees=feature_angle_degrees,
         include_boundaries=True,
+    )
+    coplanar_edges = coplanar_internal_edges(
+        reference_mesh,
+        feature_edges=reference_features,
+        angle_degrees=coplanar_angle_degrees,
     )
     patch_ids = original_surface_patch_ids(
         reference_faces,
@@ -2012,6 +2496,24 @@ def surface_sample_remesh(
         reference_vertices,
         reference_faces,
     )
+    protected_source_faces = (
+        protected_source_quality > 0.0
+    ) & (
+        source_qualities >= protected_source_quality
+    )
+    source_triangles = reference_vertices[reference_faces]
+    source_cross = np.cross(
+        source_triangles[:, 1] - source_triangles[:, 0],
+        source_triangles[:, 2] - source_triangles[:, 0],
+    )
+    source_cross_lengths = np.linalg.norm(source_cross, axis=1)
+    source_normals = np.divide(
+        source_cross,
+        source_cross_lengths[:, None],
+        out=np.zeros_like(source_cross),
+        where=source_cross_lengths[:, None] > 0.0,
+    )
+    source_origins = source_triangles[:, 0]
     eligible_face_mask = (
         (source_qualities >= minimum_source_quality)
         & (
@@ -2054,6 +2556,7 @@ def surface_sample_remesh(
             sampled_barycentric,
             edge_target_length=poisson_radius,
             eligible_face_mask=eligible_face_mask,
+            protected_internal_edges=coplanar_edges,
         )
         float_vertices = output_vertices.astype(np.float32)
         float_triangles = float_vertices[output_faces]
@@ -2130,8 +2633,28 @@ def surface_sample_remesh(
         dtype=torch.long,
         device=device,
     )
+    gpu_protected_source_faces = torch.as_tensor(
+        protected_source_faces,
+        dtype=torch.bool,
+        device=device,
+    )
+    gpu_source_origins = torch.as_tensor(
+        source_origins,
+        dtype=vertices.dtype,
+        device=device,
+    )
+    gpu_source_normals = torch.as_tensor(
+        source_normals,
+        dtype=vertices.dtype,
+        device=device,
+    )
     gpu_support_face_ids = torch.as_tensor(
         support_face_ids,
+        dtype=torch.long,
+        device=device,
+    )
+    gpu_coplanar_edges = torch.as_tensor(
+        coplanar_edges,
         dtype=torch.long,
         device=device,
     )
@@ -2150,6 +2673,17 @@ def surface_sample_remesh(
     minimum_edge_length = (
         float(poisson_radius) * minimum_edge_ratio
     )
+    reference_diameter = float(
+        np.max(np.ptp(reference_vertices, axis=0))
+    )
+    numeric_surface_tolerance = max(
+        reference_diameter,
+        float(poisson_radius),
+    ) * 1e-7
+    maximum_surface_deviation = max(
+        float(poisson_radius) * maximum_surface_deviation_ratio,
+        numeric_surface_tolerance,
+    )
     (
         gpu_vertices,
         gpu_faces,
@@ -2166,6 +2700,14 @@ def surface_sample_remesh(
         minimum_edge_length,
         maximum_edge_length,
         collapse_passes,
+        protected_source_face_mask=gpu_protected_source_faces,
+        source_face_origins=gpu_source_origins,
+        source_face_normals=gpu_source_normals,
+        maximum_normal_deviation_degrees=(
+            maximum_normal_deviation_degrees
+        ),
+        maximum_surface_deviation=maximum_surface_deviation,
+        minimum_collapse_quality=minimum_collapse_quality,
     )
     (
         gpu_vertices,
@@ -2183,6 +2725,7 @@ def surface_sample_remesh(
         gpu_support_face_ids,
         maximum_edge_length,
         split_passes,
+        protected_edges=gpu_coplanar_edges,
     )
     (
         gpu_vertices,
@@ -2200,15 +2743,44 @@ def surface_sample_remesh(
         minimum_edge_length,
         maximum_edge_length,
         collapse_passes // 2,
+        protected_source_face_mask=gpu_protected_source_faces,
+        source_face_origins=gpu_source_origins,
+        source_face_normals=gpu_source_normals,
+        maximum_normal_deviation_degrees=(
+            maximum_normal_deviation_degrees
+        ),
+        maximum_surface_deviation=maximum_surface_deviation,
+        minimum_collapse_quality=minimum_collapse_quality,
     )
     collapse_count = pre_collapse_count + post_collapse_count
+    gpu_source_sensitive_vertices = _gpu_source_sensitive_vertex_mask(
+        gpu_faces,
+        gpu_source_face_ids,
+        gpu_source_normals,
+        protected_source_face_mask=gpu_protected_source_faces,
+        maximum_normal_deviation_degrees=(
+            maximum_normal_deviation_degrees
+        ),
+    )
     gpu_faces, flip_count = _gpu_flip_quality_edges(
         gpu_vertices,
         gpu_faces,
         gpu_patch_ids,
         flip_passes,
         maximum_edge_length=maximum_edge_length,
-        protected_vertex_mask=gpu_support_face_ids < -1,
+        protected_vertex_mask=(
+            (gpu_support_face_ids < -1)
+            | gpu_source_sensitive_vertices
+        ),
+        face_source_ids=gpu_source_face_ids,
+        protected_source_face_mask=gpu_protected_source_faces,
+        source_face_origins=gpu_source_origins,
+        source_face_normals=gpu_source_normals,
+        maximum_normal_deviation_degrees=(
+            maximum_normal_deviation_degrees
+        ),
+        maximum_surface_deviation=maximum_surface_deviation,
+        protected_edges=gpu_coplanar_edges,
     )
     gpu_vertices, accepted_relaxations = _gpu_relax_inserted_vertices(
         gpu_vertices,
@@ -2218,6 +2790,16 @@ def surface_sample_remesh(
         gpu_support_face_ids,
         relax_iterations,
         smoothing_step,
+        protected_source_face_mask=gpu_protected_source_faces,
+        protected_vertex_mask=_gpu_source_sensitive_vertex_mask(
+            gpu_faces,
+            gpu_source_face_ids,
+            gpu_source_normals,
+            protected_source_face_mask=gpu_protected_source_faces,
+            maximum_normal_deviation_degrees=(
+                maximum_normal_deviation_degrees
+            ),
+        ),
     )
     torch.cuda.synchronize(device)
     final_vertices = gpu_vertices.cpu().numpy()
@@ -2238,11 +2820,16 @@ def surface_sample_remesh(
     )
     print(
         "Feature-safe retriangulation: {} smooth patches, {} hard feature "
-        "edges, {} source faces rolled back; {} CUDA long-edge splits "
+        "edges, {} coplanar internal edges, {} / {} refinement-only source "
+        "faces, {} source faces rolled "
+        "back; {} CUDA long-edge splits "
         "({} still over {:.6g}), {} CUDA short-edge collapses, {} GPU "
         "flips, {} / {} relaxations accepted".format(
             int(patch_ids.max()) + 1 if len(patch_ids) else 0,
             len(reference_features),
+            len(coplanar_edges),
+            int(np.count_nonzero(protected_source_faces)),
+            len(reference_faces),
             len(rejected_source_faces),
             split_count,
             remaining_long_edges,
@@ -2280,6 +2867,16 @@ def surface_sample_remesh(
         "patch_count": int(patch_ids.max()) + 1 if len(patch_ids) else 0,
         "maximum_edge_length": maximum_edge_length,
         "minimum_edge_length": minimum_edge_length,
+        "protected_source_face_count": int(
+            np.count_nonzero(protected_source_faces)
+        ),
+        "protected_source_quality": protected_source_quality,
+        "maximum_normal_deviation_degrees": (
+            maximum_normal_deviation_degrees
+        ),
+        "maximum_surface_deviation": maximum_surface_deviation,
+        "minimum_collapse_quality": minimum_collapse_quality,
+        "coplanar_internal_edge_count": int(len(coplanar_edges)),
         "splits": split_count,
         "remaining_long_edges": remaining_long_edges,
         "collapses": collapse_count,

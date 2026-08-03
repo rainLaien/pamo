@@ -88,6 +88,44 @@ class SurfaceSampleTest(unittest.TestCase):
         for boundary_edge in ((0, 1), (1, 2), (2, 3), (0, 3)):
             self.assertIn(boundary_edge, edges)
 
+    def test_coplanar_shared_edge_is_not_subdivided(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+
+        output_vertices, _, _, _ = surface_sample.subdivide_original_faces(
+            vertices,
+            faces,
+            np.array(
+                [
+                    [3.0, 0.25, 0.0],
+                    [2.0, 0.75, 0.0],
+                ],
+                dtype=np.float64,
+            ),
+            np.array([0, 1], dtype=np.int64),
+            np.array(
+                [
+                    [0.25, 0.5, 0.25],
+                    [0.25, 0.5, 0.25],
+                ],
+                dtype=np.float64,
+            ),
+            edge_target_length=0.5,
+            protected_internal_edges=np.array([[0, 2]], dtype=np.int64),
+        )
+
+        diagonal_points = output_vertices[
+            np.isclose(output_vertices[:, 0], output_vertices[:, 1])
+        ]
+        self.assertEqual(len(diagonal_points), 2)
+
     def test_feature_edge_separates_surface_patches(self):
         faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
         one_patch = surface_sample.original_surface_patch_ids(
@@ -291,6 +329,27 @@ class SurfaceSampleTest(unittest.TestCase):
         self.assertEqual(explicit_feature_flip_count, 0)
         self.assertTrue(bool(torch.equal(explicit_feature_faces, faces)))
 
+        protected_source_faces, protected_source_flip_count = (
+            surface_sample._gpu_flip_quality_edges(
+                vertices,
+                faces,
+                patches,
+                passes=1,
+                face_source_ids=torch.arange(
+                    2,
+                    dtype=torch.long,
+                    device="cuda",
+                ),
+                protected_source_face_mask=torch.tensor(
+                    [True, False],
+                    dtype=torch.bool,
+                    device="cuda",
+                ),
+            )
+        )
+        self.assertEqual(protected_source_flip_count, 0)
+        self.assertTrue(bool(torch.equal(protected_source_faces, faces)))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda_long_edge_split_reaches_requested_bound(self):
         vertices = torch.tensor(
@@ -401,6 +460,242 @@ class SurfaceSampleTest(unittest.TestCase):
         np.testing.assert_allclose(
             output_vertices.cpu().numpy(),
             vertices[:4].cpu().numpy(),
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_short_edge_collapse_preserves_protected_source_one_ring(self):
+        vertices = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.05, 0.05, 0.0],
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        faces = torch.tensor(
+            [
+                [0, 1, 4],
+                [1, 2, 4],
+                [2, 3, 4],
+                [3, 0, 4],
+            ],
+            dtype=torch.long,
+            device="cuda",
+        )
+        patches = torch.zeros(4, dtype=torch.long, device="cuda")
+        sources = torch.arange(4, dtype=torch.long, device="cuda")
+        support = torch.full(
+            (5,),
+            -1,
+            dtype=torch.long,
+            device="cuda",
+        )
+        protected_sources = torch.tensor(
+            [False, True, False, False],
+            dtype=torch.bool,
+            device="cuda",
+        )
+
+        (
+            output_vertices,
+            output_faces,
+            _,
+            _,
+            _,
+            collapse_count,
+        ) = surface_sample._gpu_collapse_short_edges(
+            vertices,
+            faces,
+            patches,
+            sources,
+            support,
+            minimum_edge_length=0.2,
+            maximum_edge_length=2.0,
+            passes=2,
+            protected_source_face_mask=protected_sources,
+        )
+
+        self.assertEqual(collapse_count, 0)
+        self.assertTrue(bool(torch.equal(output_vertices, vertices)))
+        self.assertTrue(bool(torch.equal(output_faces, faces)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_short_edge_collapse_preserves_rounded_normal_cone(self):
+        vertices = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.05, 0.05, 0.0],
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        faces = torch.tensor(
+            [
+                [0, 1, 4],
+                [1, 2, 4],
+                [2, 3, 4],
+                [3, 0, 4],
+            ],
+            dtype=torch.long,
+            device="cuda",
+        )
+        patches = torch.zeros(4, dtype=torch.long, device="cuda")
+        sources = torch.arange(4, dtype=torch.long, device="cuda")
+        support = torch.full(
+            (5,),
+            -1,
+            dtype=torch.long,
+            device="cuda",
+        )
+        angle = np.deg2rad(20.0)
+        source_normals = torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [np.sin(angle), 0.0, np.cos(angle)],
+                [0.0, 0.0, 1.0],
+                [-np.sin(angle), 0.0, np.cos(angle)],
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+
+        (
+            output_vertices,
+            output_faces,
+            _,
+            _,
+            _,
+            collapse_count,
+        ) = surface_sample._gpu_collapse_short_edges(
+            vertices,
+            faces,
+            patches,
+            sources,
+            support,
+            minimum_edge_length=0.2,
+            maximum_edge_length=2.0,
+            passes=2,
+            source_face_normals=source_normals,
+            maximum_normal_deviation_degrees=5.0,
+        )
+
+        self.assertEqual(collapse_count, 0)
+        self.assertTrue(bool(torch.equal(output_vertices, vertices)))
+        self.assertTrue(bool(torch.equal(output_faces, faces)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_quality_driven_collapse_handles_thin_coplanar_fan(self):
+        vertices = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [10.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [5.0, 0.5, 0.0],
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        faces = torch.tensor(
+            [
+                [0, 1, 4],
+                [1, 2, 4],
+                [2, 3, 4],
+                [3, 0, 4],
+            ],
+            dtype=torch.long,
+            device="cuda",
+        )
+        patches = torch.zeros(4, dtype=torch.long, device="cuda")
+        sources = torch.arange(4, dtype=torch.long, device="cuda")
+        support = torch.full(
+            (5,),
+            -1,
+            dtype=torch.long,
+            device="cuda",
+        )
+
+        _, _, _, _, _, collapse_count = (
+            surface_sample._gpu_collapse_short_edges(
+                vertices,
+                faces,
+                patches,
+                sources,
+                support,
+                minimum_edge_length=0.5,
+                maximum_edge_length=20.0,
+                passes=2,
+                minimum_collapse_quality=0.25,
+            )
+        )
+
+        self.assertGreater(collapse_count, 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_source_sensitive_vertices_lock_rounded_shared_edge(self):
+        faces = torch.tensor(
+            [[0, 1, 2], [2, 1, 3]],
+            dtype=torch.long,
+            device="cuda",
+        )
+        sources = torch.arange(2, dtype=torch.long, device="cuda")
+        angle = np.deg2rad(20.0)
+        source_normals = torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [np.sin(angle), 0.0, np.cos(angle)],
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+
+        rounded_mask = surface_sample._gpu_source_sensitive_vertex_mask(
+            faces,
+            sources,
+            source_normals,
+            maximum_normal_deviation_degrees=5.0,
+        )
+        protected_mask = surface_sample._gpu_source_sensitive_vertex_mask(
+            faces,
+            sources,
+            source_normals,
+            protected_source_face_mask=torch.tensor(
+                [True, False],
+                dtype=torch.bool,
+                device="cuda",
+            ),
+            maximum_normal_deviation_degrees=180.0,
+        )
+
+        self.assertTrue(
+            bool(
+                torch.equal(
+                    rounded_mask,
+                    torch.tensor(
+                        [False, True, True, False],
+                        dtype=torch.bool,
+                        device="cuda",
+                    ),
+                )
+            )
+        )
+        self.assertTrue(
+            bool(
+                torch.equal(
+                    protected_mask,
+                    torch.tensor(
+                        [True, True, True, False],
+                        dtype=torch.bool,
+                        device="cuda",
+                    ),
+                )
+            )
         )
 
 

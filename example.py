@@ -399,6 +399,51 @@ def main():
         help="Maximum feature-safe CUDA short-edge collapse batches (default: 24)",
     )
     parser.add_argument(
+        '--surface-protect-source-quality',
+        type=float,
+        default=0.8,
+        help=(
+            "Make source faces at or above this triangle-quality threshold "
+            "refinement-only; use 0 to disable (default: 0.8)"
+        ),
+    )
+    parser.add_argument(
+        '--surface-max-normal-deviation',
+        type=float,
+        default=5.0,
+        help=(
+            "Maximum source-normal cone half-angle allowed in a collapse "
+            "one-ring, in degrees (default: 5)"
+        ),
+    )
+    parser.add_argument(
+        '--surface-max-deviation-ratio',
+        type=float,
+        default=0.05,
+        help=(
+            "Maximum collapse/flip source-plane deviation divided by the "
+            "Poisson radius (default: 0.05)"
+        ),
+    )
+    parser.add_argument(
+        '--surface-min-collapse-quality',
+        type=float,
+        default=0.25,
+        help=(
+            "Also consider edges adjacent to triangles below this quality "
+            "for controlled collapse; use 0 to disable (default: 0.25)"
+        ),
+    )
+    parser.add_argument(
+        '--surface-coplanar-angle',
+        type=float,
+        default=1.0,
+        help=(
+            "Treat adjacent source faces within this normal angle as a "
+            "single coplanar patch for edge refinement (default: 1 degree)"
+        ),
+    )
+    parser.add_argument(
         '--constraint-projection-distance',
         type=float,
         default=None,
@@ -555,6 +600,26 @@ def main():
         parser.error("--surface-split-passes must be positive")
     if args.surface_collapse_passes < 0:
         parser.error("--surface-collapse-passes must be non-negative")
+    if not 0.0 <= args.surface_protect_source_quality <= 1.0:
+        parser.error(
+            "--surface-protect-source-quality must be in [0, 1]"
+        )
+    if not 0.0 <= args.surface_max_normal_deviation <= 180.0:
+        parser.error(
+            "--surface-max-normal-deviation must be in [0, 180]"
+        )
+    if args.surface_max_deviation_ratio < 0.0:
+        parser.error(
+            "--surface-max-deviation-ratio must be non-negative"
+        )
+    if not 0.0 <= args.surface_min_collapse_quality <= 1.0:
+        parser.error(
+            "--surface-min-collapse-quality must be in [0, 1]"
+        )
+    if not 0.0 <= args.surface_coplanar_angle < 180.0:
+        parser.error(
+            "--surface-coplanar-angle must be in [0, 180)"
+        )
     constraint_options_used = (
         args.constraint_projection_distance is not None
         or args.constraint_feature_distance is not None
@@ -659,6 +724,17 @@ def main():
             minimum_edge_ratio=args.surface_min_edge_ratio,
             split_passes=args.surface_split_passes,
             collapse_passes=args.surface_collapse_passes,
+            protected_source_quality=(
+                args.surface_protect_source_quality
+            ),
+            maximum_normal_deviation_degrees=(
+                args.surface_max_normal_deviation
+            ),
+            maximum_surface_deviation_ratio=(
+                args.surface_max_deviation_ratio
+            ),
+            minimum_collapse_quality=args.surface_min_collapse_quality,
+            coplanar_angle_degrees=args.surface_coplanar_angle,
         )
     elif args.feature_remesh:
         verts, faces = pamo.feature_remesh(

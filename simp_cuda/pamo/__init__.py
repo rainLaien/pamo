@@ -652,6 +652,11 @@ class PaMO(nn.Module):
         minimum_edge_ratio=0.5,
         split_passes=64,
         collapse_passes=24,
+        protected_source_quality=0.8,
+        maximum_normal_deviation_degrees=5.0,
+        maximum_surface_deviation_ratio=0.05,
+        minimum_collapse_quality=0.25,
+        coplanar_angle_degrees=1.0,
     ):
         """
         Remesh from points sampled directly on the original triangle surface.
@@ -683,6 +688,15 @@ class PaMO(nn.Module):
             minimum_edge_ratio=minimum_edge_ratio,
             split_passes=split_passes,
             collapse_passes=collapse_passes,
+            protected_source_quality=protected_source_quality,
+            maximum_normal_deviation_degrees=(
+                maximum_normal_deviation_degrees
+            ),
+            maximum_surface_deviation_ratio=(
+                maximum_surface_deviation_ratio
+            ),
+            minimum_collapse_quality=minimum_collapse_quality,
+            coplanar_angle_degrees=coplanar_angle_degrees,
         )
         return verts, faces
 
