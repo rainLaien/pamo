@@ -25,6 +25,7 @@ else:
         "segment_query",
         "feature_edges",
         "feature_optimize",
+        "original_constrained",
     ):
         qualified_name = f"{package_name}.{module_name}"
         spec = importlib.util.spec_from_file_location(
@@ -38,6 +39,9 @@ else:
     feature_optimize = sys.modules[
         f"{package_name}.feature_optimize"
     ]
+    original_constrained = sys.modules[
+        f"{package_name}.original_constrained"
+    ]
 
 
 @unittest.skipIf(
@@ -45,6 +49,170 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
+    def test_planar_annulus_bridges_are_retriangulated_uniformly(self):
+        count = 80
+        angles = np.arange(count) * (2.0 * np.pi / count)
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (30.0 * np.cos(angles), 30.0 * np.sin(angles), np.zeros(count))
+                ),
+                np.column_stack(
+                    (12.0 * np.cos(angles), 12.0 * np.sin(angles), np.zeros(count))
+                ),
+            )
+        )
+        faces = []
+        for index in range(count):
+            following = (index + 1) % count
+            faces.extend(
+                (
+                    [index, following, count + index],
+                    [following, count + following, count + index],
+                )
+            )
+        faces = np.asarray(faces, dtype=np.int64)
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_planar_annuli(
+                vertices, faces, minimum_faces=20
+            )
+        )
+        qualities = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+        result_edges = {
+            tuple(sorted((int(first), int(second))))
+            for face in result_faces
+            for first, second in (
+                (face[0], face[1]), (face[1], face[2]), (face[2], face[0])
+            )
+        }
+
+        self.assertEqual(stats["regions"], 1)
+        self.assertGreater(float(np.percentile(qualities, 5.0)), 0.7)
+        for offset in (0, count):
+            self.assertTrue(
+                all(
+                    tuple(
+                        sorted((offset + index, offset + (index + 1) % count))
+                    )
+                    in result_edges
+                    for index in range(count)
+                )
+            )
+
+    def test_planar_annulus_with_internal_hard_edge_is_not_replaced(self):
+        count = 12
+        angles = np.arange(count) * (2.0 * np.pi / count)
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (3 * np.cos(angles), 3 * np.sin(angles), np.zeros(count))
+                ),
+                np.column_stack(
+                    (np.cos(angles), np.sin(angles), np.zeros(count))
+                ),
+            )
+        )
+        faces = []
+        for index in range(count):
+            following = (index + 1) % count
+            faces.extend(
+                (
+                    [index, following, count + index],
+                    [following, count + following, count + index],
+                )
+            )
+        faces = np.asarray(faces, dtype=np.int64)
+        internal_hard_edge = np.asarray([[0, count]], dtype=np.int64)
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_planar_annuli(
+                vertices,
+                faces,
+                protected_edges=internal_hard_edge,
+                minimum_faces=20,
+            )
+        )
+
+        self.assertEqual(stats["regions"], 0)
+        self.assertEqual(stats["constraint_rejections"], 1)
+        np.testing.assert_array_equal(result_vertices, vertices)
+        np.testing.assert_array_equal(result_faces, faces)
+
+    def test_planar_circle_fan_is_retriangulated_uniformly(self):
+        count = 81
+        angles = np.arange(count) * (2.0 * np.pi / count)
+        vertices = np.vstack(
+            (
+                [0.0, 0.0, 0.0],
+                np.column_stack(
+                    (28.0 * np.cos(angles), 28.0 * np.sin(angles), np.zeros(count))
+                ),
+            )
+        )
+        faces = np.asarray(
+            [[0, index + 1, (index + 1) % count + 1] for index in range(count)],
+            dtype=np.int64,
+        )
+        boundary = np.asarray(
+            [[index + 1, (index + 1) % count + 1] for index in range(count)],
+            dtype=np.int64,
+        )
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_planar_fans(
+                vertices,
+                faces,
+                boundary,
+                minimum_valence=30,
+            )
+        )
+        qualities = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+        result_edges = {
+            tuple(sorted((int(first), int(second))))
+            for face in result_faces
+            for first, second in (
+                (face[0], face[1]), (face[1], face[2]), (face[2], face[0])
+            )
+        }
+
+        self.assertEqual(stats["fans"], 1)
+        self.assertEqual(np.count_nonzero(result_faces == 0), 0)
+        self.assertGreater(float(qualities.min()), 0.6)
+        self.assertTrue(
+            all(tuple(sorted(map(int, edge))) in result_edges for edge in boundary)
+        )
+
+    def test_automatic_edge_limit_uses_ten_percent_diagonal(self):
+        vertices = np.array(
+            [[0.0, 0.0, 0.0], [1000.0, 0.0, 0.0]]
+        )
+        edge_lengths = np.array([1.0, 2.0, 3.0])
+
+        limit, diagonal, percentile_95 = (
+            original_constrained.automatic_edge_length_limit(
+                vertices,
+                edge_lengths,
+            )
+        )
+
+        self.assertEqual(diagonal, 1000.0)
+        self.assertAlmostEqual(percentile_95, 2.9)
+        self.assertAlmostEqual(limit, 100.0)
+
+    def test_automatic_split_limit_has_conformity_margin(self):
+        budget, estimate = original_constrained.automatic_split_limit(
+            np.array([5.0, 20.0, 40.0]),
+            max_edge_length=10.0,
+        )
+
+        self.assertEqual(estimate, 4)
+        self.assertEqual(budget, 100000)
+
     def test_feature_snap_backtracks_instead_of_flipping_triangle(self):
         vertices = np.array(
             [

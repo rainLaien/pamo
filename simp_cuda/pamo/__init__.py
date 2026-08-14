@@ -314,8 +314,11 @@ class PaMO(nn.Module):
         sdf_mode="auto",
         max_edge_length=None,
         feature_angle=5.0,
-        max_splits=100000,
+        max_splits=None,
         coplanar_flip_passes=8,
+        coplanar_flip_minimum_valence=None,
+        planar_fan_minimum_valence=None,
+        planar_annulus_minimum_faces=None,
         quality_iterations=20,
         quality_step=0.4,
         quality_flip_passes=12,
@@ -377,7 +380,7 @@ class PaMO(nn.Module):
             feature_angle = feature_edge_output_angle
         if feature_edge_max_splits is not None:
             if (
-                max_splits != 100000
+                max_splits is not None
                 and int(max_splits) != int(feature_edge_max_splits)
             ):
                 raise ValueError(
@@ -413,6 +416,9 @@ class PaMO(nn.Module):
             max_splits=max_splits,
             coplanar_angle_degrees=coplanar_angle_tolerance,
             flip_passes=coplanar_flip_passes,
+            flip_minimum_valence=coplanar_flip_minimum_valence,
+            planar_fan_minimum_valence=planar_fan_minimum_valence,
+            planar_annulus_minimum_faces=planar_annulus_minimum_faces,
         )
         quality_iterations = int(quality_iterations)
         quality_step = float(quality_step)

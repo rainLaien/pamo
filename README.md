@@ -32,6 +32,10 @@ conda activate pamo
 bash setup.sh
 ```
 
+Planar regions with holes use the `triangle` constrained-triangulation wheel
+listed in `env.yaml`. In an existing Windows virtual environment, install it
+with `python -m pip install "triangle>=20250106"`.
+
 ## Demo
 
 ```
@@ -84,9 +88,12 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--surface-coplanar-angle`**: Treat adjacent source faces within this normal angle as one coplanar patch for source-edge refinement. Internal coplanar edges are no longer subdivided as hard source boundaries; the default is `1` degree.
 - **`--original-constrained-remesh`**: Preserve sharp, boundary, and non-manifold input edges as hard constraint chains. After conforming longest-edge refinement, quality-improving flips remove non-feature seams inside coplanar patches.
 - **`--constraint-feature-angle`**: Mark every original manifold edge whose adjacent-face dihedral is strictly greater than this angle as a hard feature, default=5 degrees.
-- **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. If the current longest edge already satisfies it, no vertices or faces are inserted.
-- **`--constraint-max-splits`**: Safety limit for longest-edge bisection, default=100000. The operation fails instead of returning a mesh which violates the requested maximum length.
+- **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. When omitted, the limit is `10% of the bounding-box diagonal`. This predictable scale-based default avoids excessive refinement on large, already dense meshes.
+- **`--constraint-max-splits`**: Optional safety limit for longest-edge bisection. When omitted, the edge-only binary-bisection estimate receives a 4x conformity margin with a minimum budget of 100000.
 - **`--constraint-flip-passes`**: Number of quality-driven coplanar non-feature edge-flip passes after refinement, default=8. Hard feature chains are never flipped.
+- **`--constraint-flip-minimum-valence`**: Restrict coplanar flips to edges touching unusually high-valence vertices. A value such as `12` efficiently removes planar center-fan triangulations without scanning every edge for expensive quality tests.
+- **`--constraint-planar-fan-minimum-valence`**: Replace a convex planar center fan at or above this valence with a uniform local Delaunay triangulation while retaining its boundary edges. A value such as `30` handles dense circle-center fans directly.
+- **`--constraint-planar-annulus-minimum-faces`**: Uniformly retriangulate planar facets containing holes while retaining every outer and inner boundary edge. A value such as `20` replaces direct inner-to-outer circle bridges with a graded interior triangulation.
 - **`--constraint-quality-iterations`**: Number of feature-safe tangential relocation iterations after constrained refinement, default=20.
 - **`--constraint-quality-step`**: Tangential relocation step for constrained quality optimization, default=0.4.
 - **`--constraint-quality-flip-passes`**: Number of feature-safe global quality edge-flip passes, default=12. The maximum edge-length bound remains enforced.

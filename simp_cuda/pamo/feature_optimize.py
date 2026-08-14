@@ -660,9 +660,13 @@ def _flip_quality_edges(
     maximum_dihedral_degrees=None,
     maximum_edge_length=None,
     preferred_edges=None,
+    minimum_candidate_valence=None,
 ):
     """Greedily flip non-feature manifold edges when local quality improves."""
     faces = np.asarray(faces, dtype=np.int64).copy()
+    passes = int(passes)
+    if passes <= 0:
+        return faces, 0
     protected = {
         tuple(sorted((int(edge[0]), int(edge[1]))))
         for edge in np.asarray(protected_edges, dtype=np.int64).reshape(-1, 2)
@@ -694,11 +698,54 @@ def _flip_quality_edges(
         if maximum_edge_length <= 0.0:
             raise ValueError("Maximum flipped edge length must be positive.")
         maximum_edge_length *= 1.0 + 1e-8
+    if minimum_candidate_valence is not None:
+        minimum_candidate_valence = int(minimum_candidate_valence)
+        if minimum_candidate_valence < 4:
+            raise ValueError("Minimum candidate valence must be at least 4.")
 
-    for _ in range(int(passes)):
+    report_progress = len(faces) >= 100000
+    for pass_index in range(passes):
+        if report_progress:
+            print(
+                "  edge-flip pass {}/{}: building adjacency for {} faces..."
+                .format(pass_index + 1, passes, len(faces)),
+                flush=True,
+            )
         edge_faces = _build_edge_faces(faces)
+        if minimum_candidate_valence is None:
+            candidate_edges = sorted(edge_faces)
+        else:
+            vertex_valence = np.bincount(
+                faces.reshape(-1), minlength=len(vertices)
+            )
+            candidate_edges = [
+                edge
+                for edge in edge_faces
+                if (
+                    vertex_valence[edge[0]]
+                    >= minimum_candidate_valence
+                    or vertex_valence[edge[1]]
+                    >= minimum_candidate_valence
+                )
+            ]
+            candidate_edges.sort(
+                key=lambda edge: (
+                    -max(vertex_valence[edge[0]], vertex_valence[edge[1]]),
+                    edge,
+                )
+            )
+            if report_progress:
+                print(
+                    "  fan cleanup: {} / {} edges touch vertices with "
+                    "valence >= {}.".format(
+                        len(candidate_edges),
+                        len(edge_faces),
+                        minimum_candidate_valence,
+                    ),
+                    flush=True,
+                )
         pass_flips = 0
-        for edge in sorted(edge_faces):
+        for edge in candidate_edges:
             if edge in protected:
                 continue
             incident = edge_faces.get(edge)
@@ -811,7 +858,15 @@ def _flip_quality_edges(
             flip_count += 1
             pass_flips += 1
         if pass_flips == 0:
+            if report_progress:
+                print("  edge-flip pass: no accepted flips.", flush=True)
             break
+        if report_progress:
+            print(
+                "  edge-flip pass: {} flips accepted."
+                .format(pass_flips),
+                flush=True,
+            )
     return faces, flip_count
 
 
@@ -861,6 +916,14 @@ def optimize_feature_constrained_mesh(
         maximum_edge_length = float(maximum_edge_length)
         if maximum_edge_length <= 0.0:
             raise ValueError("Maximum optimized edge length must be positive.")
+
+    print(
+        "Feature quality stage: {} vertices, {} faces, {} relocation "
+        "iteration(s), {} edge-flip pass(es).".format(
+            len(vertices), len(faces), iterations, flip_passes
+        ),
+        flush=True,
+    )
 
     constraints = build_feature_constraint_map(
         reference_mesh,
@@ -922,7 +985,13 @@ def optimize_feature_constrained_mesh(
     current_energy = constrained_metrics["energy"]
     accepted_iterations = 0
 
-    for _ in range(iterations):
+    for iteration_index in range(iterations):
+        if len(current_faces) >= 100000:
+            print(
+                "  relocation iteration {}/{}..."
+                .format(iteration_index + 1, iterations),
+                flush=True,
+            )
         accepted = False
         step = smoothing_step
         for _ in range(8):

@@ -1,10 +1,16 @@
+param(
+    [switch]$EnableQualityOptimization,
+    [ValidateRange(0.0, 180.0)]
+    [double]$FeatureAngle = 15.0
+)
+
 $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
-$inputPath = Join-Path $projectRoot "examples\Unnamed-Body.stl"
+$inputPath = Join-Path $projectRoot "examples\111.stl"
 $outputDirectory = Join-Path $projectRoot "examples\test_outputs"
-$outputPath = Join-Path $outputDirectory "Unnamed-Body_original_constrained.stl"
+$outputPath = Join-Path $outputDirectory "111_constrained.stl"
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python virtual environment not found: $pythonPath"
@@ -18,19 +24,32 @@ New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
 
 Push-Location $projectRoot
 try {
-    & $pythonPath ".\example.py" `
-        --input $inputPath `
-        --output $outputPath `
-        --original-constrained-remesh `
-        --sdf-mode exact `
-        --constraint-max-edge-length 10 `
-        --constraint-feature-angle 5 `
-        --constraint-max-splits 5000 `
-        --coplanar-angle-tolerance 0.1 `
-        --constraint-flip-passes 8 `
-        --constraint-quality-iterations 20 `
-        --constraint-quality-step 0.4 `
-        --constraint-quality-flip-passes 12
+    # Million-edge meshes are extremely slow in the current Python edge-flip
+    # implementation. The default performs safe constrained refinement only.
+    # Targeted fan cleanup is safe for this large mesh: it only scans edges
+    # around abnormally high-valence vertices instead of every mesh edge.
+    $flipPasses = 2
+    $qualityIterations = if ($EnableQualityOptimization) { 1 } else { 0 }
+    $qualityFlipPasses = if ($EnableQualityOptimization) { 1 } else { 0 }
+
+    $arguments = @(
+        "-u"
+        ".\example.py"
+        "--input", $inputPath
+        "--output", $outputPath
+        "--original-constrained-remesh"
+        "--sdf-mode", "exact"
+        "--constraint-feature-angle", "$FeatureAngle"
+        "--coplanar-angle-tolerance", "0.1"
+        "--constraint-flip-passes", "$flipPasses"
+        "--constraint-flip-minimum-valence", "12"
+        "--constraint-planar-fan-minimum-valence", "30"
+        "--constraint-planar-annulus-minimum-faces", "20"
+        "--constraint-quality-iterations", "$qualityIterations"
+        "--constraint-quality-step", "0.4"
+        "--constraint-quality-flip-passes", "$qualityFlipPasses"
+    )
+    & $pythonPath @arguments
 
     if ($LASTEXITCODE -ne 0) {
         throw "Mesh optimization failed with exit code $LASTEXITCODE"

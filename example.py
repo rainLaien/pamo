@@ -494,8 +494,11 @@ def main():
         '--constraint-edge-max-splits',
         dest='constraint_max_splits',
         type=int,
-        default=100000,
-        help="Safety limit for longest-edge splits (default: 100000)",
+        default=None,
+        help=(
+            "Safety limit for longest-edge splits; by default it is "
+            "estimated automatically with a 4x conformity margin"
+        ),
     )
     parser.add_argument(
         '--constraint-flip-passes',
@@ -504,6 +507,33 @@ def main():
         help=(
             "Quality-driven coplanar non-feature edge-flip passes "
             "(default: 8)"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-flip-minimum-valence',
+        type=int,
+        default=None,
+        help=(
+            "Only consider coplanar edges touching a vertex with at least "
+            "this valence; useful for fast planar-fan cleanup"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-planar-fan-minimum-valence',
+        type=int,
+        default=None,
+        help=(
+            "Replace convex planar center fans at or above this valence by "
+            "a uniform local triangulation"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-planar-annulus-minimum-faces',
+        type=int,
+        default=None,
+        help=(
+            "Uniformly retriangulate planar facets with holes when they "
+            "contain at least this many faces"
         ),
     )
     parser.add_argument(
@@ -681,10 +711,32 @@ def main():
         parser.error("--constraint-max-edge-length must be positive")
     if not 0.0 <= args.constraint_feature_angle < 180.0:
         parser.error("--constraint-feature-angle must be in [0, 180)")
-    if args.constraint_max_splits <= 0:
+    if (
+        args.constraint_max_splits is not None
+        and args.constraint_max_splits <= 0
+    ):
         parser.error("--constraint-max-splits must be positive")
     if args.constraint_flip_passes < 0:
         parser.error("--constraint-flip-passes must be non-negative")
+    if (
+        args.constraint_flip_minimum_valence is not None
+        and args.constraint_flip_minimum_valence < 4
+    ):
+        parser.error("--constraint-flip-minimum-valence must be at least 4")
+    if (
+        args.constraint_planar_fan_minimum_valence is not None
+        and args.constraint_planar_fan_minimum_valence < 6
+    ):
+        parser.error(
+            "--constraint-planar-fan-minimum-valence must be at least 6"
+        )
+    if (
+        args.constraint_planar_annulus_minimum_faces is not None
+        and args.constraint_planar_annulus_minimum_faces < 4
+    ):
+        parser.error(
+            "--constraint-planar-annulus-minimum-faces must be at least 4"
+        )
     if args.constraint_quality_iterations < 0:
         parser.error("--constraint-quality-iterations must be non-negative")
     if not 0.0 < args.constraint_quality_step <= 1.0:
@@ -828,6 +880,15 @@ def main():
             feature_angle=args.constraint_feature_angle,
             max_splits=args.constraint_max_splits,
             coplanar_flip_passes=args.constraint_flip_passes,
+            coplanar_flip_minimum_valence=(
+                args.constraint_flip_minimum_valence
+            ),
+            planar_fan_minimum_valence=(
+                args.constraint_planar_fan_minimum_valence
+            ),
+            planar_annulus_minimum_faces=(
+                args.constraint_planar_annulus_minimum_faces
+            ),
             quality_iterations=args.constraint_quality_iterations,
             quality_step=args.constraint_quality_step,
             quality_flip_passes=args.constraint_quality_flip_passes,
