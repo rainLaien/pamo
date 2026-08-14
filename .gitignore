@@ -17,5 +17,5 @@ thingi10k.py
 run.sh
 make.sh
 !mesh/*obj
-examples/*
-!examples/test_*.sh
+
+/examples/test_outputs
