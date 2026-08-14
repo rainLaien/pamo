@@ -657,6 +657,9 @@ def _flip_quality_edges(
     faces,
     protected_edges,
     passes,
+    maximum_dihedral_degrees=None,
+    maximum_edge_length=None,
+    preferred_edges=None,
 ):
     """Greedily flip non-feature manifold edges when local quality improves."""
     faces = np.asarray(faces, dtype=np.int64).copy()
@@ -664,12 +667,33 @@ def _flip_quality_edges(
         tuple(sorted((int(edge[0]), int(edge[1]))))
         for edge in np.asarray(protected_edges, dtype=np.int64).reshape(-1, 2)
     }
+    preferred = {
+        tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in np.asarray(
+            preferred_edges
+            if preferred_edges is not None
+            else np.empty((0, 2), dtype=np.int64),
+            dtype=np.int64,
+        ).reshape(-1, 2)
+    }
     flip_count = 0
     diameter = max(
         float(np.ptp(vertices, axis=0).max()),
         np.finfo(np.float64).eps,
     )
     minimum_cross_squared = (diameter * diameter * 1e-12) ** 2
+    if maximum_dihedral_degrees is None:
+        minimum_normal_dot = None
+    else:
+        maximum_dihedral_degrees = float(maximum_dihedral_degrees)
+        if not 0.0 <= maximum_dihedral_degrees < 180.0:
+            raise ValueError("Maximum flip dihedral must be in [0, 180).")
+        minimum_normal_dot = np.cos(np.deg2rad(maximum_dihedral_degrees))
+    if maximum_edge_length is not None:
+        maximum_edge_length = float(maximum_edge_length)
+        if maximum_edge_length <= 0.0:
+            raise ValueError("Maximum flipped edge length must be positive.")
+        maximum_edge_length *= 1.0 + 1e-8
 
     for _ in range(int(passes)):
         edge_faces = _build_edge_faces(faces)
@@ -704,6 +728,15 @@ def _flip_quality_edges(
             if new_edge in edge_faces:
                 continue
 
+            new_edge_length = np.linalg.norm(
+                vertices[first_opposite] - vertices[second_opposite]
+            )
+            if (
+                maximum_edge_length is not None
+                and new_edge_length > maximum_edge_length
+            ):
+                continue
+
             replacement_faces = np.asarray(
                 (
                     [first_opposite, first, second_opposite],
@@ -715,6 +748,16 @@ def _flip_quality_edges(
                 vertices,
                 np.asarray((first_face, second_face)),
             )
+            if minimum_normal_dot is not None:
+                cross_lengths = np.linalg.norm(old_cross, axis=1)
+                if np.any(cross_lengths <= 0.0):
+                    continue
+                normal_dot = float(
+                    np.dot(old_cross[0], old_cross[1])
+                    / (cross_lengths[0] * cross_lengths[1])
+                )
+                if normal_dot < minimum_normal_dot:
+                    continue
             new_cross = _triangle_cross_products(
                 vertices,
                 replacement_faces,
@@ -738,7 +781,10 @@ def _flip_quality_edges(
                 vertices,
                 replacement_faces,
             )
-            if (
+            if edge in preferred:
+                if float(new_quality.min()) < float(old_quality.min()) - 1e-8:
+                    continue
+            elif (
                 float(new_quality.min())
                 <= float(old_quality.min()) + 1e-8
                 or float(new_quality.sum())
@@ -758,6 +804,10 @@ def _flip_quality_edges(
             for face_id in (first_face_id, second_face_id):
                 for replacement_edge in _face_edges(faces[face_id]):
                     edge_faces.setdefault(replacement_edge, set()).add(face_id)
+            if edge in preferred:
+                # Do not immediately undo a deliberate source-seam
+                # replacement later in this optimization run.
+                protected.add(new_edge)
             flip_count += 1
             pass_flips += 1
         if pass_flips == 0:
@@ -776,6 +826,7 @@ def optimize_feature_constrained_mesh(
     iterations=5,
     smoothing_step=0.2,
     flip_passes=2,
+    maximum_edge_length=None,
 ):
     """
     Improve mesh quality while keeping mapped feature curves explicit.
@@ -806,6 +857,10 @@ def optimize_feature_constrained_mesh(
         raise ValueError("Feature flip passes must be non-negative.")
     if not 0.0 < smoothing_step <= 1.0:
         raise ValueError("Feature quality step must be in (0, 1].")
+    if maximum_edge_length is not None:
+        maximum_edge_length = float(maximum_edge_length)
+        if maximum_edge_length <= 0.0:
+            raise ValueError("Maximum optimized edge length must be positive.")
 
     constraints = build_feature_constraint_map(
         reference_mesh,
@@ -900,6 +955,17 @@ def optimize_feature_constrained_mesh(
                     current_faces,
                     minimum_area_squared,
                 )
+                and (
+                    maximum_edge_length is None
+                    or np.all(
+                        np.linalg.norm(
+                            proposed[mesh_edges[:, 0]]
+                            - proposed[mesh_edges[:, 1]],
+                            axis=1,
+                        )
+                        <= maximum_edge_length * (1.0 + 1e-8)
+                    )
+                )
             ):
                 current = proposed
                 current_energy = proposed_metrics["energy"]
@@ -915,6 +981,7 @@ def optimize_feature_constrained_mesh(
         current_faces,
         constraints.matched_edges,
         flip_passes,
+        maximum_edge_length=maximum_edge_length,
     )
     final_metrics = mesh_quality_metrics(current, current_faces)
     feature_distances = np.empty(0, dtype=np.float64)

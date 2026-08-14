@@ -8,6 +8,7 @@ from scipy.spatial import cKDTree
 from .segment_query import (
     closest_points_on_segments as _closest_points_on_segments,
 )
+from .feature_optimize import _flip_quality_edges
 
 
 def detect_hard_constraint_edges(mesh, feature_angle_degrees=5.0):
@@ -84,14 +85,16 @@ def refine_original_mesh_by_longest_edge(
     max_edge_length=None,
     feature_angle_degrees=5.0,
     max_splits=100000,
+    coplanar_angle_degrees=0.1,
+    flip_passes=8,
 ):
     """
-    Refine the original connectivity without deleting any original edge.
+    Refine the original surface while retaining hard feature edge lineages.
 
     Hard edges (dihedral > threshold, boundary, or non-manifold) are tracked as
-    lineages. Splitting a hard edge replaces it by two collinear hard children;
-    no collapse or flip is performed. All edges, not only hard edges, are
-    bisected until the requested global maximum length is reached.
+    lineages. Splitting a hard edge replaces it by two collinear hard children.
+    All edges are bisected to the requested length, then quality-improving flips
+    remove non-feature seams only inside coplanar patches.
     """
     vertices = np.asarray(reference_mesh.vertices, dtype=np.float64)
     faces = np.asarray(reference_mesh.faces, dtype=np.int64)
@@ -99,6 +102,12 @@ def refine_original_mesh_by_longest_edge(
         raise ValueError("Original-constrained refinement needs a nonempty mesh.")
     if not np.isfinite(vertices).all():
         raise ValueError("Input vertices contain NaN or infinity.")
+    coplanar_angle_degrees = float(coplanar_angle_degrees)
+    if not 0.0 <= coplanar_angle_degrees < 180.0:
+        raise ValueError("Coplanar angle tolerance must be in [0, 180).")
+    flip_passes = int(flip_passes)
+    if flip_passes < 0:
+        raise ValueError("Constraint flip passes must be non-negative.")
 
     hard_edges_array = detect_hard_constraint_edges(
         reference_mesh,
@@ -107,6 +116,16 @@ def refine_original_mesh_by_longest_edge(
     hard_edges = {
         tuple((int(edge[0]), int(edge[1])))
         for edge in hard_edges_array
+    }
+    coplanar_mask = (
+        np.asarray(reference_mesh.face_adjacency_angles)
+        <= np.deg2rad(coplanar_angle_degrees)
+    )
+    coplanar_edges = {
+        tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in np.asarray(reference_mesh.face_adjacency_edges)[
+            coplanar_mask
+        ]
     }
     root_for_edge = {
         edge: root_index
@@ -138,13 +157,24 @@ def refine_original_mesh_by_longest_edge(
             "no maximum edge length requested, so no vertices were inserted."
             .format(len(hard_edges), float(feature_angle_degrees))
         )
-        return vertices.copy(), faces.copy(), {
+        optimized_faces, flip_count = _flip_quality_edges(
+            vertices,
+            faces,
+            hard_edges_array,
+            passes=flip_passes,
+            maximum_dihedral_degrees=coplanar_angle_degrees,
+            preferred_edges=np.asarray(
+                sorted(coplanar_edges), dtype=np.int64
+            ).reshape(-1, 2),
+        )
+        return vertices.copy(), optimized_faces, {
             "hard_edges": len(hard_edges),
             "hard_edges_split": 0,
             "splits": 0,
             "initial_max_length": initial_max_length,
             "final_max_length": initial_max_length,
             "already_satisfied": True,
+            "coplanar_flips": flip_count,
         }
 
     max_edge_length = float(max_edge_length)
@@ -164,13 +194,25 @@ def refine_original_mesh_by_longest_edge(
                 max_edge_length,
             )
         )
-        return vertices.copy(), faces.copy(), {
+        optimized_faces, flip_count = _flip_quality_edges(
+            vertices,
+            faces,
+            hard_edges_array,
+            passes=flip_passes,
+            maximum_dihedral_degrees=coplanar_angle_degrees,
+            maximum_edge_length=max_edge_length,
+            preferred_edges=np.asarray(
+                sorted(coplanar_edges), dtype=np.int64
+            ).reshape(-1, 2),
+        )
+        return vertices.copy(), optimized_faces, {
             "hard_edges": len(hard_edges),
             "hard_edges_split": 0,
             "splits": 0,
             "initial_max_length": initial_max_length,
             "final_max_length": initial_max_length,
             "already_satisfied": True,
+            "coplanar_flips": flip_count,
         }
 
     vertices_list = [vertex.copy() for vertex in vertices]
@@ -246,6 +288,10 @@ def refine_original_mesh_by_longest_edge(
             root_for_edge[first_child] = root_index
             root_for_edge[second_child] = root_index
             split_hard_roots.add(root_index)
+        if edge in coplanar_edges:
+            coplanar_edges.discard(edge)
+            coplanar_edges.add(first_child)
+            coplanar_edges.add(second_child)
 
         new_edges = set()
         for _, first_face, second_face in replacements:
@@ -285,6 +331,21 @@ def refine_original_mesh_by_longest_edge(
             )
         )
 
+    refined_vertices = np.asarray(vertices_list, dtype=np.float64)
+    refined_faces = np.asarray(faces_list, dtype=np.int64)
+    refined_faces, flip_count = _flip_quality_edges(
+        refined_vertices,
+        refined_faces,
+        np.asarray(sorted(root_for_edge), dtype=np.int64).reshape(-1, 2),
+        passes=flip_passes,
+        maximum_dihedral_degrees=coplanar_angle_degrees,
+        maximum_edge_length=max_edge_length,
+        preferred_edges=np.asarray(
+            sorted(coplanar_edges), dtype=np.int64
+        ).reshape(-1, 2),
+    )
+    edge_faces = _build_edge_faces(refined_faces)
+
     hard_length_sums = np.zeros(len(original_hard_lengths), dtype=np.float64)
     for edge, root_index in root_for_edge.items():
         if edge not in edge_faces:
@@ -293,7 +354,7 @@ def refine_original_mesh_by_longest_edge(
                 .format(edge)
             )
         hard_length_sums[root_index] += np.linalg.norm(
-            vertices_list[edge[0]] - vertices_list[edge[1]]
+            refined_vertices[edge[0]] - refined_vertices[edge[1]]
         )
     hard_tolerance = max(
         np.ptp(vertices, axis=0).max() * 1e-10,
@@ -309,6 +370,10 @@ def refine_original_mesh_by_longest_edge(
             "Hard constraint lineage validation failed after refinement."
         )
 
+    final_lengths = [
+        float(np.linalg.norm(refined_vertices[edge[0]] - refined_vertices[edge[1]]))
+        for edge in edge_faces
+    ]
     final_max_length = max(final_lengths) if final_lengths else 0.0
     print(
         "Strict original constraints: {} hard edges at > {:.6g} degrees; "
@@ -320,6 +385,13 @@ def refine_original_mesh_by_longest_edge(
         )
     )
     print(
+        "Coplanar optimization: {} quality-safe edge flips within "
+        "{:.6g} degrees; hard feature edges were locked.".format(
+            flip_count,
+            coplanar_angle_degrees,
+        )
+    )
+    print(
         "Global longest edge: {:.6g} -> {:.6g} (limit {:.6g}); "
         "all hard feature lineages preserved.".format(
             initial_max_length,
@@ -328,8 +400,8 @@ def refine_original_mesh_by_longest_edge(
         )
     )
     return (
-        np.asarray(vertices_list, dtype=np.float64),
-        np.asarray(faces_list, dtype=np.int64),
+        refined_vertices,
+        refined_faces,
         {
             "hard_edges": len(original_hard_lengths),
             "hard_edges_split": len(split_hard_roots),
@@ -337,6 +409,7 @@ def refine_original_mesh_by_longest_edge(
             "initial_max_length": initial_max_length,
             "final_max_length": final_max_length,
             "already_satisfied": False,
+            "coplanar_flips": flip_count,
         },
     )
 

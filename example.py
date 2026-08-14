@@ -497,6 +497,33 @@ def main():
         default=100000,
         help="Safety limit for longest-edge splits (default: 100000)",
     )
+    parser.add_argument(
+        '--constraint-flip-passes',
+        type=int,
+        default=8,
+        help=(
+            "Quality-driven coplanar non-feature edge-flip passes "
+            "(default: 8)"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-quality-iterations',
+        type=int,
+        default=20,
+        help="Feature-safe quality relocation iterations (default: 20)",
+    )
+    parser.add_argument(
+        '--constraint-quality-step',
+        type=float,
+        default=0.4,
+        help="Feature-safe quality relocation step (default: 0.4)",
+    )
+    parser.add_argument(
+        '--constraint-quality-flip-passes',
+        type=int,
+        default=12,
+        help="Feature-safe global quality flip passes (default: 12)",
+    )
     args = parser.parse_args()
 
     if (
@@ -656,6 +683,14 @@ def main():
         parser.error("--constraint-feature-angle must be in [0, 180)")
     if args.constraint_max_splits <= 0:
         parser.error("--constraint-max-splits must be positive")
+    if args.constraint_flip_passes < 0:
+        parser.error("--constraint-flip-passes must be non-negative")
+    if args.constraint_quality_iterations < 0:
+        parser.error("--constraint-quality-iterations must be non-negative")
+    if not 0.0 < args.constraint_quality_step <= 1.0:
+        parser.error("--constraint-quality-step must be in (0, 1]")
+    if args.constraint_quality_flip_passes < 0:
+        parser.error("--constraint-quality-flip-passes must be non-negative")
 
 
     input_mesh = load_input_mesh(args.input)
@@ -792,6 +827,10 @@ def main():
             max_edge_length=args.constraint_max_edge_length,
             feature_angle=args.constraint_feature_angle,
             max_splits=args.constraint_max_splits,
+            coplanar_flip_passes=args.constraint_flip_passes,
+            quality_iterations=args.constraint_quality_iterations,
+            quality_step=args.constraint_quality_step,
+            quality_flip_passes=args.constraint_quality_flip_passes,
         )
     else:
         verts, faces = pamo.run(

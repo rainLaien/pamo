@@ -122,6 +122,80 @@ class FeatureOptimizeTest(unittest.TestCase):
             before["minimum_triangle_quality"],
         )
 
+    def test_coplanar_flip_filter_preserves_fold_edge(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]
+        )
+        faces = np.array([[0, 1, 2], [2, 1, 3]], dtype=np.int64)
+
+        filtered_faces, flip_count = feature_optimize._flip_quality_edges(
+            vertices,
+            faces,
+            np.empty((0, 2), dtype=np.int64),
+            passes=4,
+            maximum_dihedral_degrees=0.1,
+        )
+
+        self.assertEqual(flip_count, 0)
+        np.testing.assert_array_equal(filtered_faces, faces)
+
+    def test_coplanar_flip_respects_maximum_new_edge_length(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ]
+        )
+        faces = np.array([[0, 1, 2], [2, 1, 3]], dtype=np.int64)
+
+        filtered_faces, flip_count = feature_optimize._flip_quality_edges(
+            vertices,
+            faces,
+            np.empty((0, 2), dtype=np.int64),
+            passes=4,
+            maximum_dihedral_degrees=0.1,
+            maximum_edge_length=1.0,
+        )
+
+        self.assertEqual(flip_count, 0)
+        np.testing.assert_array_equal(filtered_faces, faces)
+
+    def test_preferred_coplanar_seam_flips_at_equal_quality(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+
+        flipped_faces, flip_count = feature_optimize._flip_quality_edges(
+            vertices,
+            faces,
+            np.empty((0, 2), dtype=np.int64),
+            passes=1,
+            maximum_dihedral_degrees=0.1,
+            preferred_edges=np.array([[0, 2]], dtype=np.int64),
+        )
+
+        self.assertEqual(flip_count, 1)
+        output_edges = {
+            edge
+            for face in flipped_faces
+            for edge in feature_optimize._face_edges(face)
+        }
+        self.assertNotIn((0, 2), output_edges)
+        self.assertIn((1, 3), output_edges)
+
     def test_maps_boundary_features_and_geometric_corners(self):
         vertices = np.array(
             [

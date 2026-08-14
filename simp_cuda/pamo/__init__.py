@@ -315,6 +315,10 @@ class PaMO(nn.Module):
         max_edge_length=None,
         feature_angle=5.0,
         max_splits=100000,
+        coplanar_flip_passes=8,
+        quality_iterations=20,
+        quality_step=0.4,
+        quality_flip_passes=12,
     ):
         """
         Refine the exact zero surface with hard original-edge constraints.
@@ -328,6 +332,7 @@ class PaMO(nn.Module):
         from .original_constrained import (
             refine_original_mesh_by_longest_edge,
         )
+        from .feature_optimize import optimize_feature_constrained_mesh
         from .sdf_field import resolve_sdf_mode
 
         resolved_mode, mode_reason = resolve_sdf_mode(
@@ -384,20 +389,19 @@ class PaMO(nn.Module):
         legacy_projection_requested = (
             projection_distance is not None
             or feature_snap_distance is not None
-            or not np.isclose(float(coplanar_angle_tolerance), 0.1)
             or not np.isclose(float(coplanar_distance_ratio), 1e-6)
         )
         if legacy_projection_requested:
             print(
-                "Warning: projection/coplanar options are ignored by strict "
+                "Warning: projection/distance options are ignored by strict "
                 "original-constrained refinement; no DMC projection or edge "
                 "matching is performed."
             )
 
         print(
             "Original-constrained SDF semantics : exact zero surface "
-            "({}). Original connectivity is retained as the hard constraint "
-            "skeleton instead of replacing it with DMC connectivity.".format(
+            "({}). Hard original feature lineages are retained while "
+            "coplanar non-feature edges may be optimized.".format(
                 mode_reason
             )
         )
@@ -407,7 +411,30 @@ class PaMO(nn.Module):
             max_edge_length=max_edge_length,
             feature_angle_degrees=feature_angle,
             max_splits=max_splits,
+            coplanar_angle_degrees=coplanar_angle_tolerance,
+            flip_passes=coplanar_flip_passes,
         )
+        quality_iterations = int(quality_iterations)
+        quality_step = float(quality_step)
+        quality_flip_passes = int(quality_flip_passes)
+        if quality_iterations < 0:
+            raise ValueError("Constraint quality iterations must be non-negative.")
+        if not 0.0 < quality_step <= 1.0:
+            raise ValueError("Constraint quality step must be in (0, 1].")
+        if quality_flip_passes < 0:
+            raise ValueError("Constraint quality flip passes must be non-negative.")
+        if quality_iterations > 0:
+            verts, faces, _ = optimize_feature_constrained_mesh(
+                self.gt_mesh,
+                verts,
+                faces,
+                resolution=resolution,
+                feature_angle_degrees=feature_angle,
+                iterations=quality_iterations,
+                smoothing_step=quality_step,
+                flip_passes=quality_flip_passes,
+                maximum_edge_length=max_edge_length,
+            )
         print(
             "Time for Strict Original Constraint Refinement: {} sec".format(
                 time.time() - start_constraints

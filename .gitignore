@@ -1,4 +1,6 @@
 *dll
+*.pyd
+.venv/
 *obj
 *build*
 *egg*

@@ -82,10 +82,14 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--surface-max-deviation-ratio`**: Maximum source-plane deviation introduced by collapse or flip, divided by the Poisson radius. The default is `0.05`; smaller values prevent flat chords across rounded regions more aggressively.
 - **`--surface-min-collapse-quality`**: Also make edges adjacent to triangles below this normalized quality eligible for controlled collapse, even when the edge is not shorter than the minimum edge ratio. The default is `0.25`; use `0` to keep short-edge-only behavior.
 - **`--surface-coplanar-angle`**: Treat adjacent source faces within this normal angle as one coplanar patch for source-edge refinement. Internal coplanar edges are no longer subdivided as hard source boundaries; the default is `1` degree.
-- **`--original-constrained-remesh`**: Preserve the original triangle connectivity as a hard constraint skeleton. No input edge is collapsed or flipped. Edges sharper than the feature threshold, boundaries, and non-manifold edges remain explicit edge chains and may only be split collinearly.
+- **`--original-constrained-remesh`**: Preserve sharp, boundary, and non-manifold input edges as hard constraint chains. After conforming longest-edge refinement, quality-improving flips remove non-feature seams inside coplanar patches.
 - **`--constraint-feature-angle`**: Mark every original manifold edge whose adjacent-face dihedral is strictly greater than this angle as a hard feature, default=5 degrees.
 - **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. If the current longest edge already satisfies it, no vertices or faces are inserted.
 - **`--constraint-max-splits`**: Safety limit for longest-edge bisection, default=100000. The operation fails instead of returning a mesh which violates the requested maximum length.
+- **`--constraint-flip-passes`**: Number of quality-driven coplanar non-feature edge-flip passes after refinement, default=8. Hard feature chains are never flipped.
+- **`--constraint-quality-iterations`**: Number of feature-safe tangential relocation iterations after constrained refinement, default=20.
+- **`--constraint-quality-step`**: Tangential relocation step for constrained quality optimization, default=0.4.
+- **`--constraint-quality-flip-passes`**: Number of feature-safe global quality edge-flip passes, default=12. The maximum edge-length bound remains enforced.
 
 For STL input and output:
 ```
@@ -288,10 +292,11 @@ an approximation. With exact `SDF=0` semantics, the original piecewise-linear
 surface is already the zero surface, so this mode retains its connectivity as
 the constraint skeleton and refines it directly.
 
-Every edge is preserved geometrically. If a hard edge is longer than the
+Every hard feature edge is preserved geometrically. If it is longer than the
 global length bound, it is replaced only by two collinear child edges and its
 lineage is validated after refinement. Long non-feature edges are bisected in
-the same conforming operation. There is no edge collapse, edge flip, smoothing,
+the same conforming operation, then quality-improving flips replace redundant
+diagonals inside coplanar patches. There is no hard-edge collapse, smoothing,
 or nearest-edge matching.
 
 Because an unsigned-distance repair envelope has different topology and is

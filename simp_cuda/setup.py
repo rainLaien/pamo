@@ -4,12 +4,19 @@ import platform
 
 import torch
 from setuptools import find_packages, setup
+import torch.utils.cpp_extension as torch_cpp_extension
 from torch.utils.cpp_extension import (
     CUDA_HOME,
     BuildExtension,
     CppExtension,
     CUDAExtension,
 )
+
+
+# MSVC emits UTF-8 diagnostics on localized Windows installations, while
+# PyTorch defaults to the active OEM code page when probing the compiler.
+if platform.system() == "Windows":
+    torch_cpp_extension.SUBPROCESS_DECODE_ARGS = ("utf-8", "replace")
 
 
 def get_extensions():
@@ -41,8 +48,9 @@ def get_extensions():
             nvcc_flags.append("-Xcompiler")
             nvcc_flags.append("/utf-8")
             nvcc_flags.append("-D_USE_MATH_DEFINES")
+        cxx_flags = ["/O2", "/utf-8"] if platform.system() == "Windows" else ["-O3"]
         extra_compile_args = {
-            "cxx": ["-O3"],
+            "cxx": cxx_flags,
             "nvcc": nvcc_flags,
         }
     sources = [os.path.join(extensions_dir, s) for s in sources]
