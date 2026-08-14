@@ -317,8 +317,19 @@ class PaMO(nn.Module):
         max_splits=None,
         coplanar_flip_passes=8,
         coplanar_flip_minimum_valence=None,
+        coplanar_flip_maximum_candidate_quality=None,
         planar_fan_minimum_valence=None,
         planar_annulus_minimum_faces=None,
+        cylinder_minimum_faces=None,
+        cylinder_radius_tolerance=1e-3,
+        cylinder_target_edge_ratio=1.0,
+        partial_cylinder_minimum_faces=None,
+        partial_cylinder_radius_tolerance=2e-3,
+        partial_cylinder_normal_tolerance=2e-2,
+        partial_cylinder_minimum_angle=30.0,
+        rounded_fillet_minimum_faces=None,
+        rounded_fillet_minimum_curvature=0.2,
+        planar_region_minimum_faces=None,
         quality_iterations=20,
         quality_step=0.4,
         quality_flip_passes=12,
@@ -417,8 +428,27 @@ class PaMO(nn.Module):
             coplanar_angle_degrees=coplanar_angle_tolerance,
             flip_passes=coplanar_flip_passes,
             flip_minimum_valence=coplanar_flip_minimum_valence,
+            flip_maximum_candidate_quality=(
+                coplanar_flip_maximum_candidate_quality
+            ),
             planar_fan_minimum_valence=planar_fan_minimum_valence,
             planar_annulus_minimum_faces=planar_annulus_minimum_faces,
+            cylinder_minimum_faces=cylinder_minimum_faces,
+            cylinder_radius_tolerance=cylinder_radius_tolerance,
+            cylinder_target_edge_ratio=cylinder_target_edge_ratio,
+            partial_cylinder_minimum_faces=partial_cylinder_minimum_faces,
+            partial_cylinder_radius_tolerance=(
+                partial_cylinder_radius_tolerance
+            ),
+            partial_cylinder_normal_tolerance=(
+                partial_cylinder_normal_tolerance
+            ),
+            partial_cylinder_minimum_angle=partial_cylinder_minimum_angle,
+            rounded_fillet_minimum_faces=rounded_fillet_minimum_faces,
+            rounded_fillet_minimum_curvature=(
+                rounded_fillet_minimum_curvature
+            ),
+            planar_region_minimum_faces=planar_region_minimum_faces,
         )
         quality_iterations = int(quality_iterations)
         quality_step = float(quality_step)

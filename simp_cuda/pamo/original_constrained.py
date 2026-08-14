@@ -5,6 +5,8 @@ import numpy as np
 import trimesh
 import igl
 from scipy.spatial import cKDTree, Delaunay, QhullError
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 try:
     import triangle as constrained_triangle
@@ -185,8 +187,11 @@ def retriangulate_planar_annuli(
     faces,
     protected_edges=None,
     minimum_faces=20,
+    minimum_holes=1,
+    maximum_holes=None,
+    maximum_target_edge_length=None,
 ):
-    """Uniformly retriangulate exact planar facets containing one or more holes."""
+    """Uniformly retriangulate exact planar facets with constrained boundaries."""
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
@@ -216,7 +221,12 @@ def retriangulate_planar_annuli(
         if len(facet) < int(minimum_faces):
             continue
         cycles = _ordered_cycles_from_edges(boundary_edges)
-        if cycles is None or len(cycles) < 2:
+        if cycles is None:
+            continue
+        hole_count = len(cycles) - 1
+        if hole_count < int(minimum_holes):
+            continue
+        if maximum_holes is not None and hole_count > int(maximum_holes):
             continue
         candidate_count += 1
         boundary_edge_set = {
@@ -278,6 +288,19 @@ def retriangulate_planar_annuli(
         spacing = float(np.median(boundary_lengths[boundary_lengths > 0.0]))
         if not np.isfinite(spacing) or spacing <= 0.0:
             continue
+        if hole_count == 0:
+            domain_area = max(float(areas[outer_index]), 0.0)
+            maximum_interior_points = max(len(facet) * 8, 100)
+            density_spacing = np.sqrt(
+                domain_area
+                / max(
+                    (np.sqrt(3.0) * 0.5) * maximum_interior_points,
+                    np.finfo(np.float64).eps,
+                )
+            )
+            spacing = max(spacing, density_spacing)
+        if maximum_target_edge_length is not None:
+            spacing = min(spacing, float(maximum_target_edge_length))
 
         all_boundary_2d = np.vstack(polygons)
         all_boundary_ids = np.concatenate(
@@ -354,10 +377,11 @@ def retriangulate_planar_annuli(
             triangle_input = {
                 "vertices": all_2d,
                 "segments": np.asarray(sorted(required_edges), dtype=np.int32),
-                "holes": np.asarray(
-                    [hole.mean(axis=0) for hole in holes], dtype=np.float64
-                ),
             }
+            if holes:
+                triangle_input["holes"] = np.asarray(
+                    [hole.mean(axis=0) for hole in holes], dtype=np.float64
+                )
             triangle_result = constrained_triangle.triangulate(
                 triangle_input, "pQY"
             )
@@ -457,6 +481,831 @@ def retriangulate_planar_annuli(
             "new_faces": len(appended_faces),
             "old_quality": float(np.mean(old_quality_values)),
             "new_quality": float(np.mean(new_quality_values)),
+        },
+    )
+
+
+def _fit_circle_loop(points):
+    points = np.asarray(points, dtype=np.float64)
+    origin = points.mean(axis=0)
+    _, singular_values, basis_vh = np.linalg.svd(
+        points - origin, full_matrices=False
+    )
+    if singular_values[0] <= 0.0:
+        return None
+    normal = basis_vh[-1]
+    basis = basis_vh[:2]
+    coordinates = (points - origin) @ basis.T
+    system = np.column_stack(
+        (2.0 * coordinates[:, 0], 2.0 * coordinates[:, 1], np.ones(len(points)))
+    )
+    right_hand_side = np.sum(coordinates * coordinates, axis=1)
+    solution, _, _, _ = np.linalg.lstsq(system, right_hand_side, rcond=None)
+    center_2d = solution[:2]
+    center = origin + center_2d @ basis
+    radii = np.linalg.norm(coordinates - center_2d, axis=1)
+    radius = float(radii.mean())
+    if radius <= 0.0:
+        return None
+    return {
+        "center": center,
+        "normal": normal,
+        "radius": radius,
+        "radius_error": float(radii.std() / radius),
+        "plane_error": float(singular_values[-1] / singular_values[0]),
+    }
+
+
+def retriangulate_partial_cylindrical_walls(
+    vertices,
+    faces,
+    protected_edges,
+    minimum_faces=20,
+    radius_tolerance=2e-3,
+    normal_tolerance=2e-2,
+    minimum_angle_degrees=30.0,
+    target_edge_ratio=1.0,
+    isolate_rounded_faces=False,
+    minimum_curvature_degrees=0.2,
+):
+    """Remesh open or irregularly trimmed cylinder patches with one boundary loop."""
+    if constrained_triangle is None:
+        raise RuntimeError(
+            "Partial-cylinder constrained remeshing needs the 'triangle' package."
+        )
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    protected = {
+        tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in np.asarray(protected_edges, dtype=np.int64).reshape(-1, 2)
+    }
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    adjacency_edges = np.sort(
+        np.asarray(mesh.face_adjacency_edges, dtype=np.int64), axis=1
+    )
+    usable = np.asarray(
+        [tuple(map(int, edge)) not in protected for edge in adjacency_edges]
+    )
+    if isolate_rounded_faces:
+        adjacency_angles = np.degrees(
+            np.asarray(mesh.face_adjacency_angles, dtype=np.float64)
+        )
+        face_curvature = np.zeros(len(faces), dtype=np.float64)
+        np.maximum.at(face_curvature, adjacency[:, 0], adjacency_angles)
+        np.maximum.at(face_curvature, adjacency[:, 1], adjacency_angles)
+        rounded_faces = face_curvature >= float(minimum_curvature_degrees)
+        usable &= rounded_faces[adjacency[:, 0]] & rounded_faces[adjacency[:, 1]]
+    usable_adjacency = adjacency[usable]
+    graph = coo_matrix(
+        (
+            np.ones(len(usable_adjacency) * 2, dtype=np.uint8),
+            (
+                np.concatenate((usable_adjacency[:, 0], usable_adjacency[:, 1])),
+                np.concatenate((usable_adjacency[:, 1], usable_adjacency[:, 0])),
+            ),
+        ),
+        shape=(len(faces), len(faces)),
+    ).tocsr()
+    _, labels = connected_components(graph, directed=False)
+    component_sizes = np.bincount(labels)
+    kept_faces = np.ones(len(faces), dtype=bool)
+    appended_vertices = []
+    appended_faces = []
+    candidates = 0
+    accepted = 0
+    removed_faces = 0
+    old_qualities = []
+    new_qualities = []
+
+    for component_id in np.flatnonzero(
+        (component_sizes >= int(minimum_faces)) & (component_sizes <= 50000)
+    ):
+        face_ids = np.flatnonzero(labels == component_id)
+        component_faces = faces[face_ids]
+        component_edges = np.sort(
+            component_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2),
+            axis=1,
+        )
+        unique_edges, edge_counts = np.unique(
+            component_edges, axis=0, return_counts=True
+        )
+        boundary_edges = unique_edges[edge_counts == 1]
+        cycles = _ordered_cycles_from_edges(boundary_edges)
+        if cycles is None or len(cycles) != 1:
+            continue
+        candidates += 1
+        boundary_set = {tuple(map(int, edge)) for edge in boundary_edges}
+        if not isolate_rounded_faces and not boundary_set.issubset(protected):
+            continue
+        if (set(map(tuple, unique_edges)) & protected) - boundary_set:
+            continue
+
+        triangles = vertices[component_faces]
+        crosses = np.cross(
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 0],
+        )
+        cross_lengths = np.linalg.norm(crosses, axis=1)
+        if np.any(cross_lengths <= 0.0):
+            continue
+        normals = crosses / cross_lengths[:, None]
+        normal_covariance = normals.T @ normals / len(normals)
+        eigenvalues, eigenvectors = np.linalg.eigh(normal_covariance)
+        axis = eigenvectors[:, 0]
+        if float(np.sqrt(np.mean((normals @ axis) ** 2))) > normal_tolerance:
+            continue
+        first_basis = normals[0] - axis * np.dot(normals[0], axis)
+        first_basis_length = np.linalg.norm(first_basis)
+        if first_basis_length <= 0.0:
+            continue
+        first_basis /= first_basis_length
+        second_basis = np.cross(axis, first_basis)
+        component_vertex_ids = np.unique(component_faces)
+        origin = vertices[component_vertex_ids].mean(axis=0)
+        offsets = vertices[component_vertex_ids] - origin
+        projected = np.column_stack(
+            (offsets @ first_basis, offsets @ second_basis)
+        )
+        circle_system = np.column_stack(
+            (
+                2.0 * projected[:, 0],
+                2.0 * projected[:, 1],
+                np.ones(len(projected)),
+            )
+        )
+        circle_rhs = np.sum(projected * projected, axis=1)
+        circle_solution, _, _, _ = np.linalg.lstsq(
+            circle_system, circle_rhs, rcond=None
+        )
+        center_2d = circle_solution[:2]
+        radial_lengths = np.linalg.norm(projected - center_2d, axis=1)
+        radius = float(radial_lengths.mean())
+        if radius <= 0.0 or float(radial_lengths.std() / radius) > radius_tolerance:
+            continue
+        axis_origin = origin + center_2d @ np.vstack((first_basis, second_basis))
+
+        face_centroids = triangles.mean(axis=1)
+        centroid_offsets = face_centroids - axis_origin
+        centroid_axial = centroid_offsets @ axis
+        centroid_radial = centroid_offsets - centroid_axial[:, None] * axis
+        centroid_radial_lengths = np.linalg.norm(centroid_radial, axis=1)
+        if np.any(centroid_radial_lengths <= 0.0):
+            continue
+        radial_alignment = np.abs(
+            np.sum(normals * centroid_radial, axis=1) / centroid_radial_lengths
+        )
+        if float(np.percentile(radial_alignment, 5.0)) < 0.98:
+            continue
+
+        all_offsets = vertices[component_vertex_ids] - axis_origin
+        all_angles = np.mod(
+            np.arctan2(all_offsets @ second_basis, all_offsets @ first_basis),
+            2.0 * np.pi,
+        )
+        sorted_angles = np.sort(all_angles)
+        angular_gaps = np.diff(
+            np.concatenate((sorted_angles, sorted_angles[:1] + 2.0 * np.pi))
+        )
+        largest_gap_index = int(np.argmax(angular_gaps))
+        coverage = 2.0 * np.pi - float(angular_gaps[largest_gap_index])
+        if coverage < np.deg2rad(float(minimum_angle_degrees)):
+            continue
+        cut_angle = float(
+            sorted_angles[largest_gap_index]
+            + 0.5 * angular_gaps[largest_gap_index]
+        )
+
+        boundary_cycle = np.asarray(cycles[0], dtype=np.int64)
+        boundary_offsets = vertices[boundary_cycle] - axis_origin
+        boundary_angles = np.mod(
+            np.arctan2(
+                boundary_offsets @ second_basis,
+                boundary_offsets @ first_basis,
+            )
+            - cut_angle,
+            2.0 * np.pi,
+        )
+        minimum_unwrapped_angle = float(
+            np.min(np.mod(all_angles - cut_angle, 2.0 * np.pi))
+        )
+        boundary_u = radius * (boundary_angles - minimum_unwrapped_angle)
+        boundary_z = boundary_offsets @ axis
+        minimum_z = float(boundary_z.min())
+        boundary_parameters = np.column_stack(
+            (boundary_u, boundary_z - minimum_z)
+        )
+        if abs(_polygon_signed_area(boundary_parameters)) <= 1e-12:
+            continue
+        segments = np.column_stack(
+            (
+                np.arange(len(boundary_cycle), dtype=np.int32),
+                np.roll(np.arange(len(boundary_cycle), dtype=np.int32), -1),
+            )
+        )
+        boundary_lengths = np.linalg.norm(
+            vertices[boundary_cycle]
+            - vertices[np.roll(boundary_cycle, -1)],
+            axis=1,
+        )
+        spacing = float(np.median(boundary_lengths)) * float(target_edge_ratio)
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            continue
+        lower = boundary_parameters.min(axis=0)
+        upper = boundary_parameters.max(axis=0)
+        row_step = spacing * np.sqrt(3.0) * 0.5
+        grid_points = []
+        row_index = 0
+        y = lower[1] + row_step
+        segment_starts = boundary_parameters
+        segment_vectors = np.roll(boundary_parameters, -1, axis=0) - boundary_parameters
+        segment_length_squared = np.maximum(
+            np.sum(segment_vectors * segment_vectors, axis=1),
+            np.finfo(np.float64).eps,
+        )
+        while y < upper[1]:
+            x_values = np.arange(
+                lower[0] + spacing * (0.5 if row_index % 2 == 0 else 1.0),
+                upper[0],
+                spacing,
+            )
+            if len(x_values):
+                row_points = np.column_stack((x_values, np.full(len(x_values), y)))
+                inside_points = row_points[
+                    _points_in_polygon(row_points, boundary_parameters)
+                ]
+                if len(inside_points):
+                    differences = inside_points[:, None, :] - segment_starts[None, :, :]
+                    fractions = np.clip(
+                        np.sum(
+                            differences * segment_vectors[None, :, :], axis=2
+                        )
+                        / segment_length_squared[None, :],
+                        0.0,
+                        1.0,
+                    )
+                    closest = (
+                        segment_starts[None, :, :]
+                        + fractions[:, :, None] * segment_vectors[None, :, :]
+                    )
+                    distances = np.sqrt(
+                        np.min(
+                            np.sum((inside_points[:, None, :] - closest) ** 2, axis=2),
+                            axis=1,
+                        )
+                    )
+                    grid_points.extend(inside_points[distances >= spacing * 0.55])
+            row_index += 1
+            y += row_step
+
+        parameter_vertices = np.vstack(
+            (
+                boundary_parameters,
+                np.asarray(grid_points, dtype=np.float64).reshape(-1, 2),
+            )
+        )
+        triangle_result = constrained_triangle.triangulate(
+            {"vertices": parameter_vertices, "segments": segments}, "pQY"
+        )
+        if "triangles" not in triangle_result:
+            continue
+        result_parameters = np.asarray(triangle_result["vertices"], dtype=np.float64)
+        local_faces = np.asarray(triangle_result["triangles"], dtype=np.int64)
+        new_parameters = result_parameters[len(boundary_cycle):]
+        new_angles = (
+            new_parameters[:, 0] / radius
+            + minimum_unwrapped_angle
+            + cut_angle
+        )
+        new_axial = new_parameters[:, 1] + minimum_z
+        new_vertices = (
+            axis_origin
+            + new_axial[:, None] * axis
+            + radius
+            * (
+                np.cos(new_angles)[:, None] * first_basis
+                + np.sin(new_angles)[:, None] * second_basis
+            )
+        )
+        if len(new_vertices):
+            _, _, new_vertices = igl.point_mesh_squared_distance(
+                new_vertices, vertices, component_faces
+            )
+            new_vertices = np.asarray(new_vertices, dtype=np.float64)
+        first_new_index = len(vertices) + len(appended_vertices)
+        local_to_global = np.concatenate(
+            (
+                boundary_cycle,
+                np.arange(
+                    first_new_index,
+                    first_new_index + len(new_vertices),
+                    dtype=np.int64,
+                ),
+            )
+        )
+        new_faces = local_to_global[local_faces]
+        if np.any(
+            (new_faces[:, 0] == new_faces[:, 1])
+            | (new_faces[:, 1] == new_faces[:, 2])
+            | (new_faces[:, 2] == new_faces[:, 0])
+        ):
+            continue
+        coordinate_pool = np.vstack(
+            (
+                vertices,
+                np.asarray(appended_vertices, dtype=np.float64).reshape(-1, 3),
+                new_vertices,
+            )
+        )
+        new_edge_array = np.sort(
+            new_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1
+        )
+        new_unique_edges, new_edge_counts = np.unique(
+            new_edge_array, axis=0, return_counts=True
+        )
+        new_edge_count_map = {
+            tuple(map(int, edge)): int(count)
+            for edge, count in zip(new_unique_edges, new_edge_counts)
+        }
+        if any(new_edge_count_map.get(edge, 0) != 1 for edge in boundary_set):
+            continue
+        if any(
+            count != (1 if edge in boundary_set else 2)
+            for edge, count in new_edge_count_map.items()
+        ):
+            continue
+
+        def boundary_directions(face_array):
+            directions = {}
+            for face in face_array:
+                for first, second in (
+                    (int(face[0]), int(face[1])),
+                    (int(face[1]), int(face[2])),
+                    (int(face[2]), int(face[0])),
+                ):
+                    edge = tuple(sorted((first, second)))
+                    if edge in boundary_set:
+                        directions[edge] = (first, second)
+            return directions
+
+        old_directions = boundary_directions(component_faces)
+        new_directions = boundary_directions(new_faces)
+        if set(old_directions) != boundary_set or set(new_directions) != boundary_set:
+            continue
+        matches = np.asarray(
+            [old_directions[edge] == new_directions[edge] for edge in boundary_set]
+        )
+        if not np.all(matches):
+            if np.all(~matches):
+                new_faces = new_faces[:, [0, 2, 1]]
+            else:
+                continue
+        old_quality = _triangle_quality_values(vertices, component_faces)
+        new_quality = _triangle_quality_values(coordinate_pool, new_faces)
+        if (
+            np.percentile(new_quality, 5.0)
+            < np.percentile(old_quality, 5.0) - 1e-8
+            or float(new_quality.mean()) < float(old_quality.mean()) - 1e-8
+        ):
+            continue
+
+        kept_faces[face_ids] = False
+        appended_vertices.extend(new_vertices)
+        appended_faces.extend(new_faces)
+        old_qualities.extend(old_quality)
+        new_qualities.extend(new_quality)
+        accepted += 1
+        removed_faces += len(face_ids)
+
+    if not accepted:
+        return vertices.copy(), faces.copy(), {
+            "candidates": candidates, "patches": 0, "new_vertices": 0,
+            "removed_faces": 0, "new_faces": 0,
+            "old_quality": 0.0, "new_quality": 0.0,
+        }
+    return (
+        np.vstack((vertices, np.asarray(appended_vertices, dtype=np.float64))),
+        np.vstack((faces[kept_faces], np.asarray(appended_faces, dtype=np.int64))),
+        {
+            "candidates": candidates,
+            "patches": accepted,
+            "new_vertices": len(appended_vertices),
+            "removed_faces": removed_faces,
+            "new_faces": len(appended_faces),
+            "old_quality": float(np.mean(old_qualities)),
+            "new_quality": float(np.mean(new_qualities)),
+        },
+    )
+
+
+def retriangulate_cylindrical_walls(
+    vertices,
+    faces,
+    protected_edges,
+    minimum_faces=20,
+    radius_tolerance=1e-3,
+    target_edge_ratio=1.0,
+):
+    """Remesh safely detected cylindrical strips in an unwrapped parameter domain."""
+    if constrained_triangle is None:
+        raise RuntimeError(
+            "Cylindrical constrained remeshing needs the 'triangle' package."
+        )
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    protected = {
+        tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in np.asarray(protected_edges, dtype=np.int64).reshape(-1, 2)
+    }
+    radius_tolerance = float(radius_tolerance)
+    target_edge_ratio = float(target_edge_ratio)
+    if radius_tolerance <= 0.0:
+        raise ValueError("Cylinder radius tolerance must be positive.")
+    if target_edge_ratio <= 0.0:
+        raise ValueError("Cylinder target edge ratio must be positive.")
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    adjacency_edges = np.sort(
+        np.asarray(mesh.face_adjacency_edges, dtype=np.int64), axis=1
+    )
+    usable = np.asarray(
+        [tuple(map(int, edge)) not in protected for edge in adjacency_edges]
+    )
+    usable_adjacency = adjacency[usable]
+    graph = coo_matrix(
+        (
+            np.ones(len(usable_adjacency) * 2, dtype=np.uint8),
+            (
+                np.concatenate((usable_adjacency[:, 0], usable_adjacency[:, 1])),
+                np.concatenate((usable_adjacency[:, 1], usable_adjacency[:, 0])),
+            ),
+        ),
+        shape=(len(faces), len(faces)),
+    ).tocsr()
+    _, labels = connected_components(graph, directed=False)
+    component_sizes = np.bincount(labels)
+    kept_faces = np.ones(len(faces), dtype=bool)
+    appended_vertices = []
+    appended_faces = []
+    candidates = 0
+    accepted = 0
+    removed_faces = 0
+    old_qualities = []
+    new_qualities = []
+
+    component_ids = np.flatnonzero(
+        (component_sizes >= int(minimum_faces)) & (component_sizes <= 50000)
+    )
+    for component_id in component_ids:
+        face_ids = np.flatnonzero(labels == component_id)
+        component_faces = faces[face_ids]
+        component_edges = np.sort(
+            component_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2),
+            axis=1,
+        )
+        unique_edges, edge_counts = np.unique(
+            component_edges, axis=0, return_counts=True
+        )
+        boundary_edges = unique_edges[edge_counts == 1]
+        cycles = _ordered_cycles_from_edges(boundary_edges)
+        if cycles is None or len(cycles) != 2:
+            continue
+        if set(cycles[0]) & set(cycles[1]):
+            continue
+        candidates += 1
+        boundary_set = {
+            tuple(sorted((int(edge[0]), int(edge[1]))))
+            for edge in boundary_edges
+        }
+        if not boundary_set.issubset(protected):
+            continue
+        if (set(map(tuple, unique_edges)) & protected) - boundary_set:
+            continue
+
+        fits = [_fit_circle_loop(vertices[cycle]) for cycle in cycles]
+        if any(fit is None for fit in fits):
+            continue
+        if any(
+            fit["plane_error"] > radius_tolerance
+            or fit["radius_error"] > radius_tolerance
+            for fit in fits
+        ):
+            continue
+        center_delta = fits[1]["center"] - fits[0]["center"]
+        height = float(np.linalg.norm(center_delta))
+        if height <= 0.0:
+            continue
+        axis = center_delta / height
+        if any(abs(np.dot(fit["normal"], axis)) < 1.0 - radius_tolerance for fit in fits):
+            continue
+        mean_radius = 0.5 * (fits[0]["radius"] + fits[1]["radius"])
+        if abs(fits[0]["radius"] - fits[1]["radius"]) > mean_radius * radius_tolerance:
+            continue
+        component_vertex_ids = np.unique(component_faces)
+        offsets = vertices[component_vertex_ids] - fits[0]["center"]
+        axial_coordinates = offsets @ axis
+        radial_vectors = offsets - axial_coordinates[:, None] * axis
+        radial_lengths = np.linalg.norm(radial_vectors, axis=1)
+        if (
+            float(radial_lengths.std() / max(radial_lengths.mean(), 1e-30))
+            > radius_tolerance
+        ):
+            continue
+
+        first_radial = vertices[cycles[0][0]] - fits[0]["center"]
+        first_radial -= axis * np.dot(first_radial, axis)
+        first_radial_length = np.linalg.norm(first_radial)
+        if first_radial_length <= 0.0:
+            continue
+        first_basis = first_radial / first_radial_length
+        second_basis = np.cross(axis, first_basis)
+        sorted_cycles = []
+        sorted_angles = []
+        for cycle, fit in zip(cycles, fits):
+            radial = vertices[cycle] - fit["center"]
+            angles = np.mod(
+                np.arctan2(radial @ second_basis, radial @ first_basis),
+                2.0 * np.pi,
+            )
+            order = np.argsort(angles)
+            ordered_cycle = np.asarray(cycle, dtype=np.int64)[order]
+            ordered_angles = angles[order]
+            ordered_angles = np.mod(ordered_angles - ordered_angles[0], 2.0 * np.pi)
+            sorted_cycles.append(ordered_cycle)
+            sorted_angles.append(ordered_angles)
+
+        circumference = 2.0 * np.pi * mean_radius
+        lower_u = sorted_angles[0] * mean_radius
+        upper_u = sorted_angles[1] * mean_radius
+        boundary_lengths = np.concatenate(
+            (
+                np.linalg.norm(
+                    vertices[sorted_cycles[0]]
+                    - vertices[np.roll(sorted_cycles[0], -1)], axis=1
+                ),
+                np.linalg.norm(
+                    vertices[sorted_cycles[1]]
+                    - vertices[np.roll(sorted_cycles[1], -1)], axis=1
+                ),
+            )
+        )
+        spacing = float(np.median(boundary_lengths)) * target_edge_ratio
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            continue
+        row_step = spacing * np.sqrt(3.0) * 0.5
+        seam_heights = []
+        y = row_step
+        while y < height - row_step * 0.25:
+            seam_heights.append(y)
+            y += row_step
+
+        parameter_vertices = []
+        boundary_mapping = []
+        parameter_vertices.extend(np.column_stack((lower_u, np.zeros(len(lower_u)))))
+        boundary_mapping.extend(sorted_cycles[0])
+        parameter_vertices.append((circumference, 0.0))
+        boundary_mapping.append(int(sorted_cycles[0][0]))
+        right_seam_indices = []
+        for seam_height in seam_heights:
+            right_seam_indices.append(len(parameter_vertices))
+            parameter_vertices.append((circumference, seam_height))
+            boundary_mapping.append(-1)
+        parameter_vertices.append((circumference, height))
+        boundary_mapping.append(int(sorted_cycles[1][0]))
+        parameter_vertices.extend(
+            np.column_stack((upper_u[::-1], np.full(len(upper_u), height)))
+        )
+        boundary_mapping.extend(sorted_cycles[1][::-1])
+        left_seam_indices = []
+        for seam_height in reversed(seam_heights):
+            left_seam_indices.append(len(parameter_vertices))
+            parameter_vertices.append((0.0, seam_height))
+            boundary_mapping.append(-1)
+        parameter_vertices = np.asarray(parameter_vertices, dtype=np.float64)
+        boundary_mapping = np.asarray(boundary_mapping, dtype=np.int64)
+        segments = np.column_stack(
+            (
+                np.arange(len(parameter_vertices), dtype=np.int32),
+                np.roll(np.arange(len(parameter_vertices), dtype=np.int32), -1),
+            )
+        )
+
+        grid_points = []
+        row_index = 0
+        for y in seam_heights:
+            x = spacing * (0.5 if row_index % 2 == 0 else 1.0)
+            while x < circumference:
+                grid_points.append((x, y))
+                x += spacing
+            row_index += 1
+        all_parameter_vertices = np.vstack(
+            (
+                parameter_vertices,
+                np.asarray(grid_points, dtype=np.float64).reshape(-1, 2),
+            )
+        )
+        triangle_result = constrained_triangle.triangulate(
+            {"vertices": all_parameter_vertices, "segments": segments},
+            "pQY",
+        )
+        if "triangles" not in triangle_result:
+            continue
+        result_parameters = np.asarray(
+            triangle_result["vertices"], dtype=np.float64
+        )
+        local_faces = np.asarray(triangle_result["triangles"], dtype=np.int64)
+        interior_parameters = result_parameters[len(parameter_vertices):]
+        seam_parameters = np.column_stack(
+            (
+                np.zeros(len(seam_heights), dtype=np.float64),
+                np.asarray(seam_heights, dtype=np.float64),
+            )
+        )
+        new_parameters = np.vstack((seam_parameters, interior_parameters))
+        axial_fraction = np.clip(new_parameters[:, 1] / height, 0.0, 1.0)
+        lower_seam_angle = float(
+            np.arctan2(
+                (vertices[sorted_cycles[0][0]] - fits[0]["center"]) @ second_basis,
+                (vertices[sorted_cycles[0][0]] - fits[0]["center"]) @ first_basis,
+            )
+        )
+        upper_seam_angle = float(
+            np.arctan2(
+                (vertices[sorted_cycles[1][0]] - fits[1]["center"]) @ second_basis,
+                (vertices[sorted_cycles[1][0]] - fits[1]["center"]) @ first_basis,
+            )
+        )
+        seam_delta = np.arctan2(
+            np.sin(upper_seam_angle - lower_seam_angle),
+            np.cos(upper_seam_angle - lower_seam_angle),
+        )
+        angles = (
+            new_parameters[:, 0] / mean_radius
+            + lower_seam_angle
+            + axial_fraction * seam_delta
+        )
+        radii = (
+            fits[0]["radius"] * (1.0 - axial_fraction)
+            + fits[1]["radius"] * axial_fraction
+        )
+        centers = (
+            fits[0]["center"][None, :] * (1.0 - axial_fraction[:, None])
+            + fits[1]["center"][None, :] * axial_fraction[:, None]
+        )
+        new_vertices = centers + radii[:, None] * (
+            np.cos(angles)[:, None] * first_basis
+            + np.sin(angles)[:, None] * second_basis
+        )
+        if len(new_vertices):
+            _, _, new_vertices = igl.point_mesh_squared_distance(
+                new_vertices,
+                vertices,
+                component_faces,
+            )
+            new_vertices = np.asarray(new_vertices, dtype=np.float64)
+        first_new_index = len(vertices) + len(appended_vertices)
+        local_to_global = np.empty(len(result_parameters), dtype=np.int64)
+        existing_boundary = boundary_mapping >= 0
+        local_to_global[:len(parameter_vertices)][existing_boundary] = (
+            boundary_mapping[existing_boundary]
+        )
+        seam_global_ids = np.arange(
+            first_new_index,
+            first_new_index + len(seam_heights),
+            dtype=np.int64,
+        )
+        for seam_index, local_index in enumerate(right_seam_indices):
+            local_to_global[local_index] = seam_global_ids[seam_index]
+        for seam_index, local_index in enumerate(reversed(left_seam_indices)):
+            local_to_global[local_index] = seam_global_ids[seam_index]
+        local_to_global[len(parameter_vertices):] = np.arange(
+            first_new_index + len(seam_heights),
+            first_new_index + len(new_vertices),
+            dtype=np.int64,
+        )
+        new_faces = local_to_global[local_faces]
+        if np.any(
+            (new_faces[:, 0] == new_faces[:, 1])
+            | (new_faces[:, 1] == new_faces[:, 2])
+            | (new_faces[:, 2] == new_faces[:, 0])
+        ):
+            continue
+        coordinate_pool = np.vstack(
+            (
+                vertices,
+                np.asarray(appended_vertices, dtype=np.float64).reshape(-1, 3),
+                new_vertices,
+            )
+        )
+        new_triangles = coordinate_pool[new_faces]
+        new_crosses = np.cross(
+            new_triangles[:, 1] - new_triangles[:, 0],
+            new_triangles[:, 2] - new_triangles[:, 0],
+        )
+        original_triangles = vertices[component_faces]
+        original_crosses = np.cross(
+            original_triangles[:, 1] - original_triangles[:, 0],
+            original_triangles[:, 2] - original_triangles[:, 0],
+        )
+        original_centroids = original_triangles.mean(axis=1)
+        original_offsets = original_centroids - fits[0]["center"]
+        original_radial = original_offsets - (original_offsets @ axis)[:, None] * axis
+        orientation_sign = np.sign(
+            np.sum(original_crosses * original_radial, axis=1).mean()
+        )
+        new_centroids = new_triangles.mean(axis=1)
+        new_offsets = new_centroids - fits[0]["center"]
+        new_radial = new_offsets - (new_offsets @ axis)[:, None] * axis
+        reverse = (
+            np.sum(new_crosses * new_radial, axis=1) * orientation_sign < 0.0
+        )
+        new_faces[reverse] = new_faces[reverse][:, [0, 2, 1]]
+
+        new_edge_array = np.sort(
+            new_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2),
+            axis=1,
+        )
+        new_unique_edges, new_edge_counts = np.unique(
+            new_edge_array, axis=0, return_counts=True
+        )
+        new_edge_count_map = {
+            tuple(map(int, edge)): int(count)
+            for edge, count in zip(new_unique_edges, new_edge_counts)
+        }
+        if any(new_edge_count_map.get(edge, 0) != 1 for edge in boundary_set):
+            continue
+        if any(
+            count != (1 if edge in boundary_set else 2)
+            for edge, count in new_edge_count_map.items()
+        ):
+            continue
+
+        def boundary_directions(face_array):
+            directions = {}
+            for face in face_array:
+                for first, second in (
+                    (int(face[0]), int(face[1])),
+                    (int(face[1]), int(face[2])),
+                    (int(face[2]), int(face[0])),
+                ):
+                    edge = tuple(sorted((first, second)))
+                    if edge in boundary_set:
+                        directions[edge] = (first, second)
+            return directions
+
+        old_boundary_directions = boundary_directions(component_faces)
+        new_boundary_directions = boundary_directions(new_faces)
+        if set(old_boundary_directions) != boundary_set or set(
+            new_boundary_directions
+        ) != boundary_set:
+            continue
+        direction_matches = np.asarray(
+            [
+                old_boundary_directions[edge] == new_boundary_directions[edge]
+                for edge in boundary_set
+            ],
+            dtype=bool,
+        )
+        if not np.all(direction_matches):
+            if np.all(~direction_matches):
+                new_faces = new_faces[:, [0, 2, 1]]
+            else:
+                continue
+        old_quality = _triangle_quality_values(vertices, component_faces)
+        new_quality = _triangle_quality_values(coordinate_pool, new_faces)
+        if (
+            np.percentile(new_quality, 5.0)
+            < np.percentile(old_quality, 5.0) - 1e-8
+            or float(new_quality.mean()) < float(old_quality.mean()) - 1e-8
+        ):
+            continue
+
+        kept_faces[face_ids] = False
+        appended_vertices.extend(new_vertices)
+        appended_faces.extend(new_faces)
+        old_qualities.extend(old_quality)
+        new_qualities.extend(new_quality)
+        accepted += 1
+        removed_faces += len(face_ids)
+
+    if not accepted:
+        return vertices.copy(), faces.copy(), {
+            "candidates": candidates, "walls": 0, "new_vertices": 0,
+            "removed_faces": 0, "new_faces": 0,
+            "old_quality": 0.0, "new_quality": 0.0,
+        }
+    return (
+        np.vstack((vertices, np.asarray(appended_vertices, dtype=np.float64))),
+        np.vstack((faces[kept_faces], np.asarray(appended_faces, dtype=np.int64))),
+        {
+            "candidates": candidates,
+            "walls": accepted,
+            "new_vertices": len(appended_vertices),
+            "removed_faces": removed_faces,
+            "new_faces": len(appended_faces),
+            "old_quality": float(np.mean(old_qualities)),
+            "new_quality": float(np.mean(new_qualities)),
         },
     )
 
@@ -724,7 +1573,7 @@ def _build_edge_faces(faces):
 
 
 def automatic_edge_length_limit(vertices, edge_lengths):
-    """Choose 10% of the bounding-box diagonal as the maximum edge length."""
+    """Choose 5% of the bounding-box diagonal as the maximum edge length."""
     vertices = np.asarray(vertices, dtype=np.float64)
     edge_lengths = np.asarray(edge_lengths, dtype=np.float64)
     diagonal = float(np.linalg.norm(np.ptp(vertices, axis=0)))
@@ -739,7 +1588,7 @@ def automatic_edge_length_limit(vertices, edge_lengths):
     # Keep the automatic rule predictable for large, already dense meshes.
     # Using the input edge distribution here can select an unnecessarily small
     # limit and trigger hundreds of thousands of conforming Python splits.
-    limit = diagonal * 0.1
+    limit = diagonal * 0.05
     return limit, diagonal, percentile_95
 
 
@@ -764,8 +1613,19 @@ def refine_original_mesh_by_longest_edge(
     coplanar_angle_degrees=0.1,
     flip_passes=8,
     flip_minimum_valence=None,
+    flip_maximum_candidate_quality=None,
     planar_fan_minimum_valence=None,
     planar_annulus_minimum_faces=None,
+    cylinder_minimum_faces=None,
+    cylinder_radius_tolerance=1e-3,
+    cylinder_target_edge_ratio=1.0,
+    partial_cylinder_minimum_faces=None,
+    partial_cylinder_radius_tolerance=2e-3,
+    partial_cylinder_normal_tolerance=2e-2,
+    partial_cylinder_minimum_angle=30.0,
+    rounded_fillet_minimum_faces=None,
+    rounded_fillet_minimum_curvature=0.2,
+    planar_region_minimum_faces=None,
 ):
     """
     Refine the original surface while retaining hard feature edge lineages.
@@ -847,6 +1707,99 @@ def refine_original_mesh_by_longest_edge(
             flush=True,
         )
 
+    if cylinder_minimum_faces is not None:
+        vertices, faces, cylinder_stats = retriangulate_cylindrical_walls(
+            vertices,
+            faces,
+            protected_edges=hard_edges_array,
+            minimum_faces=cylinder_minimum_faces,
+            radius_tolerance=cylinder_radius_tolerance,
+            target_edge_ratio=cylinder_target_edge_ratio,
+        )
+        print(
+            "Cylindrical wall retriangulation: {} / {} candidate wall(s), "
+            "{} new vertices, {} old -> {} new faces; mean quality "
+            "{:.6g} -> {:.6g}.".format(
+                cylinder_stats["walls"], cylinder_stats["candidates"],
+                cylinder_stats["new_vertices"], cylinder_stats["removed_faces"],
+                cylinder_stats["new_faces"], cylinder_stats["old_quality"],
+                cylinder_stats["new_quality"],
+            ),
+            flush=True,
+        )
+
+    if partial_cylinder_minimum_faces is not None:
+        vertices, faces, partial_stats = (
+            retriangulate_partial_cylindrical_walls(
+                vertices,
+                faces,
+                protected_edges=hard_edges_array,
+                minimum_faces=partial_cylinder_minimum_faces,
+                radius_tolerance=partial_cylinder_radius_tolerance,
+                normal_tolerance=partial_cylinder_normal_tolerance,
+                minimum_angle_degrees=partial_cylinder_minimum_angle,
+                target_edge_ratio=cylinder_target_edge_ratio,
+            )
+        )
+        print(
+            "Partial cylindrical wall retriangulation: {} / {} candidate "
+            "patch(es), {} new vertices, {} old -> {} new faces; mean "
+            "quality {:.6g} -> {:.6g}.".format(
+                partial_stats["patches"], partial_stats["candidates"],
+                partial_stats["new_vertices"], partial_stats["removed_faces"],
+                partial_stats["new_faces"], partial_stats["old_quality"],
+                partial_stats["new_quality"],
+            ),
+            flush=True,
+        )
+
+    if rounded_fillet_minimum_faces is not None:
+        vertices, faces, fillet_stats = retriangulate_partial_cylindrical_walls(
+            vertices,
+            faces,
+            protected_edges=hard_edges_array,
+            minimum_faces=rounded_fillet_minimum_faces,
+            radius_tolerance=max(partial_cylinder_radius_tolerance, 1e-2),
+            normal_tolerance=max(partial_cylinder_normal_tolerance, 8e-2),
+            minimum_angle_degrees=5.0,
+            target_edge_ratio=cylinder_target_edge_ratio,
+            isolate_rounded_faces=True,
+            minimum_curvature_degrees=rounded_fillet_minimum_curvature,
+        )
+        print(
+            "Rounded fillet retriangulation: {} / {} candidate band(s), "
+            "{} new vertices, {} old -> {} new faces; mean quality "
+            "{:.6g} -> {:.6g}.".format(
+                fillet_stats["patches"], fillet_stats["candidates"],
+                fillet_stats["new_vertices"], fillet_stats["removed_faces"],
+                fillet_stats["new_faces"], fillet_stats["old_quality"],
+                fillet_stats["new_quality"],
+            ),
+            flush=True,
+        )
+
+    if planar_region_minimum_faces is not None:
+        planar_edge_target = float(np.linalg.norm(np.ptp(vertices, axis=0))) * 0.05
+        vertices, faces, planar_stats = retriangulate_planar_annuli(
+            vertices,
+            faces,
+            protected_edges=hard_edges_array,
+            minimum_faces=planar_region_minimum_faces,
+            minimum_holes=0,
+            maximum_holes=0,
+            maximum_target_edge_length=planar_edge_target,
+        )
+        print(
+            "Solid planar region retriangulation: {} region(s), {} new "
+            "vertices, {} old -> {} new faces; mean quality {:.6g} -> "
+            "{:.6g}.".format(
+                planar_stats["regions"], planar_stats["new_vertices"],
+                planar_stats["removed_faces"], planar_stats["new_faces"],
+                planar_stats["old_quality"], planar_stats["new_quality"],
+            ),
+            flush=True,
+        )
+
     edge_faces = _build_edge_faces(faces)
     initial_lengths = np.asarray(
         [
@@ -867,7 +1820,7 @@ def refine_original_mesh_by_longest_edge(
             edge_length_p95,
         ) = automatic_edge_length_limit(vertices, initial_lengths)
         print(
-            "Automatic maximum edge length: bounding-box diagonal 10% "
+            "Automatic maximum edge length: bounding-box diagonal 5% "
             "= {:.6g} (input edge P95 {:.6g}).".format(
                 max_edge_length,
                 edge_length_p95,
@@ -935,6 +1888,7 @@ def refine_original_mesh_by_longest_edge(
                 sorted(coplanar_edges), dtype=np.int64
             ).reshape(-1, 2),
             minimum_candidate_valence=flip_minimum_valence,
+            maximum_candidate_quality=flip_maximum_candidate_quality,
         )
         return optimized_vertices, optimized_faces, {
             "hard_edges": len(hard_edges),
@@ -1112,6 +2066,7 @@ def refine_original_mesh_by_longest_edge(
             sorted(coplanar_edges), dtype=np.int64
         ).reshape(-1, 2),
         minimum_candidate_valence=flip_minimum_valence,
+        maximum_candidate_quality=flip_maximum_candidate_quality,
     )
     edge_faces = _build_edge_faces(refined_faces)
 

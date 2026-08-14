@@ -519,6 +519,15 @@ def main():
         ),
     )
     parser.add_argument(
+        '--constraint-flip-maximum-candidate-quality',
+        type=float,
+        default=None,
+        help=(
+            "Also consider edges adjacent to triangles below this normalized "
+            "quality; useful after strict longest-edge splitting"
+        ),
+    )
+    parser.add_argument(
         '--constraint-planar-fan-minimum-valence',
         type=int,
         default=None,
@@ -535,6 +544,66 @@ def main():
             "Uniformly retriangulate planar facets with holes when they "
             "contain at least this many faces"
         ),
+    )
+    parser.add_argument(
+        '--constraint-cylinder-minimum-faces',
+        type=int,
+        default=None,
+        help="Remesh detected cylindrical walls at or above this face count",
+    )
+    parser.add_argument(
+        '--constraint-cylinder-radius-tolerance',
+        type=float,
+        default=1e-3,
+        help="Relative circle/cylinder fitting tolerance (default: 0.001)",
+    )
+    parser.add_argument(
+        '--constraint-cylinder-target-edge-ratio',
+        type=float,
+        default=1.0,
+        help="Cylinder target edge length divided by boundary median (default: 1)",
+    )
+    parser.add_argument(
+        '--constraint-partial-cylinder-minimum-faces',
+        type=int,
+        default=None,
+        help="Remesh open/trimmed cylinder patches at or above this face count",
+    )
+    parser.add_argument(
+        '--constraint-partial-cylinder-radius-tolerance',
+        type=float,
+        default=2e-3,
+        help="Relative radius-fit tolerance for partial cylinders",
+    )
+    parser.add_argument(
+        '--constraint-partial-cylinder-normal-tolerance',
+        type=float,
+        default=2e-2,
+        help="Maximum RMS face-normal component along the fitted cylinder axis",
+    )
+    parser.add_argument(
+        '--constraint-partial-cylinder-minimum-angle',
+        type=float,
+        default=30.0,
+        help="Minimum angular coverage in degrees for partial-cylinder cleanup",
+    )
+    parser.add_argument(
+        '--constraint-rounded-fillet-minimum-faces',
+        type=int,
+        default=None,
+        help="Isolate and remesh smooth cylindrical fillet bands",
+    )
+    parser.add_argument(
+        '--constraint-rounded-fillet-minimum-curvature',
+        type=float,
+        default=0.2,
+        help="Minimum nonzero dihedral in degrees used to isolate fillets",
+    )
+    parser.add_argument(
+        '--constraint-planar-region-minimum-faces',
+        type=int,
+        default=None,
+        help="Uniformly retriangulate solid planar regions of at least this size",
     )
     parser.add_argument(
         '--constraint-quality-iterations',
@@ -724,6 +793,13 @@ def main():
     ):
         parser.error("--constraint-flip-minimum-valence must be at least 4")
     if (
+        args.constraint_flip_maximum_candidate_quality is not None
+        and not 0.0 < args.constraint_flip_maximum_candidate_quality <= 1.0
+    ):
+        parser.error(
+            "--constraint-flip-maximum-candidate-quality must be in (0, 1]"
+        )
+    if (
         args.constraint_planar_fan_minimum_valence is not None
         and args.constraint_planar_fan_minimum_valence < 6
     ):
@@ -736,6 +812,52 @@ def main():
     ):
         parser.error(
             "--constraint-planar-annulus-minimum-faces must be at least 4"
+        )
+    if (
+        args.constraint_cylinder_minimum_faces is not None
+        and args.constraint_cylinder_minimum_faces < 4
+    ):
+        parser.error("--constraint-cylinder-minimum-faces must be at least 4")
+    if args.constraint_cylinder_radius_tolerance <= 0.0:
+        parser.error("--constraint-cylinder-radius-tolerance must be positive")
+    if args.constraint_cylinder_target_edge_ratio <= 0.0:
+        parser.error("--constraint-cylinder-target-edge-ratio must be positive")
+    if (
+        args.constraint_partial_cylinder_minimum_faces is not None
+        and args.constraint_partial_cylinder_minimum_faces < 4
+    ):
+        parser.error(
+            "--constraint-partial-cylinder-minimum-faces must be at least 4"
+        )
+    if args.constraint_partial_cylinder_radius_tolerance <= 0.0:
+        parser.error(
+            "--constraint-partial-cylinder-radius-tolerance must be positive"
+        )
+    if args.constraint_partial_cylinder_normal_tolerance <= 0.0:
+        parser.error(
+            "--constraint-partial-cylinder-normal-tolerance must be positive"
+        )
+    if not 0.0 < args.constraint_partial_cylinder_minimum_angle < 360.0:
+        parser.error(
+            "--constraint-partial-cylinder-minimum-angle must be in (0, 360)"
+        )
+    if (
+        args.constraint_rounded_fillet_minimum_faces is not None
+        and args.constraint_rounded_fillet_minimum_faces < 4
+    ):
+        parser.error(
+            "--constraint-rounded-fillet-minimum-faces must be at least 4"
+        )
+    if args.constraint_rounded_fillet_minimum_curvature <= 0.0:
+        parser.error(
+            "--constraint-rounded-fillet-minimum-curvature must be positive"
+        )
+    if (
+        args.constraint_planar_region_minimum_faces is not None
+        and args.constraint_planar_region_minimum_faces < 4
+    ):
+        parser.error(
+            "--constraint-planar-region-minimum-faces must be at least 4"
         )
     if args.constraint_quality_iterations < 0:
         parser.error("--constraint-quality-iterations must be non-negative")
@@ -883,11 +1005,42 @@ def main():
             coplanar_flip_minimum_valence=(
                 args.constraint_flip_minimum_valence
             ),
+            coplanar_flip_maximum_candidate_quality=(
+                args.constraint_flip_maximum_candidate_quality
+            ),
             planar_fan_minimum_valence=(
                 args.constraint_planar_fan_minimum_valence
             ),
             planar_annulus_minimum_faces=(
                 args.constraint_planar_annulus_minimum_faces
+            ),
+            cylinder_minimum_faces=args.constraint_cylinder_minimum_faces,
+            cylinder_radius_tolerance=(
+                args.constraint_cylinder_radius_tolerance
+            ),
+            cylinder_target_edge_ratio=(
+                args.constraint_cylinder_target_edge_ratio
+            ),
+            partial_cylinder_minimum_faces=(
+                args.constraint_partial_cylinder_minimum_faces
+            ),
+            partial_cylinder_radius_tolerance=(
+                args.constraint_partial_cylinder_radius_tolerance
+            ),
+            partial_cylinder_normal_tolerance=(
+                args.constraint_partial_cylinder_normal_tolerance
+            ),
+            partial_cylinder_minimum_angle=(
+                args.constraint_partial_cylinder_minimum_angle
+            ),
+            rounded_fillet_minimum_faces=(
+                args.constraint_rounded_fillet_minimum_faces
+            ),
+            rounded_fillet_minimum_curvature=(
+                args.constraint_rounded_fillet_minimum_curvature
+            ),
+            planar_region_minimum_faces=(
+                args.constraint_planar_region_minimum_faces
             ),
             quality_iterations=args.constraint_quality_iterations,
             quality_step=args.constraint_quality_step,

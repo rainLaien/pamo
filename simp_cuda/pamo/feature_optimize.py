@@ -661,6 +661,7 @@ def _flip_quality_edges(
     maximum_edge_length=None,
     preferred_edges=None,
     minimum_candidate_valence=None,
+    maximum_candidate_quality=None,
 ):
     """Greedily flip non-feature manifold edges when local quality improves."""
     faces = np.asarray(faces, dtype=np.int64).copy()
@@ -702,6 +703,10 @@ def _flip_quality_edges(
         minimum_candidate_valence = int(minimum_candidate_valence)
         if minimum_candidate_valence < 4:
             raise ValueError("Minimum candidate valence must be at least 4.")
+    if maximum_candidate_quality is not None:
+        maximum_candidate_quality = float(maximum_candidate_quality)
+        if not 0.0 < maximum_candidate_quality <= 1.0:
+            raise ValueError("Maximum candidate quality must be in (0, 1].")
 
     report_progress = len(faces) >= 100000
     for pass_index in range(passes):
@@ -712,22 +717,30 @@ def _flip_quality_edges(
                 flush=True,
             )
         edge_faces = _build_edge_faces(faces)
-        if minimum_candidate_valence is None:
+        if (
+            minimum_candidate_valence is None
+            and maximum_candidate_quality is None
+        ):
             candidate_edges = sorted(edge_faces)
         else:
             vertex_valence = np.bincount(
                 faces.reshape(-1), minlength=len(vertices)
             )
-            candidate_edges = [
-                edge
-                for edge in edge_faces
-                if (
-                    vertex_valence[edge[0]]
-                    >= minimum_candidate_valence
-                    or vertex_valence[edge[1]]
-                    >= minimum_candidate_valence
+            candidate_edge_set = set()
+            if minimum_candidate_valence is not None:
+                candidate_edge_set.update(
+                    edge
+                    for edge in edge_faces
+                    if (
+                        vertex_valence[edge[0]] >= minimum_candidate_valence
+                        or vertex_valence[edge[1]] >= minimum_candidate_valence
+                    )
                 )
-            ]
+            if maximum_candidate_quality is not None:
+                face_qualities = _triangle_quality_values(vertices, faces)
+                for face in faces[face_qualities < maximum_candidate_quality]:
+                    candidate_edge_set.update(_face_edges(face))
+            candidate_edges = list(candidate_edge_set)
             candidate_edges.sort(
                 key=lambda edge: (
                     -max(vertex_valence[edge[0]], vertex_valence[edge[1]]),
@@ -736,11 +749,12 @@ def _flip_quality_edges(
             )
             if report_progress:
                 print(
-                    "  fan cleanup: {} / {} edges touch vertices with "
-                    "valence >= {}.".format(
+                    "  targeted cleanup: {} / {} candidate edges "
+                    "(minimum valence {}, maximum face quality {}).".format(
                         len(candidate_edges),
                         len(edge_faces),
                         minimum_candidate_valence,
+                        maximum_candidate_quality,
                     ),
                     flush=True,
                 )

@@ -88,12 +88,23 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--surface-coplanar-angle`**: Treat adjacent source faces within this normal angle as one coplanar patch for source-edge refinement. Internal coplanar edges are no longer subdivided as hard source boundaries; the default is `1` degree.
 - **`--original-constrained-remesh`**: Preserve sharp, boundary, and non-manifold input edges as hard constraint chains. After conforming longest-edge refinement, quality-improving flips remove non-feature seams inside coplanar patches.
 - **`--constraint-feature-angle`**: Mark every original manifold edge whose adjacent-face dihedral is strictly greater than this angle as a hard feature, default=5 degrees.
-- **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. When omitted, the limit is `10% of the bounding-box diagonal`. This predictable scale-based default avoids excessive refinement on large, already dense meshes.
+- **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. When omitted, the limit is `5% of the bounding-box diagonal`. This tighter scale-based default improves edge-length consistency on ordinary planar regions.
 - **`--constraint-max-splits`**: Optional safety limit for longest-edge bisection. When omitted, the edge-only binary-bisection estimate receives a 4x conformity margin with a minimum budget of 100000.
 - **`--constraint-flip-passes`**: Number of quality-driven coplanar non-feature edge-flip passes after refinement, default=8. Hard feature chains are never flipped.
 - **`--constraint-flip-minimum-valence`**: Restrict coplanar flips to edges touching unusually high-valence vertices. A value such as `12` efficiently removes planar center-fan triangulations without scanning every edge for expensive quality tests.
+- **`--constraint-flip-maximum-candidate-quality`**: Also inspect edges adjacent to triangles below this normalized quality. A value such as `0.1` repairs skinny coplanar triangles introduced by strict longest-edge splitting while retaining the edge-length limit.
 - **`--constraint-planar-fan-minimum-valence`**: Replace a convex planar center fan at or above this valence with a uniform local Delaunay triangulation while retaining its boundary edges. A value such as `30` handles dense circle-center fans directly.
 - **`--constraint-planar-annulus-minimum-faces`**: Uniformly retriangulate planar facets containing holes while retaining every outer and inner boundary edge. A value such as `20` replaces direct inner-to-outer circle bridges with a graded interior triangulation.
+- **`--constraint-cylinder-minimum-faces`**: Detect cylindrical wall components with two circular hard boundaries, unwrap them, add axial transition rows, and retriangulate them in the cylinder parameter domain.
+- **`--constraint-cylinder-radius-tolerance`**: Relative tolerance used for circular-boundary and constant-radius validation, default=`0.001`. Cones, fillets, and irregular curved surfaces are skipped.
+- **`--constraint-cylinder-target-edge-ratio`**: Target cylinder-wall edge length divided by the median boundary edge length, default=`1.0`.
+- **`--constraint-partial-cylinder-minimum-faces`**: Remesh open, half, or irregularly trimmed cylindrical patches with one constrained boundary loop.
+- **`--constraint-partial-cylinder-radius-tolerance`**: Relative radial-fit tolerance for partial cylinders, default=`0.002`.
+- **`--constraint-partial-cylinder-normal-tolerance`**: RMS face-normal component allowed along the fitted cylinder axis, default=`0.02`.
+- **`--constraint-partial-cylinder-minimum-angle`**: Minimum angular coverage accepted as a partial cylinder, default=`30` degrees.
+- **`--constraint-rounded-fillet-minimum-faces`**: Isolate tangent cylindrical fillet bands by smooth nonzero curvature and remesh them without requiring hard feature boundaries.
+- **`--constraint-rounded-fillet-minimum-curvature`**: Minimum face-adjacency angle used to separate a fillet from tangent planes, default=`0.2` degrees.
+- **`--constraint-planar-region-minimum-faces`**: Replace sufficiently large solid planar facets with a uniform constrained triangulation, preserving their complete outer boundary instead of repeatedly splitting the old skinny topology.
 - **`--constraint-quality-iterations`**: Number of feature-safe tangential relocation iterations after constrained refinement, default=20.
 - **`--constraint-quality-step`**: Tangential relocation step for constrained quality optimization, default=0.4.
 - **`--constraint-quality-flip-passes`**: Number of feature-safe global quality edge-flip passes, default=12. The maximum edge-length bound remains enforced.

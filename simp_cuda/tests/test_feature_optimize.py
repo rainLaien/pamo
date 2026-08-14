@@ -49,6 +49,191 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
+    def test_solid_planar_fan_uses_uniform_constrained_mesh(self):
+        count = 40
+        angles = np.arange(count) * (2.0 * np.pi / count)
+        vertices = np.vstack(
+            (
+                [0.0, 0.0, 0.0],
+                np.column_stack(
+                    (10 * np.cos(angles), 10 * np.sin(angles), np.zeros(count))
+                ),
+            )
+        )
+        faces = np.asarray(
+            [[0, index + 1, (index + 1) % count + 1] for index in range(count)],
+            dtype=np.int64,
+        )
+        boundary = np.asarray(
+            [[index + 1, (index + 1) % count + 1] for index in range(count)],
+            dtype=np.int64,
+        )
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_planar_annuli(
+                vertices,
+                faces,
+                protected_edges=boundary,
+                minimum_faces=20,
+                minimum_holes=0,
+                maximum_holes=0,
+                maximum_target_edge_length=5.0,
+            )
+        )
+        qualities = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+
+        self.assertEqual(stats["regions"], 1)
+        self.assertGreater(float(qualities.mean()), 0.9)
+        self.assertGreater(float(np.percentile(qualities, 5.0)), 0.7)
+
+    def test_half_cylinder_with_irregular_boundary_is_retriangulated(self):
+        count = 31
+        angles = np.linspace(-0.5 * np.pi, 0.5 * np.pi, count)
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (10 * np.cos(angles), 10 * np.sin(angles), np.zeros(count))
+                ),
+                np.column_stack(
+                    (10 * np.cos(angles), 10 * np.sin(angles), np.full(count, 10.0))
+                ),
+            )
+        )
+        faces = []
+        for index in range(count - 1):
+            faces.extend(
+                (
+                    [index, index + 1, count + index],
+                    [index + 1, count + index + 1, count + index],
+                )
+            )
+        faces = np.asarray(faces, dtype=np.int64)
+        boundary = np.asarray(
+            [[index, index + 1] for index in range(count - 1)]
+            + [[count + index, count + index + 1] for index in range(count - 1)]
+            + [[0, count], [count - 1, 2 * count - 1]],
+            dtype=np.int64,
+        )
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_partial_cylindrical_walls(
+                vertices, faces, boundary, minimum_faces=20
+            )
+        )
+        qualities = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+        result_edges = {
+            tuple(sorted((int(first), int(second))))
+            for face in result_faces
+            for first, second in (
+                (face[0], face[1]), (face[1], face[2]), (face[2], face[0])
+            )
+        }
+
+        self.assertEqual(stats["patches"], 1)
+        self.assertGreater(float(np.percentile(qualities, 5.0)), 0.8)
+        self.assertTrue(
+            all(tuple(sorted(map(int, edge))) in result_edges for edge in boundary)
+        )
+
+    def test_mismatched_cylinder_rings_get_axial_transition_rows(self):
+        lower_count = 60
+        upper_count = 20
+        lower_angles = np.arange(lower_count) * (2.0 * np.pi / lower_count)
+        upper_angles = np.arange(upper_count) * (2.0 * np.pi / upper_count)
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (10 * np.cos(lower_angles), 10 * np.sin(lower_angles),
+                     np.zeros(lower_count))
+                ),
+                np.column_stack(
+                    (10 * np.cos(upper_angles), 10 * np.sin(upper_angles),
+                     np.full(upper_count, 8.0))
+                ),
+            )
+        )
+        faces = []
+        lower_index = 0
+        upper_index = 0
+        while lower_index < lower_count or upper_index < upper_count:
+            next_lower = (
+                (lower_index + 1) / lower_count
+                if lower_index < lower_count else 2.0
+            )
+            next_upper = (
+                (upper_index + 1) / upper_count
+                if upper_index < upper_count else 2.0
+            )
+            if next_lower <= next_upper:
+                faces.append(
+                    [lower_index % lower_count,
+                     (lower_index + 1) % lower_count,
+                     lower_count + upper_index % upper_count]
+                )
+                lower_index += 1
+            else:
+                faces.append(
+                    [lower_index % lower_count,
+                     lower_count + (upper_index + 1) % upper_count,
+                     lower_count + upper_index % upper_count]
+                )
+                upper_index += 1
+        faces = np.asarray(faces, dtype=np.int64)
+        boundaries = np.asarray(
+            [[index, (index + 1) % lower_count] for index in range(lower_count)]
+            + [
+                [lower_count + index,
+                 lower_count + (index + 1) % upper_count]
+                for index in range(upper_count)
+            ],
+            dtype=np.int64,
+        )
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_cylindrical_walls(
+                vertices,
+                faces,
+                boundaries,
+                minimum_faces=20,
+            )
+        )
+        qualities = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+        result_edges = {
+            tuple(sorted((int(first), int(second))))
+            for face in result_faces
+            for first, second in (
+                (face[0], face[1]), (face[1], face[2]), (face[2], face[0])
+            )
+        }
+        edge_array = np.sort(
+            result_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2),
+            axis=1,
+        )
+        unique_edges, edge_counts = np.unique(
+            edge_array, axis=0, return_counts=True
+        )
+        boundary_set = {
+            tuple(sorted(map(int, edge))) for edge in boundaries
+        }
+
+        self.assertEqual(stats["walls"], 1)
+        self.assertGreater(float(np.percentile(qualities, 5.0)), 0.5)
+        self.assertTrue(
+            all(tuple(sorted(map(int, edge))) in result_edges for edge in boundaries)
+        )
+        self.assertTrue(
+            all(
+                int(count) == (1 if tuple(map(int, edge)) in boundary_set else 2)
+                for edge, count in zip(unique_edges, edge_counts)
+            )
+        )
+
     def test_planar_annulus_bridges_are_retriangulated_uniformly(self):
         count = 80
         angles = np.arange(count) * (2.0 * np.pi / count)
@@ -187,7 +372,7 @@ class FeatureOptimizeTest(unittest.TestCase):
             all(tuple(sorted(map(int, edge))) in result_edges for edge in boundary)
         )
 
-    def test_automatic_edge_limit_uses_ten_percent_diagonal(self):
+    def test_automatic_edge_limit_uses_five_percent_diagonal(self):
         vertices = np.array(
             [[0.0, 0.0, 0.0], [1000.0, 0.0, 0.0]]
         )
@@ -202,7 +387,7 @@ class FeatureOptimizeTest(unittest.TestCase):
 
         self.assertEqual(diagonal, 1000.0)
         self.assertAlmostEqual(percentile_95, 2.9)
-        self.assertAlmostEqual(limit, 100.0)
+        self.assertAlmostEqual(limit, 50.0)
 
     def test_automatic_split_limit_has_conformity_margin(self):
         budget, estimate = original_constrained.automatic_split_limit(
