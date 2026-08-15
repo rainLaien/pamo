@@ -564,6 +564,24 @@ def main():
         help="Cylinder target edge length divided by boundary median (default: 1)",
     )
     parser.add_argument(
+        '--constraint-trimmed-cylinder-minimum-faces',
+        type=int,
+        default=None,
+        help="Remesh cylinders with two irregular Boolean-trimmed boundary loops",
+    )
+    parser.add_argument(
+        '--constraint-trimmed-cylinder-radius-tolerance',
+        type=float,
+        default=1e-2,
+        help="Relative radial-fit tolerance for Boolean-trimmed cylinders",
+    )
+    parser.add_argument(
+        '--constraint-trimmed-cylinder-normal-tolerance',
+        type=float,
+        default=8e-2,
+        help="Maximum axial face-normal RMS for Boolean-trimmed cylinders",
+    )
+    parser.add_argument(
         '--constraint-partial-cylinder-minimum-faces',
         type=int,
         default=None,
@@ -598,6 +616,18 @@ def main():
         type=float,
         default=0.2,
         help="Minimum nonzero dihedral in degrees used to isolate fillets",
+    )
+    parser.add_argument(
+        '--constraint-rounded-fillet-maximum-source-quality',
+        type=float,
+        default=0.15,
+        help="Exclude better-shaped planar bridge faces from fillet bands",
+    )
+    parser.add_argument(
+        '--constraint-rounded-fillet-target-edge-ratio',
+        type=float,
+        default=4.0,
+        help="Fillet target edge length divided by boundary median",
     )
     parser.add_argument(
         '--constraint-planar-region-minimum-faces',
@@ -823,6 +853,21 @@ def main():
     if args.constraint_cylinder_target_edge_ratio <= 0.0:
         parser.error("--constraint-cylinder-target-edge-ratio must be positive")
     if (
+        args.constraint_trimmed_cylinder_minimum_faces is not None
+        and args.constraint_trimmed_cylinder_minimum_faces < 4
+    ):
+        parser.error(
+            "--constraint-trimmed-cylinder-minimum-faces must be at least 4"
+        )
+    if args.constraint_trimmed_cylinder_radius_tolerance <= 0.0:
+        parser.error(
+            "--constraint-trimmed-cylinder-radius-tolerance must be positive"
+        )
+    if args.constraint_trimmed_cylinder_normal_tolerance <= 0.0:
+        parser.error(
+            "--constraint-trimmed-cylinder-normal-tolerance must be positive"
+        )
+    if (
         args.constraint_partial_cylinder_minimum_faces is not None
         and args.constraint_partial_cylinder_minimum_faces < 4
     ):
@@ -851,6 +896,14 @@ def main():
     if args.constraint_rounded_fillet_minimum_curvature <= 0.0:
         parser.error(
             "--constraint-rounded-fillet-minimum-curvature must be positive"
+        )
+    if not 0.0 < args.constraint_rounded_fillet_maximum_source_quality <= 1.0:
+        parser.error(
+            "--constraint-rounded-fillet-maximum-source-quality must be in (0, 1]"
+        )
+    if args.constraint_rounded_fillet_target_edge_ratio <= 0.0:
+        parser.error(
+            "--constraint-rounded-fillet-target-edge-ratio must be positive"
         )
     if (
         args.constraint_planar_region_minimum_faces is not None
@@ -1021,6 +1074,15 @@ def main():
             cylinder_target_edge_ratio=(
                 args.constraint_cylinder_target_edge_ratio
             ),
+            trimmed_cylinder_minimum_faces=(
+                args.constraint_trimmed_cylinder_minimum_faces
+            ),
+            trimmed_cylinder_radius_tolerance=(
+                args.constraint_trimmed_cylinder_radius_tolerance
+            ),
+            trimmed_cylinder_normal_tolerance=(
+                args.constraint_trimmed_cylinder_normal_tolerance
+            ),
             partial_cylinder_minimum_faces=(
                 args.constraint_partial_cylinder_minimum_faces
             ),
@@ -1038,6 +1100,12 @@ def main():
             ),
             rounded_fillet_minimum_curvature=(
                 args.constraint_rounded_fillet_minimum_curvature
+            ),
+            rounded_fillet_maximum_source_quality=(
+                args.constraint_rounded_fillet_maximum_source_quality
+            ),
+            rounded_fillet_target_edge_ratio=(
+                args.constraint_rounded_fillet_target_edge_ratio
             ),
             planar_region_minimum_faces=(
                 args.constraint_planar_region_minimum_faces

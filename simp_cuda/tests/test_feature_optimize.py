@@ -49,6 +49,73 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
+    def test_two_fillet_bands_are_not_joined_through_a_planar_bridge(self):
+        count = 33
+        radius = 5.0
+        length = 10.0
+        left_angles = np.linspace(0.0, 0.5 * np.pi, count)
+        right_angles = np.linspace(0.5 * np.pi, np.pi, count)
+
+        def band(center_x, angles):
+            return np.asarray(
+                [
+                    [
+                        center_x + radius * np.cos(angle),
+                        axial,
+                        radius * np.sin(angle),
+                    ]
+                    for axial in (0.0, length)
+                    for angle in angles
+                ]
+            )
+
+        vertices = np.vstack((band(0.0, left_angles), band(20.0, right_angles)))
+        faces = []
+        for base in (0, 2 * count):
+            for index in range(count - 1):
+                faces.extend(
+                    (
+                        [base + index, base + index + 1, base + count + index],
+                        [
+                            base + index + 1,
+                            base + count + index + 1,
+                            base + count + index,
+                        ],
+                    )
+                )
+        # A two-triangle tangent plane joins the two different-radius-center bands.
+        faces.extend(
+            (
+                [count - 1, 2 * count, 2 * count - 1],
+                [2 * count, 3 * count, 2 * count - 1],
+            )
+        )
+        faces = np.asarray(faces, dtype=np.int64)
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_partial_cylindrical_walls(
+                vertices,
+                faces,
+                np.empty((0, 2), dtype=np.int64),
+                minimum_faces=12,
+                radius_tolerance=0.01,
+                normal_tolerance=0.08,
+                minimum_angle_degrees=5.0,
+                target_edge_ratio=4.0,
+                isolate_rounded_faces=True,
+                minimum_curvature_degrees=0.2,
+                maximum_source_quality=0.15,
+            )
+        )
+        qualities = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+
+        self.assertEqual(stats["candidates"], 2)
+        self.assertEqual(stats["patches"], 2)
+        self.assertGreater(stats["new_quality"], 0.7)
+        self.assertGreater(float(qualities.mean()), 0.5)
+
     def test_solid_planar_fan_uses_uniform_constrained_mesh(self):
         count = 40
         angles = np.arange(count) * (2.0 * np.pi / count)
@@ -232,6 +299,69 @@ class FeatureOptimizeTest(unittest.TestCase):
                 int(count) == (1 if tuple(map(int, edge)) in boundary_set else 2)
                 for edge, count in zip(unique_edges, edge_counts)
             )
+        )
+
+    def test_boolean_trimmed_cylinder_keeps_irregular_join_loops(self):
+        count = 60
+        angles = np.arange(count) * (2.0 * np.pi / count)
+        lower_z = 0.8 * np.sin(2.0 * angles)
+        upper_z = 8.0 + 0.7 * np.cos(3.0 * angles)
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (10.0 * np.cos(angles), 10.0 * np.sin(angles), lower_z)
+                ),
+                np.column_stack(
+                    (10.0 * np.cos(angles), 10.0 * np.sin(angles), upper_z)
+                ),
+            )
+        )
+        faces = []
+        for index in range(count):
+            following = (index + 1) % count
+            faces.extend(
+                (
+                    [index, following, count + index],
+                    [following, count + following, count + index],
+                )
+            )
+        faces = np.asarray(faces, dtype=np.int64)
+        boundaries = np.asarray(
+            [[index, (index + 1) % count] for index in range(count)]
+            + [
+                [count + index, count + (index + 1) % count]
+                for index in range(count)
+            ],
+            dtype=np.int64,
+        )
+        old_quality = feature_optimize._triangle_quality_values(vertices, faces)
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_trimmed_cylindrical_walls(
+                vertices,
+                faces,
+                boundaries,
+                minimum_faces=20,
+                radius_tolerance=0.01,
+                normal_tolerance=0.08,
+            )
+        )
+        new_quality = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+        result_edges = {
+            tuple(sorted((int(first), int(second))))
+            for face in result_faces
+            for first, second in (
+                (face[0], face[1]), (face[1], face[2]), (face[2], face[0])
+            )
+        }
+
+        self.assertEqual(stats["walls"], 1)
+        self.assertGreater(float(new_quality.mean()), float(old_quality.mean()))
+        self.assertGreater(float(np.percentile(new_quality, 5.0)), 0.5)
+        self.assertTrue(
+            all(tuple(sorted(map(int, edge))) in result_edges for edge in boundaries)
         )
 
     def test_planar_annulus_bridges_are_retriangulated_uniformly(self):

@@ -323,12 +323,17 @@ class PaMO(nn.Module):
         cylinder_minimum_faces=None,
         cylinder_radius_tolerance=1e-3,
         cylinder_target_edge_ratio=1.0,
+        trimmed_cylinder_minimum_faces=None,
+        trimmed_cylinder_radius_tolerance=1e-2,
+        trimmed_cylinder_normal_tolerance=8e-2,
         partial_cylinder_minimum_faces=None,
         partial_cylinder_radius_tolerance=2e-3,
         partial_cylinder_normal_tolerance=2e-2,
         partial_cylinder_minimum_angle=30.0,
         rounded_fillet_minimum_faces=None,
         rounded_fillet_minimum_curvature=0.2,
+        rounded_fillet_maximum_source_quality=0.15,
+        rounded_fillet_target_edge_ratio=4.0,
         planar_region_minimum_faces=None,
         quality_iterations=20,
         quality_step=0.4,
@@ -347,19 +352,12 @@ class PaMO(nn.Module):
             refine_original_mesh_by_longest_edge,
         )
         from .feature_optimize import optimize_feature_constrained_mesh
-        from .sdf_field import resolve_sdf_mode
+        from .sdf_field import resolve_original_surface_mode
 
-        resolved_mode, mode_reason = resolve_sdf_mode(
+        resolved_mode, mode_reason = resolve_original_surface_mode(
             self.gt_mesh,
             sdf_mode,
         )
-        if resolved_mode != "exact":
-            raise ValueError(
-                "Strict original-constrained remeshing cannot use the SDF "
-                "repair envelope because its offset topology cannot retain "
-                "original edge identities. Supply a watertight, consistently "
-                "wound mesh and use sdf_mode='exact'."
-            )
 
         if (
             max_edge_length is not None
@@ -413,7 +411,7 @@ class PaMO(nn.Module):
             )
 
         print(
-            "Original-constrained SDF semantics : exact zero surface "
+            "Original-constrained surface semantics: exact original surface "
             "({}). Hard original feature lineages are retained while "
             "coplanar non-feature edges may be optimized.".format(
                 mode_reason
@@ -436,6 +434,13 @@ class PaMO(nn.Module):
             cylinder_minimum_faces=cylinder_minimum_faces,
             cylinder_radius_tolerance=cylinder_radius_tolerance,
             cylinder_target_edge_ratio=cylinder_target_edge_ratio,
+            trimmed_cylinder_minimum_faces=trimmed_cylinder_minimum_faces,
+            trimmed_cylinder_radius_tolerance=(
+                trimmed_cylinder_radius_tolerance
+            ),
+            trimmed_cylinder_normal_tolerance=(
+                trimmed_cylinder_normal_tolerance
+            ),
             partial_cylinder_minimum_faces=partial_cylinder_minimum_faces,
             partial_cylinder_radius_tolerance=(
                 partial_cylinder_radius_tolerance
@@ -448,6 +453,10 @@ class PaMO(nn.Module):
             rounded_fillet_minimum_curvature=(
                 rounded_fillet_minimum_curvature
             ),
+            rounded_fillet_maximum_source_quality=(
+                rounded_fillet_maximum_source_quality
+            ),
+            rounded_fillet_target_edge_ratio=rounded_fillet_target_edge_ratio,
             planar_region_minimum_faces=planar_region_minimum_faces,
         )
         quality_iterations = int(quality_iterations)

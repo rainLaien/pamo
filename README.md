@@ -98,12 +98,21 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--constraint-cylinder-minimum-faces`**: Detect cylindrical wall components with two circular hard boundaries, unwrap them, add axial transition rows, and retriangulate them in the cylinder parameter domain.
 - **`--constraint-cylinder-radius-tolerance`**: Relative tolerance used for circular-boundary and constant-radius validation, default=`0.001`. Cones, fillets, and irregular curved surfaces are skipped.
 - **`--constraint-cylinder-target-edge-ratio`**: Target cylinder-wall edge length divided by the median boundary edge length, default=`1.0`.
+- **`--constraint-trimmed-cylinder-minimum-faces`**: Remesh cylindrical walls whose two closed ends were irregularly cut by Boolean joins while preserving every join-boundary edge.
+- **`--constraint-trimmed-cylinder-radius-tolerance`**: Relative whole-patch radial-fit tolerance for irregularly trimmed cylinders, default=`0.01`.
+- **`--constraint-trimmed-cylinder-normal-tolerance`**: Maximum RMS face-normal component along the fitted axis for irregularly trimmed cylinders, default=`0.08`.
 - **`--constraint-partial-cylinder-minimum-faces`**: Remesh open, half, or irregularly trimmed cylindrical patches with one constrained boundary loop.
 - **`--constraint-partial-cylinder-radius-tolerance`**: Relative radial-fit tolerance for partial cylinders, default=`0.002`.
 - **`--constraint-partial-cylinder-normal-tolerance`**: RMS face-normal component allowed along the fitted cylinder axis, default=`0.02`.
 - **`--constraint-partial-cylinder-minimum-angle`**: Minimum angular coverage accepted as a partial cylinder, default=`30` degrees.
 - **`--constraint-rounded-fillet-minimum-faces`**: Isolate tangent cylindrical fillet bands by smooth nonzero curvature and remesh them without requiring hard feature boundaries.
 - **`--constraint-rounded-fillet-minimum-curvature`**: Minimum face-adjacency angle used to separate a fillet from tangent planes, default=`0.2` degrees.
+- **`--constraint-rounded-fillet-maximum-source-quality`**: Maximum source triangle quality admitted into a rounded band, default=`0.15`; this prevents large planar bridge faces from joining fillets with different centers.
+- **`--constraint-rounded-fillet-target-edge-ratio`**: Target fillet edge length divided by the median boundary edge, default=`4.0`; larger values avoid over-refining finely sampled CAD arcs.
+
+Curved cylinders and fillets are rebuilt first, shared hard boundaries are then
+subdivided to the strict edge-length limit, and planar regions are rebuilt last.
+This lets planar triangulation consume the refined curve/plane join edges.
 - **`--constraint-planar-region-minimum-faces`**: Replace sufficiently large solid planar facets with a uniform constrained triangulation, preserving their complete outer boundary instead of repeatedly splitting the old skinny topology.
 - **`--constraint-quality-iterations`**: Number of feature-safe tangential relocation iterations after constrained refinement, default=20.
 - **`--constraint-quality-step`**: Tangential relocation step for constrained quality optimization, default=0.4.
