@@ -312,8 +312,10 @@ class PaMO(nn.Module):
         feature_edge_output_angle=None,
         feature_edge_max_splits=None,
         sdf_mode="auto",
+        allow_open_surface=False,
         max_edge_length=None,
         feature_angle=5.0,
+        feature_target_edge_length=None,
         max_splits=None,
         coplanar_flip_passes=8,
         coplanar_flip_minimum_valence=None,
@@ -329,37 +331,39 @@ class PaMO(nn.Module):
         partial_cylinder_minimum_angle=30.0,
         rounded_fillet_minimum_faces=None,
         rounded_fillet_minimum_curvature=0.2,
+        extrusion_region_minimum_faces=None,
+        extrusion_maximum_input_quality=0.05,
         planar_region_minimum_faces=None,
+        planar_target_edge_length=None,
+        planar_minimum_angle_degrees=None,
+        planar_largest_opposed_pair_only=False,
         quality_iterations=20,
         quality_step=0.4,
         quality_flip_passes=12,
     ):
         """
-        Refine the exact zero surface with hard original-edge constraints.
+        Refine the original surface with hard original-edge constraints.
 
-        DMC connectivity cannot retain original edge identities. For exact
-        SDF=0 semantics this operation therefore uses the original triangle
-        connectivity as the constraint skeleton. Edges sharper than
-        ``feature_angle`` are never collapsed or flipped; longest-edge
-        bisection may only replace them with collinear child edges.
+        The operation uses the original triangle connectivity as its
+        constraint skeleton and does not evaluate an SDF. Closed meshes are
+        accepted by default. Consistently wound two-manifolds with boundary
+        are accepted only when ``allow_open_surface`` is true, in which case
+        boundary and non-manifold edges remain hard constraints. Edges
+        sharper than ``feature_angle`` are never collapsed or flipped;
+        ``feature_target_edge_length`` can refine only those hard chains while
+        smooth, high-quality regions retain the coarser global size.
         """
         from .original_constrained import (
             refine_original_mesh_by_longest_edge,
         )
         from .feature_optimize import optimize_feature_constrained_mesh
-        from .sdf_field import resolve_sdf_mode
+        from .sdf_field import resolve_original_constraint_mode
 
-        resolved_mode, mode_reason = resolve_sdf_mode(
+        resolved_mode, mode_reason = resolve_original_constraint_mode(
             self.gt_mesh,
             sdf_mode,
+            allow_open_surface=allow_open_surface,
         )
-        if resolved_mode != "exact":
-            raise ValueError(
-                "Strict original-constrained remeshing cannot use the SDF "
-                "repair envelope because its offset topology cannot retain "
-                "original edge identities. Supply a watertight, consistently "
-                "wound mesh and use sdf_mode='exact'."
-            )
 
         if (
             max_edge_length is not None
@@ -403,7 +407,6 @@ class PaMO(nn.Module):
         legacy_projection_requested = (
             projection_distance is not None
             or feature_snap_distance is not None
-            or not np.isclose(float(coplanar_distance_ratio), 1e-6)
         )
         if legacy_projection_requested:
             print(
@@ -413,10 +416,11 @@ class PaMO(nn.Module):
             )
 
         print(
-            "Original-constrained SDF semantics : exact zero surface "
-            "({}). Hard original feature lineages are retained while "
-            "coplanar non-feature edges may be optimized.".format(
-                mode_reason
+            "Original-constrained surface semantics: {} ({}). Hard original "
+            "feature and boundary lineages are retained while coplanar "
+            "non-feature edges may be reconstructed.".format(
+                resolved_mode,
+                mode_reason,
             )
         )
         start_constraints = time.time()
@@ -424,8 +428,10 @@ class PaMO(nn.Module):
             self.gt_mesh,
             max_edge_length=max_edge_length,
             feature_angle_degrees=feature_angle,
+            feature_target_edge_length=feature_target_edge_length,
             max_splits=max_splits,
             coplanar_angle_degrees=coplanar_angle_tolerance,
+            coplanar_distance_ratio=coplanar_distance_ratio,
             flip_passes=coplanar_flip_passes,
             flip_minimum_valence=coplanar_flip_minimum_valence,
             flip_maximum_candidate_quality=(
@@ -448,7 +454,14 @@ class PaMO(nn.Module):
             rounded_fillet_minimum_curvature=(
                 rounded_fillet_minimum_curvature
             ),
+            extrusion_region_minimum_faces=extrusion_region_minimum_faces,
+            extrusion_maximum_input_quality=extrusion_maximum_input_quality,
             planar_region_minimum_faces=planar_region_minimum_faces,
+            planar_target_edge_length=planar_target_edge_length,
+            planar_minimum_angle_degrees=planar_minimum_angle_degrees,
+            planar_largest_opposed_pair_only=(
+                planar_largest_opposed_pair_only
+            ),
         )
         quality_iterations = int(quality_iterations)
         quality_step = float(quality_step)

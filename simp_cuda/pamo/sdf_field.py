@@ -54,6 +54,74 @@ def resolve_sdf_mode(mesh, requested_mode):
     return mode, "explicitly requested"
 
 
+def resolve_original_constraint_mode(
+    mesh,
+    requested_mode,
+    allow_open_surface=False,
+):
+    """Resolve topology semantics for original-connectivity refinement.
+
+    Original-constrained refinement does not evaluate an SDF: it operates on
+    the input connectivity directly. A consistently wound open surface is
+    therefore supported when the caller explicitly opts in; boundary and
+    non-manifold edges remain hard constraints. Repair envelopes are never
+    compatible because they replace the input connectivity and feature
+    lineages.
+    """
+    mode = str(requested_mode).lower()
+    if mode not in SDF_MODES:
+        raise ValueError(
+            "Unknown SDF mode '{}'. Expected one of: {}.".format(
+                requested_mode,
+                ", ".join(SDF_MODES),
+            )
+        )
+    if mode == "repair":
+        raise ValueError(
+            "Original-constrained refinement cannot use an SDF repair "
+            "envelope because it must retain the input connectivity."
+        )
+
+    watertight = bool(mesh.is_watertight)
+    winding_consistent = bool(mesh.is_winding_consistent)
+    if watertight and winding_consistent:
+        return "exact", "watertight input with consistent face winding"
+
+    if not allow_open_surface:
+        problems = []
+        if not watertight:
+            problems.append("the input is not watertight")
+        if not winding_consistent:
+            problems.append("face winding is inconsistent")
+        raise ValueError(
+            "Strict original-constrained refinement requires a watertight, "
+            "consistently wound mesh; {}. For a thin sheet, enable "
+            "allow_open_surface so its boundary and non-manifold edges are "
+            "retained as hard constraints.".format(" and ".join(problems))
+        )
+
+    if not winding_consistent:
+        raise ValueError(
+            "Open-surface original-constrained refinement requires "
+            "consistent face winding."
+        )
+
+    edge_counts = np.bincount(
+        np.asarray(mesh.edges_unique_inverse, dtype=np.int64),
+        minlength=len(mesh.edges_unique),
+    )
+    boundary_count = int(np.count_nonzero(edge_counts == 1))
+    nonmanifold_count = int(np.count_nonzero(edge_counts > 2))
+    return (
+        "open",
+        "consistently wound surface with {} hard boundary edge(s) and {} "
+        "hard non-manifold edge(s)".format(
+            boundary_count,
+            nonmanifold_count,
+        ),
+    )
+
+
 def fast_winding_inside_mask(
     vertices,
     faces,

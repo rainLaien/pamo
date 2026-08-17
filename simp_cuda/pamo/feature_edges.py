@@ -52,9 +52,9 @@ def detect_reference_feature_edges(
             mesh.edges_unique_inverse,
             minlength=len(mesh.edges_unique),
         )
-        boundary_edges = mesh.edges_unique[edge_counts == 1]
-        if len(boundary_edges):
-            sharp_edges = np.vstack((sharp_edges, boundary_edges))
+        topology_edges = mesh.edges_unique[edge_counts != 2]
+        if len(topology_edges):
+            sharp_edges = np.vstack((sharp_edges, topology_edges))
 
     if len(sharp_edges) == 0:
         return np.empty((0, 2), dtype=np.int64)

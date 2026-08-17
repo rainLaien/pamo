@@ -93,6 +93,99 @@ def _polygon_signed_area(polygon):
     )
 
 
+def _triangulate_simple_polygon_with_points(points, boundary_count):
+    """Ear-clip a simple polygon, then insert strictly interior points."""
+    points = np.asarray(points, dtype=np.float64)
+    boundary_count = int(boundary_count)
+    if boundary_count < 3 or len(points) < boundary_count:
+        return None
+    scale = max(float(np.ptp(points[:boundary_count], axis=0).max()), 1.0)
+    tolerance = scale * scale * 1e-14
+
+    def orientation(first, second, third):
+        first = points[int(first)]
+        second = points[int(second)]
+        third = points[int(third)]
+        return float(
+            (second[0] - first[0]) * (third[1] - first[1])
+            - (second[1] - first[1]) * (third[0] - first[0])
+        )
+
+    polygon = list(range(boundary_count))
+    if _polygon_signed_area(points[:boundary_count]) < 0.0:
+        polygon.reverse()
+    triangles = []
+    maximum_iterations = boundary_count * boundary_count
+    iterations = 0
+    while len(polygon) > 3 and iterations < maximum_iterations:
+        ear_found = False
+        for index in range(len(polygon)):
+            previous = polygon[index - 1]
+            current = polygon[index]
+            following = polygon[(index + 1) % len(polygon)]
+            area = orientation(previous, current, following)
+            if area <= tolerance:
+                continue
+            first = points[previous]
+            second = points[current]
+            third = points[following]
+            other_indices = [
+                vertex
+                for vertex in polygon
+                if vertex not in (previous, current, following)
+            ]
+            contains_vertex = False
+            if other_indices:
+                others = points[other_indices]
+                first_side = np.cross(second - first, others - first)
+                second_side = np.cross(third - second, others - second)
+                third_side = np.cross(first - third, others - third)
+                contains_vertex = bool(
+                    np.any(
+                        (first_side >= -tolerance)
+                        & (second_side >= -tolerance)
+                        & (third_side >= -tolerance)
+                    )
+                )
+            if contains_vertex:
+                continue
+            triangles.append((previous, current, following))
+            del polygon[index]
+            ear_found = True
+            break
+        if not ear_found:
+            return None
+        iterations += 1
+    if len(polygon) != 3 or orientation(*polygon) <= tolerance:
+        return None
+    triangles.append(tuple(polygon))
+
+    for point_index in range(boundary_count, len(points)):
+        point = points[point_index]
+        containing_triangle = None
+        for triangle_index, triangle in enumerate(triangles):
+            first, second, third = map(int, triangle)
+            first_side = float(
+                np.cross(points[second] - points[first], point - points[first])
+            )
+            second_side = float(
+                np.cross(points[third] - points[second], point - points[second])
+            )
+            third_side = float(
+                np.cross(points[first] - points[third], point - points[third])
+            )
+            if min(first_side, second_side, third_side) > tolerance:
+                containing_triangle = triangle_index
+                break
+        if containing_triangle is None:
+            continue
+        first, second, third = triangles[containing_triangle]
+        triangles[containing_triangle] = (first, second, point_index)
+        triangles.append((second, third, point_index))
+        triangles.append((third, first, point_index))
+    return np.asarray(triangles, dtype=np.int64)
+
+
 def _recover_planar_constraint_edges(points, faces, required_edges):
     """Insert missing non-crossing PSLG edges by flipping intersecting edges."""
     points = np.asarray(points, dtype=np.float64)
@@ -182,6 +275,639 @@ def _recover_planar_constraint_edges(points, faces, required_edges):
     return faces, True
 
 
+def classify_planar_face_regions(
+    vertices,
+    faces,
+    protected_edges=None,
+    minimum_faces=20,
+    maximum_normal_angle_degrees=0.5,
+    maximum_plane_distance_ratio=1e-6,
+):
+    """Classify connected planar patches without chaining across curvature.
+
+    Each region grows against one fixed seed plane.  A sequence of slightly
+    rotated faces on a fillet or general curved surface therefore cannot drift
+    into a false planar patch.  Protected feature edges are never crossed.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    minimum_faces = int(minimum_faces)
+    maximum_normal_angle_degrees = float(maximum_normal_angle_degrees)
+    maximum_plane_distance_ratio = float(maximum_plane_distance_ratio)
+    if minimum_faces < 1:
+        raise ValueError("Planar classification minimum faces must be positive.")
+    if not 0.0 <= maximum_normal_angle_degrees < 90.0:
+        raise ValueError("Planar classification angle must be in [0, 90).")
+    if maximum_plane_distance_ratio < 0.0:
+        raise ValueError("Planar classification distance ratio must be non-negative.")
+    if len(faces) == 0:
+        return [], {
+            "regions": 0,
+            "planar_faces": 0,
+            "remaining_faces": 0,
+        }
+
+    triangles = vertices[faces]
+    crosses = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    double_areas = np.linalg.norm(crosses, axis=1)
+    valid_faces = double_areas > np.finfo(np.float64).eps
+    normals = np.zeros_like(crosses)
+    normals[valid_faces] = (
+        crosses[valid_faces] / double_areas[valid_faces, None]
+    )
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    adjacency_edges = np.sort(
+        np.asarray(mesh.face_adjacency_edges, dtype=np.int64),
+        axis=1,
+    )
+    protected = {
+        tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in np.asarray(
+            protected_edges
+            if protected_edges is not None
+            else np.empty((0, 2), dtype=np.int64),
+            dtype=np.int64,
+        ).reshape(-1, 2)
+    }
+    usable = np.asarray(
+        [tuple(map(int, edge)) not in protected for edge in adjacency_edges],
+        dtype=bool,
+    )
+    usable_adjacency = adjacency[usable]
+    graph = coo_matrix(
+        (
+            np.ones(len(usable_adjacency) * 2, dtype=np.uint8),
+            (
+                np.concatenate(
+                    (usable_adjacency[:, 0], usable_adjacency[:, 1])
+                ),
+                np.concatenate(
+                    (usable_adjacency[:, 1], usable_adjacency[:, 0])
+                ),
+            ),
+        ),
+        shape=(len(faces), len(faces)),
+    ).tocsr()
+
+    cosine_limit = np.cos(np.deg2rad(maximum_normal_angle_degrees))
+    diameter = max(
+        float(np.linalg.norm(np.ptp(vertices, axis=0))),
+        np.finfo(np.float64).eps,
+    )
+    distance_limit = max(
+        diameter * maximum_plane_distance_ratio,
+        diameter * 1e-12,
+    )
+    close_support = np.zeros(len(faces), dtype=np.int64)
+    if len(adjacency):
+        close = (
+            np.einsum(
+                "ij,ij->i",
+                normals[adjacency[:, 0]],
+                normals[adjacency[:, 1]],
+            )
+            >= cosine_limit
+        ) & usable
+        np.add.at(close_support, adjacency[close, 0], 1)
+        np.add.at(close_support, adjacency[close, 1], 1)
+
+    # Interior planar faces normally have the strongest coplanar support, so
+    # let them seed regions before transition and fillet faces.
+    seed_order = np.lexsort((-double_areas, -close_support))
+    assigned = ~valid_faces.copy()
+    regions = []
+    for seed in seed_order:
+        seed = int(seed)
+        if assigned[seed]:
+            continue
+        seed_normal = normals[seed]
+        seed_origin = triangles[seed, 0]
+        assigned[seed] = True
+        stack = [seed]
+        region = []
+        while stack:
+            face_index = stack.pop()
+            region.append(face_index)
+            start = graph.indptr[face_index]
+            end = graph.indptr[face_index + 1]
+            for neighbor in graph.indices[start:end]:
+                neighbor = int(neighbor)
+                if assigned[neighbor]:
+                    continue
+                if float(np.dot(normals[neighbor], seed_normal)) < cosine_limit:
+                    continue
+                distances = np.abs(
+                    (triangles[neighbor] - seed_origin) @ seed_normal
+                )
+                if float(distances.max()) > distance_limit:
+                    continue
+                assigned[neighbor] = True
+                stack.append(neighbor)
+        if len(region) >= minimum_faces:
+            regions.append(np.asarray(sorted(region), dtype=np.int64))
+
+    planar_face_count = int(sum(len(region) for region in regions))
+    return regions, {
+        "regions": len(regions),
+        "planar_faces": planar_face_count,
+        "remaining_faces": int(len(faces) - planar_face_count),
+        "normal_angle_degrees": maximum_normal_angle_degrees,
+        "distance_limit": distance_limit,
+    }
+
+
+def select_largest_opposed_planar_regions(
+    vertices,
+    faces,
+    planar_regions,
+    maximum_opposition_angle_degrees=5.0,
+):
+    """Select the largest planar patch and its largest opposite-facing mate.
+
+    This isolates the two primary skins of a plate without assuming that the
+    plate normal is aligned with a world axis.  Region area is measured from
+    its triangles and the second patch must have the opposite oriented normal
+    within ``maximum_opposition_angle_degrees``.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    maximum_opposition_angle_degrees = float(
+        maximum_opposition_angle_degrees
+    )
+    if not 0.0 <= maximum_opposition_angle_degrees < 90.0:
+        raise ValueError("Planar opposition angle must be in [0, 90).")
+    if len(planar_regions) < 2:
+        raise ValueError(
+            "Largest opposed planar-pair selection needs at least two regions."
+        )
+
+    triangles = vertices[faces]
+    crosses = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    face_areas = 0.5 * np.linalg.norm(crosses, axis=1)
+    region_areas = []
+    region_normals = []
+    normalized_regions = []
+    for region in planar_regions:
+        region = np.asarray(region, dtype=np.int64)
+        normalized_regions.append(region)
+        region_areas.append(float(face_areas[region].sum()))
+        normal = crosses[region].sum(axis=0)
+        normal_length = float(np.linalg.norm(normal))
+        if normal_length <= np.finfo(np.float64).eps:
+            region_normals.append(np.zeros(3, dtype=np.float64))
+        else:
+            region_normals.append(normal / normal_length)
+
+    region_areas = np.asarray(region_areas, dtype=np.float64)
+    region_normals = np.asarray(region_normals, dtype=np.float64)
+    primary_index = int(np.argmax(region_areas))
+    opposition_limit = -np.cos(
+        np.deg2rad(maximum_opposition_angle_degrees)
+    )
+    dot_products = region_normals @ region_normals[primary_index]
+    candidates = np.flatnonzero(dot_products <= opposition_limit)
+    candidates = candidates[candidates != primary_index]
+    if len(candidates) == 0:
+        raise ValueError(
+            "The largest planar region has no opposite-facing planar mate "
+            "within {:.6g} degrees.".format(
+                maximum_opposition_angle_degrees
+            )
+        )
+    opposite_index = int(candidates[np.argmax(region_areas[candidates])])
+    return (
+        [
+            normalized_regions[primary_index],
+            normalized_regions[opposite_index],
+        ],
+        {
+            "primary_index": primary_index,
+            "opposite_index": opposite_index,
+            "primary_faces": int(len(normalized_regions[primary_index])),
+            "opposite_faces": int(len(normalized_regions[opposite_index])),
+            "primary_area": float(region_areas[primary_index]),
+            "opposite_area": float(region_areas[opposite_index]),
+            "primary_normal": region_normals[primary_index].copy(),
+            "opposite_normal": region_normals[opposite_index].copy(),
+            "normal_dot": float(dot_products[opposite_index]),
+        },
+    )
+
+
+def classify_nonplanar_face_regions(
+    vertices,
+    faces,
+    planar_regions,
+    protected_edges=None,
+    minimum_faces=4,
+    axial_normal_tolerance=2e-2,
+    radius_tolerance=1e-2,
+    full_cylinder_coverage_degrees=300.0,
+    maximum_region_dihedral_degrees=60.0,
+):
+    """Separate non-planar faces into cylinders, fillets and extrusions.
+
+    Cylinder and extrusion normals share a common perpendicular axis.  A
+    least-squares circle fit then separates constant-radius regions from
+    general extruded/developable regions.  Constant-radius regions with broad
+    angular coverage are labelled cylinders; narrower regions are labelled
+    fillets.  Faces that do not satisfy the axial model remain general curved
+    faces for a later surface-parameterization stage.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    minimum_faces = int(minimum_faces)
+    if minimum_faces < 2:
+        raise ValueError("Non-planar classification minimum faces must be >= 2.")
+    if not 0.0 < float(axial_normal_tolerance) < 1.0:
+        raise ValueError("Axial normal tolerance must be in (0, 1).")
+    if float(radius_tolerance) <= 0.0:
+        raise ValueError("Radius tolerance must be positive.")
+    if not 0.0 < float(full_cylinder_coverage_degrees) <= 360.0:
+        raise ValueError("Full-cylinder coverage must be in (0, 360].")
+    if not 0.0 <= float(maximum_region_dihedral_degrees) < 180.0:
+        raise ValueError("Region dihedral limit must be in [0, 180).")
+
+    planar_mask = np.zeros(len(faces), dtype=bool)
+    for region in planar_regions:
+        planar_mask[np.asarray(region, dtype=np.int64)] = True
+    active_mask = ~planar_mask
+    if not np.any(active_mask):
+        return {
+            "cylinders": [],
+            "fillets": [],
+            "extrusions": [],
+            "general_curved_faces": np.empty(0, dtype=np.int64),
+        }, {
+            "cylinder_regions": 0,
+            "cylinder_faces": 0,
+            "fillet_regions": 0,
+            "fillet_faces": 0,
+            "extrusion_regions": 0,
+            "extrusion_faces": 0,
+            "general_curved_faces": 0,
+        }
+
+    triangles = vertices[faces]
+    crosses = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    double_areas = np.linalg.norm(crosses, axis=1)
+    valid = double_areas > np.finfo(np.float64).eps
+    normals = np.zeros_like(crosses)
+    normals[valid] = crosses[valid] / double_areas[valid, None]
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    adjacency_edges = np.sort(
+        np.asarray(mesh.face_adjacency_edges, dtype=np.int64), axis=1
+    )
+    adjacency_angles = np.degrees(
+        np.asarray(mesh.face_adjacency_angles, dtype=np.float64)
+    )
+    protected = {
+        tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in np.asarray(
+            protected_edges
+            if protected_edges is not None
+            else np.empty((0, 2), dtype=np.int64),
+            dtype=np.int64,
+        ).reshape(-1, 2)
+    }
+
+    # Extremely skinny triangles on an extruded surface carry a reliable
+    # local axis in their longest edge even when old feature thresholds have
+    # fragmented the surface into tiny components.  Grow those seeds by the
+    # axial-normal model before attempting broader component fits.
+    face_edge_vectors = (
+        triangles[:, (1, 2, 0)] - triangles[:, (0, 1, 2)]
+    )
+    face_edge_lengths = np.linalg.norm(face_edge_vectors, axis=2)
+    shortest_lengths = np.maximum(
+        face_edge_lengths.min(axis=1), np.finfo(np.float64).eps
+    )
+    elongation = face_edge_lengths.max(axis=1) / shortest_lengths
+    qualities = _triangle_quality_values(vertices, faces)
+    sliver_seeds = np.flatnonzero(
+        active_mask & valid & (qualities < 0.1) & (elongation >= 20.0)
+    )
+    if len(sliver_seeds):
+        sliver_seeds = sliver_seeds[
+            np.argsort(elongation[sliver_seeds])[::-1]
+        ]
+    face_neighbors = [[] for _ in range(len(faces))]
+    for index, (first, second) in enumerate(adjacency):
+        angle = float(adjacency_angles[index])
+        face_neighbors[int(first)].append((int(second), angle))
+        face_neighbors[int(second)].append((int(first), angle))
+
+    sliver_claimed = np.zeros(len(faces), dtype=bool)
+    extrusion_regions = []
+    axial_growth_tolerance = max(float(axial_normal_tolerance), 5e-2)
+    region_angle_limit = float(maximum_region_dihedral_degrees)
+    for seed in sliver_seeds:
+        seed = int(seed)
+        if sliver_claimed[seed]:
+            continue
+        longest_edge_index = int(np.argmax(face_edge_lengths[seed]))
+        axis = face_edge_vectors[seed, longest_edge_index]
+        axis_length = float(np.linalg.norm(axis))
+        if axis_length <= np.finfo(np.float64).eps:
+            continue
+        axis /= axis_length
+        visited = {seed}
+        stack = [seed]
+        while stack:
+            face_index = stack.pop()
+            for neighbor, angle in face_neighbors[face_index]:
+                if (
+                    neighbor in visited
+                    or sliver_claimed[neighbor]
+                    or not active_mask[neighbor]
+                    or not valid[neighbor]
+                    or angle > region_angle_limit
+                    or abs(float(np.dot(normals[neighbor], axis)))
+                    > axial_growth_tolerance
+                ):
+                    continue
+                visited.add(neighbor)
+                stack.append(neighbor)
+        if len(visited) < 2:
+            continue
+        face_ids = np.asarray(sorted(visited), dtype=np.int64)
+        sliver_claimed[face_ids] = True
+        extrusion_regions.append(
+            {
+                "faces": face_ids,
+                "axis": axis.copy(),
+                "axial_normal_error": float(
+                    np.sqrt(np.mean((normals[face_ids] @ axis) ** 2))
+                ),
+                "seeded_by_sliver": True,
+            }
+        )
+
+    # Seed order must not create artificial region boundaries.  Merge
+    # neighboring sliver-grown regions when their fitted axes agree and the
+    # shared edge is smooth; this turns the old long seam into an internal edge
+    # that the boundary-only reconstruction is allowed to discard.
+    if len(extrusion_regions) > 1:
+        face_region_ids = np.full(len(faces), -1, dtype=np.int64)
+        for region_id, region in enumerate(extrusion_regions):
+            face_region_ids[region["faces"]] = region_id
+        parents = np.arange(len(extrusion_regions), dtype=np.int64)
+
+        def find_root(region_id):
+            region_id = int(region_id)
+            while parents[region_id] != region_id:
+                parents[region_id] = parents[int(parents[region_id])]
+                region_id = int(parents[region_id])
+            return region_id
+
+        def union_regions(first_region, second_region):
+            first_root = find_root(first_region)
+            second_root = find_root(second_region)
+            if first_root != second_root:
+                parents[second_root] = first_root
+
+        minimum_axis_alignment = np.cos(np.deg2rad(5.0))
+        maximum_merge_dihedral = min(region_angle_limit, 10.0)
+        for adjacency_index, (first_face, second_face) in enumerate(adjacency):
+            first_region = int(face_region_ids[int(first_face)])
+            second_region = int(face_region_ids[int(second_face)])
+            if (
+                first_region < 0
+                or second_region < 0
+                or first_region == second_region
+                or float(adjacency_angles[adjacency_index])
+                > maximum_merge_dihedral
+            ):
+                continue
+            first_axis = extrusion_regions[first_region]["axis"]
+            second_axis = extrusion_regions[second_region]["axis"]
+            if abs(float(np.dot(first_axis, second_axis))) >= minimum_axis_alignment:
+                union_regions(first_region, second_region)
+
+        grouped_regions = {}
+        for region_id, region in enumerate(extrusion_regions):
+            grouped_regions.setdefault(find_root(region_id), []).append(region)
+        merged_extrusion_regions = []
+        for grouped in grouped_regions.values():
+            if len(grouped) == 1:
+                merged_extrusion_regions.append(grouped[0])
+                continue
+            face_ids = np.unique(
+                np.concatenate([region["faces"] for region in grouped])
+            )
+            grouped_normals = normals[face_ids]
+            covariance = grouped_normals.T @ grouped_normals / len(grouped_normals)
+            _, eigenvectors = np.linalg.eigh(covariance)
+            axis = eigenvectors[:, 0]
+            axial_error = float(
+                np.sqrt(np.mean((grouped_normals @ axis) ** 2))
+            )
+            if axial_error > axial_growth_tolerance:
+                merged_extrusion_regions.extend(grouped)
+                continue
+            merged_extrusion_regions.append(
+                {
+                    "faces": face_ids,
+                    "axis": axis,
+                    "axial_normal_error": axial_error,
+                    "seeded_by_sliver": True,
+                }
+            )
+        extrusion_regions = merged_extrusion_regions
+
+    remaining_active_mask = active_mask & ~sliver_claimed
+    usable = np.asarray(
+        [
+            remaining_active_mask[first]
+            and remaining_active_mask[second]
+            and (
+                tuple(map(int, edge)) not in protected
+                or adjacency_angles[index]
+                <= float(maximum_region_dihedral_degrees)
+            )
+            for index, ((first, second), edge) in enumerate(
+                zip(adjacency, adjacency_edges)
+            )
+        ],
+        dtype=bool,
+    )
+    usable_adjacency = adjacency[usable]
+    graph = coo_matrix(
+        (
+            np.ones(len(usable_adjacency) * 2, dtype=np.uint8),
+            (
+                np.concatenate((usable_adjacency[:, 0], usable_adjacency[:, 1])),
+                np.concatenate((usable_adjacency[:, 1], usable_adjacency[:, 0])),
+            ),
+        ),
+        shape=(len(faces), len(faces)),
+    ).tocsr()
+    _, labels = connected_components(graph, directed=False)
+    active_labels, active_counts = np.unique(
+        labels[remaining_active_mask], return_counts=True
+    )
+
+    classified_mask = planar_mask | sliver_claimed
+    cylinder_regions = []
+    fillet_regions = []
+    coverage_limit = np.deg2rad(float(full_cylinder_coverage_degrees))
+
+    for component_id, component_size in zip(active_labels, active_counts):
+        if int(component_size) < minimum_faces:
+            continue
+        face_ids = np.flatnonzero(
+            remaining_active_mask & (labels == component_id)
+        )
+        if not np.all(valid[face_ids]):
+            continue
+        component_normals = normals[face_ids]
+        normal_covariance = (
+            component_normals.T @ component_normals / len(component_normals)
+        )
+        eigenvalues, eigenvectors = np.linalg.eigh(normal_covariance)
+        # A single planar direction leaves two null eigenvalues and must not
+        # be mistaken for an axial surface merely because an axis can be fit.
+        if float(eigenvalues[1]) <= 1e-8:
+            continue
+        axis = eigenvectors[:, 0]
+        axial_error = float(
+            np.sqrt(np.mean((component_normals @ axis) ** 2))
+        )
+        if axial_error > float(axial_normal_tolerance):
+            continue
+
+        first_basis = component_normals[0] - axis * np.dot(
+            component_normals[0], axis
+        )
+        first_basis_length = float(np.linalg.norm(first_basis))
+        if first_basis_length <= np.finfo(np.float64).eps:
+            continue
+        first_basis /= first_basis_length
+        second_basis = np.cross(axis, first_basis)
+        component_vertex_ids = np.unique(faces[face_ids])
+        origin = vertices[component_vertex_ids].mean(axis=0)
+        offsets = vertices[component_vertex_ids] - origin
+        projected = np.column_stack(
+            (offsets @ first_basis, offsets @ second_basis)
+        )
+        circle_system = np.column_stack(
+            (
+                2.0 * projected[:, 0],
+                2.0 * projected[:, 1],
+                np.ones(len(projected)),
+            )
+        )
+        circle_rhs = np.sum(projected * projected, axis=1)
+        circle_solution, _, _, _ = np.linalg.lstsq(
+            circle_system, circle_rhs, rcond=None
+        )
+        center_2d = circle_solution[:2]
+        radii = np.linalg.norm(projected - center_2d, axis=1)
+        radius = float(radii.mean())
+        radius_error = (
+            float(radii.std() / radius)
+            if radius > np.finfo(np.float64).eps
+            else np.inf
+        )
+
+        region = {
+            "faces": face_ids,
+            "axis": axis,
+            "axial_normal_error": axial_error,
+        }
+        if radius_error <= float(radius_tolerance):
+            axis_origin = origin + center_2d @ np.vstack(
+                (first_basis, second_basis)
+            )
+            centroid_offsets = triangles[face_ids].mean(axis=1) - axis_origin
+            centroid_axial = centroid_offsets @ axis
+            centroid_radial = (
+                centroid_offsets - centroid_axial[:, None] * axis
+            )
+            radial_lengths = np.linalg.norm(centroid_radial, axis=1)
+            radial_alignment = np.zeros(len(face_ids), dtype=np.float64)
+            nonzero_radial = radial_lengths > np.finfo(np.float64).eps
+            radial_alignment[nonzero_radial] = np.abs(
+                np.sum(
+                    component_normals[nonzero_radial]
+                    * centroid_radial[nonzero_radial],
+                    axis=1,
+                )
+                / radial_lengths[nonzero_radial]
+            )
+            if (
+                np.all(nonzero_radial)
+                and float(np.percentile(radial_alignment, 5.0)) >= 0.98
+            ):
+                angles = np.mod(
+                    np.arctan2(
+                        offsets @ second_basis - center_2d[1],
+                        offsets @ first_basis - center_2d[0],
+                    ),
+                    2.0 * np.pi,
+                )
+                sorted_angles = np.sort(angles)
+                angular_gaps = np.diff(
+                    np.concatenate(
+                        (sorted_angles, sorted_angles[:1] + 2.0 * np.pi)
+                    )
+                )
+                coverage = 2.0 * np.pi - float(angular_gaps.max())
+                region.update(
+                    {
+                        "radius": radius,
+                        "radius_error": radius_error,
+                        "coverage_radians": coverage,
+                    }
+                )
+                if coverage >= coverage_limit:
+                    cylinder_regions.append(region)
+                else:
+                    fillet_regions.append(region)
+                classified_mask[face_ids] = True
+                continue
+
+        extrusion_regions.append(region)
+        classified_mask[face_ids] = True
+
+    general_curved_faces = np.flatnonzero(~classified_mask)
+    regions = {
+        "cylinders": cylinder_regions,
+        "fillets": fillet_regions,
+        "extrusions": extrusion_regions,
+        "general_curved_faces": general_curved_faces,
+    }
+    stats = {
+        "cylinder_regions": len(cylinder_regions),
+        "cylinder_faces": int(
+            sum(len(region["faces"]) for region in cylinder_regions)
+        ),
+        "fillet_regions": len(fillet_regions),
+        "fillet_faces": int(
+            sum(len(region["faces"]) for region in fillet_regions)
+        ),
+        "extrusion_regions": len(extrusion_regions),
+        "extrusion_faces": int(
+            sum(len(region["faces"]) for region in extrusion_regions)
+        ),
+        "general_curved_faces": int(len(general_curved_faces)),
+    }
+    return regions, stats
+
+
 def retriangulate_planar_annuli(
     vertices,
     faces,
@@ -190,10 +916,35 @@ def retriangulate_planar_annuli(
     minimum_holes=1,
     maximum_holes=None,
     maximum_target_edge_length=None,
+    face_regions=None,
+    solid_minimum_faces=None,
+    holed_minimum_faces=None,
+    minimum_triangle_angle_degrees=None,
+    announce_fallback=True,
+    enforce_quality_gate=True,
+    fallback_flip_passes=5,
+    allow_ear_clipping_fallback=False,
 ):
-    """Uniformly retriangulate exact planar facets with constrained boundaries."""
+    """Rebuild planar patches from boundaries, discarding all interior edges."""
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
+    fallback_flip_passes = int(fallback_flip_passes)
+    if fallback_flip_passes < 0:
+        raise ValueError("Fallback flip passes must be non-negative.")
+    if minimum_triangle_angle_degrees is not None:
+        minimum_triangle_angle_degrees = float(
+            minimum_triangle_angle_degrees
+        )
+        if not 0.0 < minimum_triangle_angle_degrees < 34.0:
+            raise ValueError(
+                "Planar minimum triangle angle must be in (0, 34) degrees."
+            )
+        if constrained_triangle is None and announce_fallback:
+            print(
+                "Planar minimum-angle package unavailable; using the SciPy "
+                "boundary-layer constrained-Delaunay fallback.",
+                flush=True,
+            )
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     protected = {
         tuple(sorted((int(edge[0]), int(edge[1]))))
@@ -216,7 +967,27 @@ def retriangulate_planar_annuli(
     quality_rejection_count = 0
     constraint_rejection_count = 0
 
-    for facet, boundary_edges in zip(mesh.facets, mesh.facets_boundary):
+    if face_regions is None:
+        region_boundaries = zip(mesh.facets, mesh.facets_boundary)
+    else:
+        region_boundaries = []
+        for region in face_regions:
+            region = np.asarray(region, dtype=np.int64)
+            region_faces = faces[region]
+            region_edges = np.sort(
+                region_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2),
+                axis=1,
+            )
+            unique_edges, edge_counts = np.unique(
+                region_edges,
+                axis=0,
+                return_counts=True,
+            )
+            region_boundaries.append(
+                (region, unique_edges[edge_counts == 1])
+            )
+
+    for facet, boundary_edges in region_boundaries:
         facet = np.asarray(facet, dtype=np.int64)
         if len(facet) < int(minimum_faces):
             continue
@@ -224,6 +995,18 @@ def retriangulate_planar_annuli(
         if cycles is None:
             continue
         hole_count = len(cycles) - 1
+        if (
+            hole_count == 0
+            and solid_minimum_faces is not None
+            and len(facet) < int(solid_minimum_faces)
+        ):
+            continue
+        if (
+            hole_count > 0
+            and holed_minimum_faces is not None
+            and len(facet) < int(holed_minimum_faces)
+        ):
+            continue
         if hole_count < int(minimum_holes):
             continue
         if maximum_holes is not None and hole_count > int(maximum_holes):
@@ -321,6 +1104,76 @@ def retriangulate_planar_annuli(
             np.sum(segment_vectors * segment_vectors, axis=1),
             np.finfo(np.float64).eps,
         )
+        if minimum_triangle_angle_degrees is not None:
+            # Build graded Steiner layers from each boundary into the planar
+            # domain.  Level 0 places an approximately equilateral apex over
+            # every boundary segment; subsequent levels double tangential and
+            # normal spacing until they meet the coarse interior grid.
+            boundary_layer_points = []
+            for polygon in polygons:
+                polygon = np.asarray(polygon, dtype=np.float64)
+                polygon_edges = np.roll(polygon, -1, axis=0) - polygon
+                positive_lengths = np.linalg.norm(polygon_edges, axis=1)
+                positive_lengths = positive_lengths[positive_lengths > 0.0]
+                if len(positive_lengths) == 0:
+                    continue
+                local_spacing = float(np.median(positive_lengths))
+                if spacing <= local_spacing * 1.5:
+                    continue
+                level_count = min(
+                    10,
+                    max(
+                        1,
+                        int(
+                            np.ceil(
+                                np.log2(
+                                    max(spacing / local_spacing, 1.0)
+                                )
+                            )
+                        )
+                        + 1,
+                    ),
+                )
+                polygon_size = len(polygon)
+                for level in range(level_count):
+                    stride = min(1 << level, max(polygon_size - 1, 1))
+                    for start_index in range(0, polygon_size, stride):
+                        end_index = (start_index + stride) % polygon_size
+                        start_point = polygon[start_index]
+                        end_point = polygon[end_index]
+                        chord = end_point - start_point
+                        chord_length = float(np.linalg.norm(chord))
+                        if chord_length <= 0.0:
+                            continue
+                        normal_2d = np.asarray(
+                            (-chord[1], chord[0]), dtype=np.float64
+                        ) / chord_length
+                        height = min(
+                            0.5 * np.sqrt(3.0) * chord_length,
+                            row_step,
+                        )
+                        midpoint = (start_point + end_point) * 0.5
+                        boundary_layer_points.extend(
+                            (
+                                midpoint + normal_2d * height,
+                                midpoint - normal_2d * height,
+                            )
+                        )
+            if boundary_layer_points:
+                boundary_layer_points = np.asarray(
+                    boundary_layer_points,
+                    dtype=np.float64,
+                )
+                layer_inside = _points_in_polygon(
+                    boundary_layer_points,
+                    outer,
+                )
+                for hole in holes:
+                    layer_inside &= ~_points_in_polygon(
+                        boundary_layer_points,
+                        hole,
+                    )
+                grid_points.extend(boundary_layer_points[layer_inside])
         while y < upper[1]:
             x = lower[0] + spacing * (0.5 if row % 2 else 1.0)
             row_points = []
@@ -358,13 +1211,27 @@ def retriangulate_planar_annuli(
                             axis=1,
                         )
                     )
+                    boundary_clearance = (
+                        spacing * 0.25
+                        if minimum_triangle_angle_degrees is not None
+                        else spacing * 0.55
+                    )
                     grid_points.extend(
-                        inside_points[minimum_distances >= spacing * 0.55]
+                        inside_points[minimum_distances >= boundary_clearance]
                     )
             row += 1
             y += row_step
 
         interior_2d = np.asarray(grid_points, dtype=np.float64).reshape(-1, 2)
+        if len(interior_2d):
+            point_scale = max(
+                float(np.ptp(all_boundary_2d, axis=0).max()),
+                1.0,
+            )
+            quantization = point_scale * 1e-10
+            keys = np.rint(interior_2d / quantization).astype(np.int64)
+            _, unique_indices = np.unique(keys, axis=0, return_index=True)
+            interior_2d = interior_2d[np.sort(unique_indices)]
         all_2d = np.vstack((all_boundary_2d, interior_2d))
         offsets = np.cumsum([0] + [len(cycle) for cycle in ordered_cycles])
         required_edges = set()
@@ -382,8 +1249,14 @@ def retriangulate_planar_annuli(
                 triangle_input["holes"] = np.asarray(
                     [hole.mean(axis=0) for hole in holes], dtype=np.float64
                 )
+            triangle_options = "pQY"
+            if minimum_triangle_angle_degrees is not None:
+                triangle_options = "pq{:.12g}QY".format(
+                    minimum_triangle_angle_degrees
+                )
             triangle_result = constrained_triangle.triangulate(
-                triangle_input, "pQY"
+                triangle_input,
+                triangle_options,
             )
             if "triangles" not in triangle_result:
                 boundary_rejection_count += 1
@@ -394,9 +1267,53 @@ def retriangulate_planar_annuli(
             )
             interior_2d = all_2d[len(all_boundary_2d):]
         else:
-            try:
-                triangulation = Delaunay(all_2d).simplices.astype(np.int64)
-            except QhullError:
+            triangulation = None
+            constraints_recovered = False
+            for qhull_options in (None, "QJ"):
+                try:
+                    candidate = Delaunay(
+                        all_2d,
+                        qhull_options=qhull_options,
+                    ).simplices.astype(np.int64)
+                except QhullError:
+                    continue
+                candidate, constraints_recovered = (
+                    _recover_planar_constraint_edges(
+                        all_2d,
+                        candidate,
+                        required_edges,
+                    )
+                )
+                if constraints_recovered:
+                    triangulation = candidate
+                    break
+            if (
+                not constraints_recovered
+                and not holes
+                and allow_ear_clipping_fallback
+            ):
+                candidate = _triangulate_simple_polygon_with_points(
+                    all_2d,
+                    len(all_boundary_2d),
+                )
+                if candidate is not None:
+                    embedded_points = np.column_stack(
+                        (
+                            all_2d,
+                            np.zeros(len(all_2d), dtype=np.float64),
+                        )
+                    )
+                    candidate, _ = _flip_quality_edges(
+                        embedded_points,
+                        candidate,
+                        np.asarray(sorted(required_edges), dtype=np.int64),
+                        passes=fallback_flip_passes,
+                        maximum_dihedral_degrees=0.1,
+                    )
+                    triangulation = candidate
+                    constraints_recovered = True
+            if not constraints_recovered:
+                boundary_rejection_count += 1
                 continue
         centroids = all_2d[triangulation].mean(axis=1)
         inside = _points_in_polygon(centroids, outer)
@@ -442,7 +1359,7 @@ def retriangulate_planar_annuli(
         new_faces[reverse] = new_faces[reverse][:, [0, 2, 1]]
         old_quality = _triangle_quality_values(vertices, faces[facet])
         new_quality = _triangle_quality_values(coordinate_pool, new_faces)
-        if (
+        if enforce_quality_gate and (
             np.percentile(new_quality, 5.0)
             < np.percentile(old_quality, 5.0) - 1e-8
             or float(new_quality.mean()) < float(old_quality.mean()) - 1e-8
@@ -468,8 +1385,18 @@ def retriangulate_planar_annuli(
             "new_faces": 0, "old_quality": 0.0, "new_quality": 0.0,
         }
     return (
-        np.vstack((vertices, np.asarray(appended_vertices))),
-        np.vstack((faces[kept_faces], np.asarray(appended_faces, dtype=np.int64))),
+        np.vstack(
+            (
+                vertices,
+                np.asarray(appended_vertices, dtype=np.float64).reshape(-1, 3),
+            )
+        ),
+        np.vstack(
+            (
+                faces[kept_faces],
+                np.asarray(appended_faces, dtype=np.int64).reshape(-1, 3),
+            )
+        ),
         {
             "regions": region_count,
             "candidates": candidate_count,
@@ -481,6 +1408,385 @@ def retriangulate_planar_annuli(
             "new_faces": len(appended_faces),
             "old_quality": float(np.mean(old_quality_values)),
             "new_quality": float(np.mean(new_quality_values)),
+        },
+    )
+
+
+def _map_uv_points_to_surface(points, uv_vertices, uv_faces, vertices):
+    """Map UV points to a source triangle surface by barycentric coordinates."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(points) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    uv_vertices = np.asarray(uv_vertices, dtype=np.float64)
+    uv_faces = np.asarray(uv_faces, dtype=np.int64)
+    embedded_uv = np.column_stack(
+        (uv_vertices, np.zeros(len(uv_vertices), dtype=np.float64))
+    )
+    embedded_points = np.column_stack(
+        (points, np.zeros(len(points), dtype=np.float64))
+    )
+    _, closest_faces, closest_points = igl.point_mesh_squared_distance(
+        embedded_points,
+        embedded_uv,
+        uv_faces,
+    )
+    closest_faces = np.asarray(closest_faces, dtype=np.int64)
+    closest_points = np.asarray(closest_points, dtype=np.float64)[:, :2]
+    parameter_triangles = uv_vertices[uv_faces[closest_faces]]
+    first = parameter_triangles[:, 0]
+    second = parameter_triangles[:, 1]
+    third = parameter_triangles[:, 2]
+    denominator = (
+        (second[:, 1] - third[:, 1]) * (first[:, 0] - third[:, 0])
+        + (third[:, 0] - second[:, 0]) * (first[:, 1] - third[:, 1])
+    )
+    if np.any(np.abs(denominator) <= np.finfo(np.float64).eps):
+        raise ValueError("Degenerate UV triangle encountered during mapping.")
+    first_weight = (
+        (second[:, 1] - third[:, 1])
+        * (closest_points[:, 0] - third[:, 0])
+        + (third[:, 0] - second[:, 0])
+        * (closest_points[:, 1] - third[:, 1])
+    ) / denominator
+    second_weight = (
+        (third[:, 1] - first[:, 1])
+        * (closest_points[:, 0] - third[:, 0])
+        + (first[:, 0] - third[:, 0])
+        * (closest_points[:, 1] - third[:, 1])
+    ) / denominator
+    third_weight = 1.0 - first_weight - second_weight
+    weights = np.column_stack(
+        (first_weight, second_weight, third_weight)
+    )
+    source_triangles = np.asarray(vertices, dtype=np.float64)[
+        uv_faces[closest_faces]
+    ]
+    return np.einsum("ij,ijk->ik", weights, source_triangles)
+
+
+def retriangulate_developable_regions(
+    vertices,
+    faces,
+    regions,
+    minimum_faces=20,
+    maximum_target_edge_length=None,
+    minimum_triangle_angle_degrees=28.0,
+    maximum_input_quality=0.05,
+):
+    """Unwrap classified developable regions and rebuild from boundaries.
+
+    LSCM is used only as a two-dimensional chart.  The old internal edges are
+    discarded in that chart, and all inserted vertices are mapped back to the
+    original region by barycentric interpolation.  Region boundary vertices
+    and boundary edges remain unchanged, so adjacent unprocessed surfaces stay
+    conforming.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    minimum_faces = int(minimum_faces)
+    if minimum_faces < 2:
+        raise ValueError("Developable reconstruction minimum faces must be >= 2.")
+    if maximum_target_edge_length is None:
+        maximum_target_edge_length = (
+            float(np.linalg.norm(np.ptp(vertices, axis=0))) * 0.05
+        )
+    maximum_target_edge_length = float(maximum_target_edge_length)
+    if maximum_target_edge_length <= 0.0:
+        raise ValueError("Developable target edge length must be positive.")
+    maximum_input_quality = float(maximum_input_quality)
+    if not 0.0 < maximum_input_quality <= 1.0:
+        raise ValueError("Developable input quality threshold must be in (0, 1].")
+
+    kept_faces = np.ones(len(faces), dtype=bool)
+    appended_vertices = []
+    appended_faces = []
+    candidates = 0
+    accepted = 0
+    parameter_rejections = 0
+    boundary_rejections = 0
+    chart_rejections = 0
+    chart_boundary_rejections = 0
+    chart_constraint_rejections = 0
+    chart_quality_rejections = 0
+    quality_rejections = 0
+    removed_faces = 0
+    screened_out = 0
+    old_qualities = []
+    new_qualities = []
+    last_quality_rejection = None
+
+    for region in regions:
+        face_ids = np.asarray(region["faces"], dtype=np.int64)
+        if len(face_ids) < minimum_faces or not np.all(kept_faces[face_ids]):
+            continue
+        component_faces = faces[face_ids]
+        old_quality = _triangle_quality_values(vertices, component_faces)
+        component_triangles = vertices[component_faces]
+        component_edge_lengths = np.linalg.norm(
+            component_triangles[:, (1, 2, 0)]
+            - component_triangles[:, (0, 1, 2)],
+            axis=2,
+        )
+        if (
+            float(np.percentile(old_quality, 5.0))
+            >= maximum_input_quality
+            or float(component_edge_lengths.max())
+            <= maximum_target_edge_length * (1.0 + 1e-8)
+        ):
+            screened_out += 1
+            continue
+        candidates += 1
+        if candidates == 1 or candidates % 25 == 0:
+            print(
+                "  developable reconstruction progress: {} candidates, {} "
+                "accepted, {} parameter/boundary/chart/quality rejected."
+                .format(
+                    candidates,
+                    accepted,
+                    parameter_rejections
+                    + boundary_rejections
+                    + chart_rejections
+                    + quality_rejections,
+                ),
+                flush=True,
+            )
+        component_edges = np.sort(
+            component_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2),
+            axis=1,
+        )
+        unique_edges, edge_counts = np.unique(
+            component_edges, axis=0, return_counts=True
+        )
+        boundary_edges = unique_edges[edge_counts == 1]
+        cycles = _ordered_cycles_from_edges(boundary_edges)
+        if cycles is None or len(cycles) != 1:
+            boundary_rejections += 1
+            continue
+
+        component_vertex_ids = np.unique(component_faces)
+        global_to_local = {
+            int(vertex_id): local_index
+            for local_index, vertex_id in enumerate(component_vertex_ids)
+        }
+        local_faces = np.asarray(
+            [
+                [global_to_local[int(vertex_id)] for vertex_id in face]
+                for face in component_faces
+            ],
+            dtype=np.int64,
+        )
+        local_vertices = vertices[component_vertex_ids]
+        boundary_cycle = np.asarray(cycles[0], dtype=np.int64)
+        local_boundary = np.asarray(
+            [global_to_local[int(vertex_id)] for vertex_id in boundary_cycle],
+            dtype=np.int64,
+        )
+        if len(local_boundary) < 4:
+            boundary_rejections += 1
+            continue
+        first_pin = int(local_boundary[0])
+        first_distances = np.linalg.norm(
+            local_vertices[local_boundary] - local_vertices[first_pin], axis=1
+        )
+        second_pin = int(local_boundary[int(np.argmax(first_distances))])
+        pin_distance = float(
+            np.linalg.norm(local_vertices[second_pin] - local_vertices[first_pin])
+        )
+        if pin_distance <= np.finfo(np.float64).eps:
+            parameter_rejections += 1
+            continue
+        try:
+            success, uv_vertices = igl.lscm(
+                local_vertices,
+                local_faces,
+                np.asarray((first_pin, second_pin), dtype=np.int64),
+                np.asarray(((0.0, 0.0), (pin_distance, 0.0)), dtype=np.float64),
+            )
+        except (RuntimeError, ValueError):
+            success = False
+        if not success:
+            parameter_rejections += 1
+            continue
+        uv_vertices = np.asarray(uv_vertices, dtype=np.float64)
+        if uv_vertices.shape != (len(local_vertices), 2) or not np.isfinite(
+            uv_vertices
+        ).all():
+            parameter_rejections += 1
+            continue
+
+        parameter_triangles = uv_vertices[local_faces]
+        signed_double_areas = (
+            (parameter_triangles[:, 1, 0] - parameter_triangles[:, 0, 0])
+            * (parameter_triangles[:, 2, 1] - parameter_triangles[:, 0, 1])
+            - (parameter_triangles[:, 1, 1] - parameter_triangles[:, 0, 1])
+            * (parameter_triangles[:, 2, 0] - parameter_triangles[:, 0, 0])
+        )
+        area_scale = max(float(np.ptp(uv_vertices, axis=0).max()) ** 2, 1.0)
+        if np.any(np.abs(signed_double_areas) <= area_scale * 1e-14):
+            parameter_rejections += 1
+            continue
+        positive_count = int(np.count_nonzero(signed_double_areas > 0.0))
+        negative_count = len(signed_double_areas) - positive_count
+        if min(positive_count, negative_count) > 0:
+            parameter_rejections += 1
+            continue
+        if negative_count:
+            uv_vertices[:, 1] *= -1.0
+
+        local_edges = np.unique(
+            np.sort(
+                local_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2),
+                axis=1,
+            ),
+            axis=0,
+        )
+        spatial_lengths = np.linalg.norm(
+            local_vertices[local_edges[:, 0]]
+            - local_vertices[local_edges[:, 1]],
+            axis=1,
+        )
+        parameter_lengths = np.linalg.norm(
+            uv_vertices[local_edges[:, 0]] - uv_vertices[local_edges[:, 1]],
+            axis=1,
+        )
+        usable_lengths = parameter_lengths > np.finfo(np.float64).eps
+        if not np.any(usable_lengths):
+            parameter_rejections += 1
+            continue
+        uv_vertices *= float(
+            np.median(spatial_lengths[usable_lengths] / parameter_lengths[usable_lengths])
+        )
+
+        local_boundary_edges = np.column_stack(
+            (local_boundary, np.roll(local_boundary, -1))
+        )
+        planar_vertices = np.column_stack(
+            (uv_vertices, np.zeros(len(uv_vertices), dtype=np.float64))
+        )
+        (
+            rebuilt_parameter_vertices,
+            rebuilt_faces,
+            rebuilt_stats,
+        ) = retriangulate_planar_annuli(
+            planar_vertices,
+            local_faces,
+            protected_edges=local_boundary_edges,
+            minimum_faces=1,
+            minimum_holes=0,
+            maximum_holes=None,
+            maximum_target_edge_length=maximum_target_edge_length,
+            face_regions=[np.arange(len(local_faces), dtype=np.int64)],
+            solid_minimum_faces=1,
+            holed_minimum_faces=1,
+            minimum_triangle_angle_degrees=minimum_triangle_angle_degrees,
+            announce_fallback=False,
+            enforce_quality_gate=False,
+            fallback_flip_passes=50,
+            allow_ear_clipping_fallback=True,
+        )
+        if rebuilt_stats["regions"] != 1:
+            chart_rejections += 1
+            chart_boundary_rejections += rebuilt_stats["boundary_rejections"]
+            chart_constraint_rejections += rebuilt_stats["constraint_rejections"]
+            chart_quality_rejections += rebuilt_stats["quality_rejections"]
+            continue
+
+        new_uv_points = rebuilt_parameter_vertices[len(local_vertices):, :2]
+        try:
+            new_vertices = _map_uv_points_to_surface(
+                new_uv_points,
+                uv_vertices,
+                local_faces,
+                local_vertices,
+            )
+        except ValueError:
+            parameter_rejections += 1
+            continue
+        first_new_index = len(vertices) + len(appended_vertices)
+        local_to_global = np.concatenate(
+            (
+                component_vertex_ids,
+                np.arange(
+                    first_new_index,
+                    first_new_index + len(new_vertices),
+                    dtype=np.int64,
+                ),
+            )
+        )
+        new_faces = local_to_global[np.asarray(rebuilt_faces, dtype=np.int64)]
+        coordinate_pool = np.vstack(
+            (
+                vertices,
+                np.asarray(appended_vertices, dtype=np.float64).reshape(-1, 3),
+                new_vertices,
+            )
+        )
+        new_quality = _triangle_quality_values(coordinate_pool, new_faces)
+        if (
+            float(np.percentile(new_quality, 5.0))
+            < float(np.percentile(old_quality, 5.0)) - 1e-8
+            or float(new_quality.mean()) < float(old_quality.mean()) - 1e-8
+        ):
+            quality_rejections += 1
+            last_quality_rejection = {
+                "old_p5": float(np.percentile(old_quality, 5.0)),
+                "new_p5": float(np.percentile(new_quality, 5.0)),
+                "old_mean": float(old_quality.mean()),
+                "new_mean": float(new_quality.mean()),
+            }
+            continue
+
+        kept_faces[face_ids] = False
+        appended_vertices.extend(new_vertices)
+        appended_faces.extend(new_faces)
+        old_qualities.extend(old_quality)
+        new_qualities.extend(new_quality)
+        accepted += 1
+        removed_faces += len(face_ids)
+
+    if not accepted:
+        return vertices.copy(), faces.copy(), {
+            "candidates": candidates,
+            "screened_out": screened_out,
+            "regions": 0,
+            "parameter_rejections": parameter_rejections,
+            "boundary_rejections": boundary_rejections,
+            "chart_rejections": chart_rejections,
+            "chart_boundary_rejections": chart_boundary_rejections,
+            "chart_constraint_rejections": chart_constraint_rejections,
+            "chart_quality_rejections": chart_quality_rejections,
+            "quality_rejections": quality_rejections,
+            "new_vertices": 0,
+            "removed_faces": 0,
+            "new_faces": 0,
+            "old_quality": 0.0,
+            "new_quality": 0.0,
+            "old_quality_p5": 0.0,
+            "new_quality_p5": 0.0,
+            "last_quality_rejection": last_quality_rejection,
+        }
+    return (
+        np.vstack((vertices, np.asarray(appended_vertices, dtype=np.float64))),
+        np.vstack((faces[kept_faces], np.asarray(appended_faces, dtype=np.int64))),
+        {
+            "candidates": candidates,
+            "screened_out": screened_out,
+            "regions": accepted,
+            "parameter_rejections": parameter_rejections,
+            "boundary_rejections": boundary_rejections,
+            "chart_rejections": chart_rejections,
+            "chart_boundary_rejections": chart_boundary_rejections,
+            "chart_constraint_rejections": chart_constraint_rejections,
+            "chart_quality_rejections": chart_quality_rejections,
+            "quality_rejections": quality_rejections,
+            "new_vertices": len(appended_vertices),
+            "removed_faces": removed_faces,
+            "new_faces": len(appended_faces),
+            "old_quality": float(np.mean(old_qualities)),
+            "new_quality": float(np.mean(new_qualities)),
+            "old_quality_p5": float(np.percentile(old_qualities, 5.0)),
+            "new_quality_p5": float(np.percentile(new_qualities, 5.0)),
+            "last_quality_rejection": last_quality_rejection,
         },
     )
 
@@ -1572,6 +2878,167 @@ def _build_edge_faces(faces):
     return edge_faces
 
 
+def sample_region_boundary_edges(
+    vertices,
+    faces,
+    boundary_edges,
+    target_edge_length,
+    relative_tolerance=1e-8,
+    tracked_edge_roots=None,
+    tracked_face_labels=None,
+):
+    """Synchronously sample shared reconstruction boundaries.
+
+    Only the supplied semantic-region boundary chains are subdivided.  The
+    adjacent faces are split solely to keep the mesh conforming.  When a
+    mutable ``tracked_edge_roots`` mapping is supplied, split hard edges are
+    replaced in that mapping by their two children so feature lineage remains
+    valid for later refinement stages.  Optional face labels are inherited by
+    both children of every split face and returned in the statistics mapping;
+    this preserves exact semantic-region membership without reclassification.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    target_edge_length = float(target_edge_length)
+    if target_edge_length <= 0.0:
+        raise ValueError("Region-boundary target edge length must be positive.")
+    selected = {
+        tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in np.asarray(boundary_edges, dtype=np.int64).reshape(-1, 2)
+    }
+    if tracked_face_labels is not None:
+        tracked_face_labels = list(
+            map(int, np.asarray(tracked_face_labels).reshape(-1))
+        )
+        if len(tracked_face_labels) != len(faces):
+            raise ValueError(
+                "Tracked face labels must match the input face count."
+            )
+    if not selected:
+        return vertices.copy(), faces.copy(), {
+            "initial_edges": 0,
+            "splits": 0,
+            "final_edges": 0,
+            "initial_max_length": 0.0,
+            "final_max_length": 0.0,
+            "face_labels": (
+                np.asarray(tracked_face_labels, dtype=np.int64)
+                if tracked_face_labels is not None
+                else None
+            ),
+        }
+
+    vertices_list = [vertex.copy() for vertex in vertices]
+    faces_list = [list(map(int, face)) for face in faces]
+    edge_faces = _build_edge_faces(faces_list)
+    selected.intersection_update(edge_faces)
+    initial_lengths = {
+        edge: float(
+            np.linalg.norm(vertices_list[edge[0]] - vertices_list[edge[1]])
+        )
+        for edge in selected
+    }
+    length_limit = target_edge_length * (1.0 + float(relative_tolerance))
+    heap = [
+        (-length, edge)
+        for edge, length in initial_lengths.items()
+        if length > length_limit
+    ]
+    heapq.heapify(heap)
+    active_boundary_edges = set(selected)
+    split_count = 0
+    maximum_splits = max(100000, len(heap) * 128)
+    while heap and split_count < maximum_splits:
+        negative_length, edge = heapq.heappop(heap)
+        if edge not in active_boundary_edges or edge not in edge_faces:
+            continue
+        current_length = float(
+            np.linalg.norm(vertices_list[edge[0]] - vertices_list[edge[1]])
+        )
+        if current_length <= length_limit:
+            continue
+        if current_length < -negative_length * (1.0 - 1e-12):
+            continue
+        incident_faces = sorted(edge_faces[edge])
+        if not incident_faces:
+            continue
+        midpoint_index = len(vertices_list)
+        vertices_list.append(
+            (vertices_list[edge[0]] + vertices_list[edge[1]]) * 0.5
+        )
+        replacements = []
+        for face_index in incident_faces:
+            first_face, second_face = _constraint_split_face(
+                faces_list[face_index], edge, midpoint_index
+            )
+            replacements.append((face_index, first_face, second_face))
+        for face_index, _, _ in replacements:
+            for old_edge in _constraint_face_edges(faces_list[face_index]):
+                memberships = edge_faces.get(old_edge)
+                if memberships is not None:
+                    memberships.discard(face_index)
+                    if not memberships:
+                        del edge_faces[old_edge]
+        for face_index, first_face, second_face in replacements:
+            faces_list[face_index] = first_face
+            second_face_index = len(faces_list)
+            faces_list.append(second_face)
+            if tracked_face_labels is not None:
+                tracked_face_labels.append(tracked_face_labels[face_index])
+            for new_edge in _constraint_face_edges(first_face):
+                edge_faces.setdefault(new_edge, set()).add(face_index)
+            for new_edge in _constraint_face_edges(second_face):
+                edge_faces.setdefault(new_edge, set()).add(second_face_index)
+
+        active_boundary_edges.discard(edge)
+        children = (
+            tuple(sorted((edge[0], midpoint_index))),
+            tuple(sorted((midpoint_index, edge[1]))),
+        )
+        if tracked_edge_roots is not None:
+            root_index = tracked_edge_roots.pop(edge, None)
+            if root_index is not None:
+                tracked_edge_roots[children[0]] = root_index
+                tracked_edge_roots[children[1]] = root_index
+        active_boundary_edges.update(children)
+        for child in children:
+            child_length = float(
+                np.linalg.norm(
+                    vertices_list[child[0]] - vertices_list[child[1]]
+                )
+            )
+            if child_length > length_limit:
+                heapq.heappush(heap, (-child_length, child))
+        split_count += 1
+    if heap:
+        raise RuntimeError(
+            "Region-boundary sampling exceeded its safety budget."
+        )
+
+    final_lengths = [
+        float(np.linalg.norm(vertices_list[first] - vertices_list[second]))
+        for first, second in active_boundary_edges
+    ]
+    return (
+        np.asarray(vertices_list, dtype=np.float64),
+        np.asarray(faces_list, dtype=np.int64),
+        {
+            "initial_edges": len(selected),
+            "splits": split_count,
+            "final_edges": len(active_boundary_edges),
+            "initial_max_length": (
+                max(initial_lengths.values()) if initial_lengths else 0.0
+            ),
+            "final_max_length": max(final_lengths) if final_lengths else 0.0,
+            "face_labels": (
+                np.asarray(tracked_face_labels, dtype=np.int64)
+                if tracked_face_labels is not None
+                else None
+            ),
+        },
+    )
+
+
 def automatic_edge_length_limit(vertices, edge_lengths):
     """Choose 5% of the bounding-box diagonal as the maximum edge length."""
     vertices = np.asarray(vertices, dtype=np.float64)
@@ -1609,8 +3076,10 @@ def refine_original_mesh_by_longest_edge(
     reference_mesh,
     max_edge_length=None,
     feature_angle_degrees=5.0,
+    feature_target_edge_length=None,
     max_splits=None,
     coplanar_angle_degrees=0.1,
+    coplanar_distance_ratio=1e-6,
     flip_passes=8,
     flip_minimum_valence=None,
     flip_maximum_candidate_quality=None,
@@ -1625,15 +3094,23 @@ def refine_original_mesh_by_longest_edge(
     partial_cylinder_minimum_angle=30.0,
     rounded_fillet_minimum_faces=None,
     rounded_fillet_minimum_curvature=0.2,
+    extrusion_region_minimum_faces=None,
+    extrusion_maximum_input_quality=0.05,
     planar_region_minimum_faces=None,
+    planar_target_edge_length=None,
+    planar_minimum_angle_degrees=None,
+    planar_largest_opposed_pair_only=False,
 ):
     """
     Refine the original surface while retaining hard feature edge lineages.
 
     Hard edges (dihedral > threshold, boundary, or non-manifold) are tracked as
     lineages. Splitting a hard edge replaces it by two collinear hard children.
-    All edges are bisected to the requested length, then quality-improving flips
-    remove non-feature seams only inside coplanar patches.
+    All edges are bisected to the requested global length.  When
+    ``feature_target_edge_length`` is supplied, hard feature chains use that
+    finer independent bound while smooth high-quality regions may stay coarse.
+    Quality-improving flips then remove non-feature seams only inside coplanar
+    patches.
     """
     vertices = np.asarray(reference_mesh.vertices, dtype=np.float64)
     faces = np.asarray(reference_mesh.faces, dtype=np.int64)
@@ -1644,10 +3121,42 @@ def refine_original_mesh_by_longest_edge(
     coplanar_angle_degrees = float(coplanar_angle_degrees)
     if not 0.0 <= coplanar_angle_degrees < 180.0:
         raise ValueError("Coplanar angle tolerance must be in [0, 180).")
+    coplanar_distance_ratio = float(coplanar_distance_ratio)
+    if coplanar_distance_ratio < 0.0:
+        raise ValueError("Coplanar distance ratio must be non-negative.")
     flip_passes = int(flip_passes)
     if flip_passes < 0:
         raise ValueError("Constraint flip passes must be non-negative.")
-
+    if (
+        feature_target_edge_length is not None
+        and float(feature_target_edge_length) <= 0.0
+    ):
+        raise ValueError("Feature target edge length must be positive.")
+    if feature_target_edge_length is not None:
+        feature_target_edge_length = float(feature_target_edge_length)
+    if (
+        planar_target_edge_length is not None
+        and float(planar_target_edge_length) <= 0.0
+    ):
+        raise ValueError("Planar target edge length must be positive.")
+    if (
+        extrusion_region_minimum_faces is not None
+        and int(extrusion_region_minimum_faces) < 2
+    ):
+        raise ValueError(
+            "Developable reconstruction minimum faces must be at least 2."
+        )
+    planar_largest_opposed_pair_only = bool(
+        planar_largest_opposed_pair_only
+    )
+    if planar_largest_opposed_pair_only and (
+        planar_annulus_minimum_faces is None
+        and planar_region_minimum_faces is None
+    ):
+        raise ValueError(
+            "Largest opposed planar-pair selection requires planar "
+            "reconstruction."
+        )
     print(
         "Constraint refinement input: {} vertices, {} faces."
         .format(len(vertices), len(faces)),
@@ -1684,25 +3193,302 @@ def refine_original_mesh_by_longest_edge(
         dtype=np.float64,
     )
 
-    if planar_annulus_minimum_faces is not None:
-        vertices, faces, annulus_stats = retriangulate_planar_annuli(
+    planar_reconstruction_requested = (
+        planar_annulus_minimum_faces is not None
+        or planar_region_minimum_faces is not None
+    )
+    surface_classification_requested = (
+        planar_reconstruction_requested
+        or extrusion_region_minimum_faces is not None
+    )
+    if surface_classification_requested:
+        classification_minimum_faces = min(
+            value
+            for value in (
+                planar_annulus_minimum_faces,
+                planar_region_minimum_faces,
+                extrusion_region_minimum_faces,
+            )
+            if value is not None
+        )
+        all_planar_regions, classification_stats = classify_planar_face_regions(
             vertices,
             faces,
             protected_edges=hard_edges_array,
-            minimum_faces=planar_annulus_minimum_faces,
+            minimum_faces=classification_minimum_faces,
+            maximum_normal_angle_degrees=coplanar_angle_degrees,
+            maximum_plane_distance_ratio=coplanar_distance_ratio,
+        )
+        nonplanar_regions, nonplanar_stats = classify_nonplanar_face_regions(
+            vertices,
+            faces,
+            all_planar_regions,
+            protected_edges=hard_edges_array,
+            minimum_faces=4,
+            axial_normal_tolerance=partial_cylinder_normal_tolerance,
+            radius_tolerance=max(cylinder_radius_tolerance, 1e-2),
         )
         print(
-            "Planar annulus retriangulation: {} region(s), {} new vertices, "
-            "{} old -> {} new faces; mean quality {:.6g} -> {:.6g}; "
-            "{} candidates ({} hard-constraint, {} boundary, {} quality "
-            "rejected).".format(
-                annulus_stats["regions"], annulus_stats["new_vertices"],
-                annulus_stats["removed_faces"], annulus_stats["new_faces"],
-                annulus_stats["old_quality"], annulus_stats["new_quality"],
-                annulus_stats["candidates"],
-                annulus_stats["constraint_rejections"],
-                annulus_stats["boundary_rejections"],
-                annulus_stats["quality_rejections"],
+            "Surface classification: {} planar patch(es) / {} faces; "
+            "{} cylinder region(s) / {} faces; {} fillet region(s) / {} "
+            "faces; {} extrusion region(s) / {} faces; {} general curved "
+            "faces; "
+            "normal tolerance {:.6g} degrees, plane distance {:.6g}.".format(
+                classification_stats["regions"],
+                classification_stats["planar_faces"],
+                nonplanar_stats["cylinder_regions"],
+                nonplanar_stats["cylinder_faces"],
+                nonplanar_stats["fillet_regions"],
+                nonplanar_stats["fillet_faces"],
+                nonplanar_stats["extrusion_regions"],
+                nonplanar_stats["extrusion_faces"],
+                nonplanar_stats["general_curved_faces"],
+                classification_stats["normal_angle_degrees"],
+                classification_stats["distance_limit"],
+            ),
+            flush=True,
+        )
+        planar_regions = all_planar_regions
+        if planar_largest_opposed_pair_only:
+            planar_regions, planar_pair_stats = (
+                select_largest_opposed_planar_regions(
+                    vertices,
+                    faces,
+                    all_planar_regions,
+                )
+            )
+            print(
+                "Primary plate planes selected: {} / {} faces, area "
+                "{:.6g} / {:.6g}, normals {} / {}, dot {:.6g}.".format(
+                    planar_pair_stats["primary_faces"],
+                    planar_pair_stats["opposite_faces"],
+                    planar_pair_stats["primary_area"],
+                    planar_pair_stats["opposite_area"],
+                    np.array2string(
+                        planar_pair_stats["primary_normal"], precision=5
+                    ),
+                    np.array2string(
+                        planar_pair_stats["opposite_normal"], precision=5
+                    ),
+                    planar_pair_stats["normal_dot"],
+                ),
+                flush=True,
+            )
+        planar_edge_target = (
+            float(planar_target_edge_length)
+            if planar_target_edge_length is not None
+            else float(np.linalg.norm(np.ptp(vertices, axis=0))) * 0.05
+        )
+
+        region_labels = np.full(len(faces), -1, dtype=np.int64)
+        next_region_label = 0
+        if planar_reconstruction_requested:
+            requested_planar_minimum = min(
+                value
+                for value in (
+                    planar_annulus_minimum_faces,
+                    planar_region_minimum_faces,
+                )
+                if value is not None
+            )
+            for region in planar_regions:
+                if len(region) >= requested_planar_minimum:
+                    region_labels[region] = next_region_label
+                    next_region_label += 1
+        selected_planar_label_count = next_region_label
+        if extrusion_region_minimum_faces is not None:
+            for region in nonplanar_regions["extrusions"]:
+                if len(region["faces"]) >= int(extrusion_region_minimum_faces):
+                    region_labels[region["faces"]] = next_region_label
+                    next_region_label += 1
+        reconstruction_boundary_edges = []
+        current_edge_faces = _build_edge_faces(faces)
+        for edge, memberships in current_edge_faces.items():
+            if len(memberships) != 2:
+                continue
+            first_face, second_face = tuple(memberships)
+            first_label = int(region_labels[first_face])
+            second_label = int(region_labels[second_face])
+            if planar_largest_opposed_pair_only:
+                selected_boundary = (
+                    first_label != second_label
+                    and (
+                        0 <= first_label < selected_planar_label_count
+                        or 0 <= second_label < selected_planar_label_count
+                    )
+                )
+            else:
+                selected_boundary = (
+                    edge not in hard_edges
+                    and first_label >= 0
+                    and second_label >= 0
+                    and first_label != second_label
+                )
+            if selected_boundary and (
+                float(np.linalg.norm(vertices[edge[0]] - vertices[edge[1]]))
+                > planar_edge_target * (1.0 + 1e-8)
+            ):
+                reconstruction_boundary_edges.append(edge)
+        if reconstruction_boundary_edges:
+            vertices, faces, boundary_sample_stats = sample_region_boundary_edges(
+                vertices,
+                faces,
+                reconstruction_boundary_edges,
+                planar_edge_target,
+                tracked_edge_roots=(
+                    root_for_edge
+                    if planar_largest_opposed_pair_only
+                    else None
+                ),
+                tracked_face_labels=(
+                    region_labels
+                    if planar_largest_opposed_pair_only
+                    else None
+                ),
+            )
+            if planar_largest_opposed_pair_only:
+                hard_edges = set(root_for_edge)
+                hard_edges_array = np.asarray(
+                    sorted(hard_edges), dtype=np.int64
+                ).reshape(-1, 2)
+            print(
+                "Synchronized reconstruction boundaries: {} selected edge(s), "
+                "{} conformity samples; longest boundary edge {:.6g} -> "
+                "{:.6g}.".format(
+                    boundary_sample_stats["initial_edges"],
+                    boundary_sample_stats["splits"],
+                    boundary_sample_stats["initial_max_length"],
+                    boundary_sample_stats["final_max_length"],
+                ),
+                flush=True,
+            )
+            all_planar_regions, classification_stats = classify_planar_face_regions(
+                vertices,
+                faces,
+                protected_edges=hard_edges_array,
+                minimum_faces=classification_minimum_faces,
+                maximum_normal_angle_degrees=coplanar_angle_degrees,
+                maximum_plane_distance_ratio=coplanar_distance_ratio,
+            )
+            nonplanar_regions, nonplanar_stats = classify_nonplanar_face_regions(
+                vertices,
+                faces,
+                all_planar_regions,
+                protected_edges=hard_edges_array,
+                minimum_faces=4,
+                axial_normal_tolerance=partial_cylinder_normal_tolerance,
+                radius_tolerance=max(cylinder_radius_tolerance, 1e-2),
+            )
+            if planar_largest_opposed_pair_only:
+                inherited_labels = boundary_sample_stats["face_labels"]
+                planar_regions = [
+                    np.flatnonzero(inherited_labels == label)
+                    for label in range(selected_planar_label_count)
+                ]
+            else:
+                planar_regions = all_planar_regions
+
+        if extrusion_region_minimum_faces is not None:
+            vertices, faces, extrusion_stats = (
+                retriangulate_developable_regions(
+                    vertices,
+                    faces,
+                    nonplanar_regions["extrusions"],
+                    minimum_faces=extrusion_region_minimum_faces,
+                    maximum_target_edge_length=planar_edge_target,
+                    minimum_triangle_angle_degrees=(
+                        planar_minimum_angle_degrees
+                        if planar_minimum_angle_degrees is not None
+                        else 28.0
+                    ),
+                    maximum_input_quality=extrusion_maximum_input_quality,
+                )
+            )
+            print(
+                "Boundary-only developable reconstruction: {} / {} "
+                "poor/oversized region(s), {} screened out, {} new "
+                "vertices, {} old -> {} new faces; "
+                "quality mean {:.6g} -> {:.6g}, P5 {:.6g} -> {:.6g}; "
+                "{} parameter, {} boundary, {} "
+                "chart, {} mapped-quality rejected.".format(
+                    extrusion_stats["regions"],
+                    extrusion_stats["candidates"],
+                    extrusion_stats["screened_out"],
+                    extrusion_stats["new_vertices"],
+                    extrusion_stats["removed_faces"],
+                    extrusion_stats["new_faces"],
+                    extrusion_stats["old_quality"],
+                    extrusion_stats["new_quality"],
+                    extrusion_stats["old_quality_p5"],
+                    extrusion_stats["new_quality_p5"],
+                    extrusion_stats["parameter_rejections"],
+                    extrusion_stats["boundary_rejections"],
+                    extrusion_stats["chart_rejections"],
+                    extrusion_stats["quality_rejections"],
+                ),
+                flush=True,
+            )
+            if extrusion_stats["regions"] and planar_reconstruction_requested:
+                planar_minimum_faces = min(
+                    value
+                    for value in (
+                        planar_annulus_minimum_faces,
+                        planar_region_minimum_faces,
+                    )
+                    if value is not None
+                )
+                all_planar_regions, _ = classify_planar_face_regions(
+                    vertices,
+                    faces,
+                    protected_edges=hard_edges_array,
+                    minimum_faces=planar_minimum_faces,
+                    maximum_normal_angle_degrees=coplanar_angle_degrees,
+                    maximum_plane_distance_ratio=coplanar_distance_ratio,
+                )
+                planar_regions = all_planar_regions
+                if planar_largest_opposed_pair_only:
+                    planar_regions, _ = select_largest_opposed_planar_regions(
+                        vertices,
+                        faces,
+                        all_planar_regions,
+                    )
+
+    if planar_reconstruction_requested:
+        planar_minimum_faces = min(
+            value
+            for value in (
+                planar_annulus_minimum_faces,
+                planar_region_minimum_faces,
+            )
+            if value is not None
+        )
+        minimum_holes = 0 if planar_region_minimum_faces is not None else 1
+        maximum_holes = None if planar_annulus_minimum_faces is not None else 0
+        vertices, faces, planar_stats = retriangulate_planar_annuli(
+            vertices,
+            faces,
+            protected_edges=hard_edges_array,
+            minimum_faces=planar_minimum_faces,
+            minimum_holes=minimum_holes,
+            maximum_holes=maximum_holes,
+            maximum_target_edge_length=planar_edge_target,
+            face_regions=planar_regions,
+            solid_minimum_faces=planar_region_minimum_faces,
+            holed_minimum_faces=planar_annulus_minimum_faces,
+            minimum_triangle_angle_degrees=planar_minimum_angle_degrees,
+        )
+        print(
+            "Boundary-only planar reconstruction: {} region(s), {} new "
+            "vertices, {} old -> {} new faces; mean quality {:.6g} -> "
+            "{:.6g}; {} candidates ({} hard-constraint, {} boundary, {} "
+            "quality rejected).".format(
+                planar_stats["regions"], planar_stats["new_vertices"],
+                planar_stats["removed_faces"], planar_stats["new_faces"],
+                planar_stats["old_quality"], planar_stats["new_quality"],
+                planar_stats["candidates"],
+                planar_stats["constraint_rejections"],
+                planar_stats["boundary_rejections"],
+                planar_stats["quality_rejections"],
             ),
             flush=True,
         )
@@ -1778,28 +3564,6 @@ def refine_original_mesh_by_longest_edge(
             flush=True,
         )
 
-    if planar_region_minimum_faces is not None:
-        planar_edge_target = float(np.linalg.norm(np.ptp(vertices, axis=0))) * 0.05
-        vertices, faces, planar_stats = retriangulate_planar_annuli(
-            vertices,
-            faces,
-            protected_edges=hard_edges_array,
-            minimum_faces=planar_region_minimum_faces,
-            minimum_holes=0,
-            maximum_holes=0,
-            maximum_target_edge_length=planar_edge_target,
-        )
-        print(
-            "Solid planar region retriangulation: {} region(s), {} new "
-            "vertices, {} old -> {} new faces; mean quality {:.6g} -> "
-            "{:.6g}.".format(
-                planar_stats["regions"], planar_stats["new_vertices"],
-                planar_stats["removed_faces"], planar_stats["new_faces"],
-                planar_stats["old_quality"], planar_stats["new_quality"],
-            ),
-            flush=True,
-        )
-
     edge_faces = _build_edge_faces(faces)
     initial_lengths = np.asarray(
         [
@@ -1811,7 +3575,29 @@ def refine_original_mesh_by_longest_edge(
     initial_max_length = (
         float(initial_lengths.max()) if len(initial_lengths) else 0.0
     )
-
+    relative_tolerance = 1e-8
+    feature_split_edges = set()
+    initial_feature_lengths = []
+    if feature_target_edge_length is not None:
+        feature_length_limit = feature_target_edge_length * (
+            1.0 + relative_tolerance
+        )
+        for edge, length in zip(edge_faces, initial_lengths):
+            if edge not in root_for_edge:
+                continue
+            initial_feature_lengths.append(float(length))
+            if length > feature_length_limit:
+                feature_split_edges.add(edge)
+        print(
+            "Feature-local refinement: {} hard edges exceed {:.6g}; smooth "
+            "regions keep the global size bound.".format(
+                len(feature_split_edges), feature_target_edge_length
+            ),
+            flush=True,
+        )
+    initial_feature_max_length = (
+        max(initial_feature_lengths) if initial_feature_lengths else 0.0
+    )
     automatic_length = max_edge_length is None
     if automatic_length:
         (
@@ -1834,20 +3620,37 @@ def refine_original_mesh_by_longest_edge(
             initial_lengths,
             max_edge_length,
         )
+        feature_safety_budget = 0
+        feature_edge_estimate = 0
+        if feature_target_edge_length is not None:
+            feature_safety_budget, feature_edge_estimate = (
+                automatic_split_limit(
+                    np.asarray(initial_feature_lengths, dtype=np.float64),
+                    feature_target_edge_length,
+                )
+            )
+        max_splits = max(
+            max_splits,
+            feature_safety_budget,
+        )
         print(
-            "Automatic split limit: {} (edge-only estimate {}, 4x "
-            "conforming safety margin, minimum 100000).".format(
+            "Automatic split limit: {} (global edge-only estimate {}, "
+            "feature estimate {}, minimum "
+            "100000).".format(
                 max_splits,
                 edge_only_estimate,
+                feature_edge_estimate,
             )
         )
     max_splits = int(max_splits)
     if max_splits <= 0:
         raise ValueError("Constraint maximum splits must be positive.")
 
-    relative_tolerance = 1e-8
     length_limit = max_edge_length * (1.0 + relative_tolerance)
-    if initial_max_length <= length_limit:
+    if (
+        initial_max_length <= length_limit
+        and not feature_split_edges
+    ):
         print(
             "Strict original constraints: current longest edge {:.6g} already "
             "satisfies the {:.6g} limit; no vertices were inserted.".format(
@@ -1894,26 +3697,60 @@ def refine_original_mesh_by_longest_edge(
             "hard_edges": len(hard_edges),
             "hard_edges_split": 0,
             "splits": 0,
+            "feature_driven_splits": 0,
+            "initial_feature_split_edges": 0,
             "initial_max_length": initial_max_length,
             "final_max_length": initial_max_length,
+            "initial_feature_max_length": initial_feature_max_length,
+            "final_feature_max_length": initial_feature_max_length,
             "already_satisfied": True,
             "coplanar_flips": flip_count,
         }
 
     vertices_list = [vertex.copy() for vertex in vertices]
     faces_list = [list(map(int, face)) for face in faces]
+    feature_length_limit = (
+        feature_target_edge_length * (1.0 + relative_tolerance)
+        if feature_target_edge_length is not None
+        else None
+    )
+    def edge_requires_feature_split(edge, edge_length=None):
+        if feature_length_limit is None or edge not in root_for_edge:
+            return False
+        if edge_length is None:
+            edge_length = float(
+                np.linalg.norm(
+                    vertices_list[edge[0]] - vertices_list[edge[1]]
+                )
+            )
+        return edge_length > feature_length_limit
+
     heap = []
     for edge, length in zip(edge_faces, initial_lengths):
-        if length > length_limit:
+        if (
+            length > length_limit
+            or edge in feature_split_edges
+        ):
             heapq.heappush(heap, (-float(length), edge))
 
     print(
-        "Longest-edge refinement: {} initial edges exceed {:.6g}; "
-        "split budget {}.".format(len(heap), max_edge_length, max_splits),
+        "Longest-edge refinement: {} initial global/feature "
+        "candidates; global limit {:.6g}, feature limit {}, split budget {}."
+        .format(
+            len(heap),
+            max_edge_length,
+            (
+                "{:.6g}".format(feature_target_edge_length)
+                if feature_target_edge_length is not None
+                else "disabled"
+            ),
+            max_splits,
+        ),
         flush=True,
     )
 
     split_count = 0
+    feature_driven_split_count = 0
     split_hard_roots = set()
     split_start = time.perf_counter()
     progress_interval = 1000 if len(heap) < 20000 else 5000
@@ -1926,7 +3763,15 @@ def refine_original_mesh_by_longest_edge(
                 vertices_list[edge[0]] - vertices_list[edge[1]]
             )
         )
-        if current_length <= length_limit:
+        global_split_required = current_length > length_limit
+        feature_split_required = edge_requires_feature_split(
+            edge,
+            edge_length=current_length,
+        )
+        if not (
+            global_split_required
+            or feature_split_required
+        ):
             continue
         if current_length < -negative_length * (1.0 - 1e-12):
             continue
@@ -1935,7 +3780,8 @@ def refine_original_mesh_by_longest_edge(
         if not incident_faces:
             del edge_faces[edge]
             continue
-
+        if feature_split_required:
+            feature_driven_split_count += 1
         midpoint_index = len(vertices_list)
         midpoint = (
             vertices_list[edge[0]] + vertices_list[edge[1]]
@@ -1997,7 +3843,13 @@ def refine_original_mesh_by_longest_edge(
                     - vertices_list[new_edge[1]]
                 )
             )
-            if new_length > length_limit:
+            if (
+                new_length > length_limit
+                or edge_requires_feature_split(
+                    new_edge,
+                    edge_length=new_length,
+                )
+            ):
                 heapq.heappush(heap, (-new_length, new_edge))
         split_count += 1
         if split_count % progress_interval == 0:
@@ -2030,7 +3882,33 @@ def refine_original_mesh_by_longest_edge(
                 longest_remaining,
             )
         )
-
+    remaining_feature_edges = []
+    if feature_target_edge_length is not None:
+        for edge in root_for_edge:
+            if edge not in edge_faces:
+                continue
+            length = float(
+                np.linalg.norm(
+                    vertices_list[edge[0]] - vertices_list[edge[1]]
+                )
+            )
+            if length > feature_length_limit:
+                remaining_feature_edges.append((edge, length))
+    if remaining_feature_edges:
+        longest_remaining = max(
+            length for _, length in remaining_feature_edges
+        )
+        raise RuntimeError(
+            "Constraint split limit {} was reached with {} hard feature "
+            "edges still over the {:.6g} local target; longest remaining "
+            "feature edge is {:.6g}. Increase max_splits or relax the "
+            "feature target.".format(
+                max_splits,
+                len(remaining_feature_edges),
+                feature_target_edge_length,
+                longest_remaining,
+            )
+        )
     refined_vertices = np.asarray(vertices_list, dtype=np.float64)
     refined_faces = np.asarray(faces_list, dtype=np.int64)
     if planar_fan_minimum_valence is not None:
@@ -2099,6 +3977,18 @@ def refine_original_mesh_by_longest_edge(
         for edge in edge_faces
     ]
     final_max_length = max(final_lengths) if final_lengths else 0.0
+    final_feature_lengths = [
+        float(
+            np.linalg.norm(
+                refined_vertices[edge[0]] - refined_vertices[edge[1]]
+            )
+        )
+        for edge in root_for_edge
+        if edge in edge_faces
+    ]
+    final_feature_max_length = (
+        max(final_feature_lengths) if final_feature_lengths else 0.0
+    )
     print(
         "Strict original constraints: {} hard edges at > {:.6g} degrees; "
         "{} longest-edge splits ({} hard feature chains refined).".format(
@@ -2123,6 +4013,16 @@ def refine_original_mesh_by_longest_edge(
             max_edge_length,
         )
     )
+    if feature_target_edge_length is not None:
+        print(
+            "Feature-local longest edge: {:.6g} -> {:.6g} (limit {:.6g}); "
+            "{} targeted feature splits.".format(
+                initial_feature_max_length,
+                final_feature_max_length,
+                feature_target_edge_length,
+                feature_driven_split_count,
+            )
+        )
     return (
         refined_vertices,
         refined_faces,
@@ -2130,8 +4030,12 @@ def refine_original_mesh_by_longest_edge(
             "hard_edges": len(original_hard_lengths),
             "hard_edges_split": len(split_hard_roots),
             "splits": split_count,
+            "feature_driven_splits": feature_driven_split_count,
+            "initial_feature_split_edges": len(feature_split_edges),
             "initial_max_length": initial_max_length,
             "final_max_length": final_max_length,
+            "initial_feature_max_length": initial_feature_max_length,
+            "final_feature_max_length": final_feature_max_length,
             "already_satisfied": False,
             "coplanar_flips": flip_count,
         },
