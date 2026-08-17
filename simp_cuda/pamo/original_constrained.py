@@ -241,6 +241,8 @@ def retriangulate_planar_annuli(
     skip_satisfactory_quality=False,
     minimum_region_area=None,
     gradual_target_spacing=True,
+    required_boundary_vertex_range=None,
+    minimum_boundary_length_ratio=None,
 ):
     """Uniformly retriangulate exact planar facets with constrained boundaries."""
     vertices = np.asarray(vertices, dtype=np.float64)
@@ -355,6 +357,28 @@ def retriangulate_planar_annuli(
                 for polygon in polygons
             ]
         )
+        if required_boundary_vertex_range is not None:
+            required_start, required_end = map(
+                int, required_boundary_vertex_range
+            )
+            if not np.any(
+                (boundary_vertex_ids >= required_start)
+                & (boundary_vertex_ids < required_end)
+            ):
+                continue
+        if minimum_boundary_length_ratio is not None:
+            positive_boundary_lengths = boundary_lengths[
+                boundary_lengths > 0.0
+            ]
+            if len(positive_boundary_lengths) == 0:
+                continue
+            fine_boundary_length = float(
+                np.percentile(positive_boundary_lengths, 25.0)
+            )
+            if float(positive_boundary_lengths.max()) < (
+                fine_boundary_length * float(minimum_boundary_length_ratio)
+            ):
+                continue
         if (
             maximum_result_edge_length is not None
             and len(boundary_lengths)
@@ -2181,6 +2205,7 @@ def _planar_transition_edge_targets(
     growth_ratio=1.25,
     generated_vertex_range=None,
     minimum_boundary_ratio=4.0,
+    minimum_local_target=None,
 ):
     """Find coarse boundaries around small, poor planar transition strips."""
     vertices = np.asarray(vertices, dtype=np.float64)
@@ -2241,6 +2266,11 @@ def _planar_transition_edge_targets(
             float(maximum_edge_length),
             fine_boundary_length * float(growth_ratio),
         )
+        if minimum_local_target is not None:
+            local_target = min(
+                float(maximum_edge_length),
+                max(local_target, float(minimum_local_target)),
+            )
         if not np.isfinite(local_target) or local_target <= 0.0:
             continue
         selected = 0
@@ -2938,6 +2968,54 @@ def refine_original_mesh_by_longest_edge(
                 ),
                 flush=True,
             )
+            grading_start = time.perf_counter()
+            current_vertices, current_faces, grading_stats = (
+                retriangulate_planar_annuli(
+                    current_vertices,
+                    current_faces,
+                    protected_edges=current_hard_edges,
+                    minimum_faces=min(8, int(planar_region_minimum_faces)),
+                    minimum_holes=0,
+                    maximum_holes=0,
+                    maximum_target_edge_length=planar_edge_target,
+                    maximum_result_edge_length=edge_target,
+                    minimum_angle_degrees=28.0,
+                    accept_strong_mean_gain=True,
+                    skip_satisfactory_quality=False,
+                    minimum_region_area=None,
+                    # Seed a coarse interior grid; Triangle adds only the
+                    # quality-required rings near the dense curved boundary,
+                    # producing a genuinely graded size transition.
+                    gradual_target_spacing=False,
+                    required_boundary_vertex_range=(
+                        curved_generated_vertex_start,
+                        curved_generated_vertex_end,
+                    ),
+                    minimum_boundary_length_ratio=4.0,
+                )
+            )
+            grading_elapsed = time.perf_counter() - grading_start
+            stage_timings.append(
+                ("curve-adjacent planar grading", grading_elapsed)
+            )
+            print(
+                "Curve-adjacent planar grading: {} region(s), {} new "
+                "vertices, {} old -> {} new faces; mean quality {:.6g} -> "
+                "{:.6g}; {} candidates ({} boundary, {} quality rejected); "
+                "time {:.3f}s.".format(
+                    grading_stats["regions"],
+                    grading_stats["new_vertices"],
+                    grading_stats["removed_faces"],
+                    grading_stats["new_faces"],
+                    grading_stats["old_quality"],
+                    grading_stats["new_quality"],
+                    grading_stats["candidates"],
+                    grading_stats["boundary_rejections"],
+                    grading_stats["quality_rejections"],
+                    grading_elapsed,
+                ),
+                flush=True,
+            )
             transition_targets, transition_regions = (
                 _planar_transition_edge_targets(
                     current_vertices,
@@ -2954,6 +3032,7 @@ def refine_original_mesh_by_longest_edge(
             )
             if transition_targets:
                 transition_start = time.perf_counter()
+                transition_vertex_start = len(current_vertices)
                 (
                     current_vertices,
                     current_faces,
@@ -3018,6 +3097,122 @@ def refine_original_mesh_by_longest_edge(
                     ),
                     flush=True,
                 )
+                outer_seed_range = (
+                    transition_vertex_start,
+                    len(current_vertices),
+                )
+                transition_base_target = float(
+                    np.median(list(transition_targets.values()))
+                )
+                for ring_index in range(3):
+                    ring_target = min(
+                        float(edge_target),
+                        transition_base_target * (2.0 ** (ring_index + 1)),
+                    )
+                    outer_targets, outer_regions = (
+                        _planar_transition_edge_targets(
+                            current_vertices,
+                            current_faces,
+                            current_hard_edges,
+                            minimum_faces=min(
+                                8, int(planar_region_minimum_faces)
+                            ),
+                            maximum_region_area=(
+                                minimum_planar_area * (4.0 ** (ring_index + 1))
+                            ),
+                            maximum_edge_length=edge_target,
+                            maximum_quality_p5=1.01,
+                            growth_ratio=2.0,
+                            generated_vertex_range=outer_seed_range,
+                            minimum_boundary_ratio=2.0,
+                            minimum_local_target=ring_target,
+                        )
+                    )
+                    if not outer_targets:
+                        break
+                    outer_grading_start = time.perf_counter()
+                    outer_vertex_start = len(current_vertices)
+                    (
+                        current_vertices,
+                        current_faces,
+                        updated_lineages,
+                        updated_coplanar_edges,
+                        outer_split_stats,
+                    ) = _split_selected_edges_by_length(
+                        current_vertices,
+                        current_faces,
+                        outer_targets,
+                        edge_lineages=root_for_edge,
+                        propagated_edges=coplanar_edges,
+                    )
+                    if outer_split_stats["hit_split_limit"]:
+                        raise RuntimeError(
+                            "Outer planar transition split limit was reached."
+                        )
+                    root_for_edge.clear()
+                    root_for_edge.update(updated_lineages)
+                    coplanar_edges.clear()
+                    coplanar_edges.update(updated_coplanar_edges)
+                    current_hard_edges = np.asarray(
+                        sorted(root_for_edge), dtype=np.int64
+                    ).reshape(-1, 2)
+                    outer_split_end = len(current_vertices)
+                    current_vertices, current_faces, outer_stats = (
+                        retriangulate_planar_annuli(
+                            current_vertices,
+                            current_faces,
+                            protected_edges=current_hard_edges,
+                            minimum_faces=min(
+                                8, int(planar_region_minimum_faces)
+                            ),
+                            minimum_holes=0,
+                            maximum_holes=0,
+                            maximum_target_edge_length=ring_target,
+                            maximum_result_edge_length=edge_target,
+                            minimum_angle_degrees=28.0,
+                            accept_strong_mean_gain=True,
+                            skip_satisfactory_quality=False,
+                            minimum_region_area=None,
+                            gradual_target_spacing=False,
+                            required_boundary_vertex_range=(
+                                outer_vertex_start,
+                                outer_split_end,
+                            ),
+                        )
+                    )
+                    outer_grading_elapsed = (
+                        time.perf_counter() - outer_grading_start
+                    )
+                    stage_timings.append(
+                        (
+                            "outer planar transition ring {}".format(
+                                ring_index + 1
+                            ),
+                            outer_grading_elapsed,
+                        )
+                    )
+                    print(
+                        "Outer planar transition ring {} (target {:.6g}): {} "
+                        "region(s), {} "
+                        "conforming edge split(s), {} rebuilt region(s), {} "
+                        "new interior vertices; mean quality {:.6g} -> "
+                        "{:.6g}; time {:.3f}s.".format(
+                            ring_index + 1,
+                            ring_target,
+                            outer_regions,
+                            outer_split_stats["splits"],
+                            outer_stats["regions"],
+                            outer_stats["new_vertices"],
+                            outer_stats["old_quality"],
+                            outer_stats["new_quality"],
+                            outer_grading_elapsed,
+                        ),
+                        flush=True,
+                    )
+                    outer_seed_range = (
+                        outer_vertex_start,
+                        len(current_vertices),
+                    )
         return current_vertices, current_faces
 
     def print_timing_summary():
