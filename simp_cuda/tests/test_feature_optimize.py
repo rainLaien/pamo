@@ -49,6 +49,18 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
+    def test_uniform_target_spacing_can_use_direct_planar_target(self):
+        self.assertAlmostEqual(
+            original_constrained._uniform_target_spacing(1.0, 10.0),
+            1.25,
+        )
+        self.assertAlmostEqual(
+            original_constrained._uniform_target_spacing(
+                1.0, 10.0, gradual=False
+            ),
+            10.0,
+        )
+
     def test_short_coplanar_edge_collapse_preserves_boundary_and_quality(self):
         vertices = np.asarray(
             (
@@ -550,12 +562,22 @@ class FeatureOptimizeTest(unittest.TestCase):
 
         result_vertices, result_faces, stats = (
             original_constrained.retriangulate_planar_annuli(
-                vertices, faces, minimum_faces=20
+                vertices,
+                faces,
+                minimum_faces=20,
+                maximum_target_edge_length=10.0,
+                maximum_result_edge_length=10.0,
+                minimum_angle_degrees=28.0,
+                gradual_target_spacing=False,
             )
         )
         qualities = feature_optimize._triangle_quality_values(
             result_vertices, result_faces
         )
+        triangles = result_vertices[result_faces]
+        edge_lengths = np.linalg.norm(
+            triangles[:, (1, 2, 0)] - triangles[:, (0, 1, 2)], axis=2
+        ).reshape(-1)
         result_edges = {
             tuple(sorted((int(first), int(second))))
             for face in result_faces
@@ -565,7 +587,12 @@ class FeatureOptimizeTest(unittest.TestCase):
         }
 
         self.assertEqual(stats["regions"], 1)
-        self.assertGreater(float(np.percentile(qualities, 5.0)), 0.7)
+        self.assertGreater(stats["new_vertices"], 0)
+        self.assertGreater(float(np.percentile(qualities, 5.0)), 0.65)
+        edge_percentiles = np.percentile(edge_lengths, (10.0, 50.0, 90.0))
+        self.assertLess(float(edge_percentiles[0]), float(edge_percentiles[1]))
+        self.assertLess(float(edge_percentiles[1]), float(edge_percentiles[2]))
+        self.assertLessEqual(float(edge_lengths.max()), 10.0 + 1e-8)
         for offset in (0, count):
             self.assertTrue(
                 all(

@@ -119,14 +119,18 @@ def _polygon_interior_point(polygon):
     return centroids[candidate_ids[np.argmax(np.abs(crosses[candidate_ids]))]]
 
 
-def _uniform_target_spacing(measured_spacing, preferred_edge_length):
-    """Move generated interiors gradually toward one target size."""
+def _uniform_target_spacing(
+    measured_spacing, preferred_edge_length, gradual=True
+):
+    """Move generated interiors toward one target size."""
     measured_spacing = float(measured_spacing)
     if preferred_edge_length is None:
         return measured_spacing
     preferred_edge_length = float(preferred_edge_length)
     if not np.isfinite(preferred_edge_length) or preferred_edge_length <= 0.0:
         raise ValueError("Preferred remeshing edge length must be positive.")
+    if not gradual:
+        return preferred_edge_length
     gradual_lower_bound = min(
         preferred_edge_length * 0.8,
         measured_spacing * 1.25,
@@ -236,6 +240,7 @@ def retriangulate_planar_annuli(
     accept_strong_mean_gain=False,
     skip_satisfactory_quality=False,
     minimum_region_area=None,
+    gradual_target_spacing=True,
 ):
     """Uniformly retriangulate exact planar facets with constrained boundaries."""
     vertices = np.asarray(vertices, dtype=np.float64)
@@ -389,7 +394,9 @@ def retriangulate_planar_annuli(
         )
         spacing = max(spacing, density_spacing)
         spacing = _uniform_target_spacing(
-            spacing, maximum_target_edge_length
+            spacing,
+            maximum_target_edge_length,
+            gradual=gradual_target_spacing,
         )
 
         all_boundary_2d = np.vstack(polygons)
@@ -2593,9 +2600,11 @@ def refine_original_mesh_by_longest_edge(
         current_vertices, current_faces, current_hard_edges, edge_target
     ):
         """Rebuild planes only after curved shared boundaries are subdivided."""
-        # Triangle-grid spacing is not itself a strict edge bound: diagonals
-        # near constrained boundaries can be slightly longer. Keep headroom.
-        planar_edge_target = float(edge_target) * 0.7
+        # Use the same requested scale as the rest of constrained refinement.
+        # Transition edges are checked against ``edge_target`` below, so a
+        # planar rebuild that cannot satisfy the strict limit is rejected
+        # instead of globally shrinking every large planar face.
+        planar_edge_target = float(edge_target)
         minimum_planar_area = planar_edge_target * planar_edge_target * 2.0
         print(
             "Planar generated-edge target: {:.6g}; minimum rebuilt region "
@@ -2612,9 +2621,14 @@ def refine_original_mesh_by_longest_edge(
                     minimum_faces=planar_annulus_minimum_faces,
                     maximum_target_edge_length=planar_edge_target,
                     maximum_result_edge_length=edge_target,
+                    # Dense hole contours need quality-driven Steiner points
+                    # so their small boundary edges grow into the coarse
+                    # planar target through several transition rings.
+                    minimum_angle_degrees=28.0,
                     accept_strong_mean_gain=True,
                     skip_satisfactory_quality=True,
                     minimum_region_area=minimum_planar_area,
+                    gradual_target_spacing=False,
                 )
             )
             planar_elapsed = time.perf_counter() - planar_start
@@ -2635,6 +2649,53 @@ def refine_original_mesh_by_longest_edge(
                 ),
                 flush=True,
             )
+            if (
+                annulus_stats["boundary_rejections"]
+                or annulus_stats["quality_rejections"]
+            ):
+                fallback_start = time.perf_counter()
+                current_vertices, current_faces, fallback_stats = (
+                    retriangulate_planar_annuli(
+                        current_vertices,
+                        current_faces,
+                        protected_edges=current_hard_edges,
+                        minimum_faces=planar_annulus_minimum_faces,
+                        maximum_target_edge_length=planar_edge_target,
+                        maximum_result_edge_length=edge_target,
+                        minimum_angle_degrees=28.0,
+                        accept_strong_mean_gain=True,
+                        skip_satisfactory_quality=True,
+                        minimum_region_area=minimum_planar_area,
+                        # Complex multi-hole planes can reject the coarse
+                        # first pass. Retry only those remaining regions with
+                        # conservative growth from their dense boundary size.
+                        gradual_target_spacing=True,
+                    )
+                )
+                fallback_elapsed = time.perf_counter() - fallback_start
+                stage_timings.append(
+                    ("planar hole transition fallback", fallback_elapsed)
+                )
+                print(
+                    "Conservative planar-hole transition fallback: {} "
+                    "region(s), {} new vertices, {} old -> {} new faces; "
+                    "mean quality {:.6g} -> {:.6g}; {} candidates ({} "
+                    "hard-constraint, {} boundary, {} quality rejected); "
+                    "time {:.3f}s.".format(
+                        fallback_stats["regions"],
+                        fallback_stats["new_vertices"],
+                        fallback_stats["removed_faces"],
+                        fallback_stats["new_faces"],
+                        fallback_stats["old_quality"],
+                        fallback_stats["new_quality"],
+                        fallback_stats["candidates"],
+                        fallback_stats["constraint_rejections"],
+                        fallback_stats["boundary_rejections"],
+                        fallback_stats["quality_rejections"],
+                        fallback_elapsed,
+                    ),
+                    flush=True,
+                )
         if planar_region_minimum_faces is not None:
             planar_start = time.perf_counter()
             current_vertices, current_faces, planar_stats = (
@@ -2651,6 +2712,10 @@ def refine_original_mesh_by_longest_edge(
                     accept_strong_mean_gain=True,
                     skip_satisfactory_quality=True,
                     minimum_region_area=minimum_planar_area,
+                    # Solid planes do not have an inner contour to seed a
+                    # graded transition. Keep their conservative growth rule
+                    # to avoid long triangles along dense outer boundaries.
+                    gradual_target_spacing=True,
                 )
             )
             planar_elapsed = time.perf_counter() - planar_start

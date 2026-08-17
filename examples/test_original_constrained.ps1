@@ -10,9 +10,9 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
-$inputPath = Join-Path $projectRoot "examples\222.stl"
+$inputPath = Join-Path $projectRoot "examples\Unnamed-Body.stl"
 $outputDirectory = Join-Path $projectRoot "examples\test_outputs"
-$outputPath = Join-Path $outputDirectory "222_constrained.stl"
+$outputPath = Join-Path $outputDirectory "111_constrained.stl"
 $logPath = Join-Path $outputDirectory "222_constrained.log"
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
