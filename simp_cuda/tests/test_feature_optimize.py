@@ -49,6 +49,49 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
+    def test_targeted_edge_splits_are_conforming_and_keep_lineage(self):
+        vertices = np.asarray(
+            (
+                (0.0, 0.0, 0.0),
+                (4.0, 0.0, 0.0),
+                (4.0, 1.0, 0.0),
+                (0.0, 1.0, 0.0),
+            )
+        )
+        faces = np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64)
+        diagonal = (0, 2)
+        (
+            result_vertices,
+            result_faces,
+            result_lineages,
+            _,
+            stats,
+        ) = original_constrained._split_selected_edges_by_length(
+            vertices,
+            faces,
+            {diagonal: 1.1},
+            edge_lineages={diagonal: 7},
+        )
+        lineage_lengths = [
+            np.linalg.norm(result_vertices[first] - result_vertices[second])
+            for (first, second), root in result_lineages.items()
+            if root == 7
+        ]
+        edge_memberships = original_constrained._build_edge_faces(result_faces)
+
+        self.assertEqual(stats["splits"], 3)
+        self.assertFalse(stats["hit_split_limit"])
+        self.assertEqual(len(lineage_lengths), 4)
+        self.assertLessEqual(max(lineage_lengths), 1.1)
+        self.assertAlmostEqual(sum(lineage_lengths), np.sqrt(17.0))
+        self.assertTrue(
+            all(
+                len(edge_memberships[edge]) == 2
+                for edge, root in result_lineages.items()
+                if root == 7
+            )
+        )
+
     def test_uniform_target_spacing_can_use_direct_planar_target(self):
         self.assertAlmostEqual(
             original_constrained._uniform_target_spacing(1.0, 10.0),

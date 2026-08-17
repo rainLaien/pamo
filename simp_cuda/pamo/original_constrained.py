@@ -2170,6 +2170,205 @@ def _constraint_split_face(face, edge, midpoint_index):
     raise RuntimeError("Split edge is missing from an incident face.")
 
 
+def _planar_transition_edge_targets(
+    vertices,
+    faces,
+    protected_edges,
+    minimum_faces,
+    maximum_region_area,
+    maximum_edge_length,
+    maximum_quality_p5=0.25,
+    growth_ratio=1.25,
+    generated_vertex_range=None,
+    minimum_boundary_ratio=4.0,
+):
+    """Find coarse boundaries around small, poor planar transition strips."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    protected = {
+        tuple(sorted((int(edge[0]), int(edge[1]))))
+        for edge in np.asarray(protected_edges, dtype=np.int64).reshape(-1, 2)
+    }
+    targets = {}
+    region_count = 0
+    for facet, boundary_edges in zip(mesh.facets, mesh.facets_boundary):
+        facet = np.asarray(facet, dtype=np.int64)
+        if len(facet) < int(minimum_faces):
+            continue
+        facet_area = float(mesh.area_faces[facet].sum())
+        if facet_area >= float(maximum_region_area):
+            continue
+        cycles = _ordered_cycles_from_edges(boundary_edges)
+        if cycles is None or len(cycles) != 1:
+            continue
+        quality = _triangle_quality_values(vertices, faces[facet])
+        if float(np.percentile(quality, 5.0)) >= float(maximum_quality_p5):
+            continue
+        boundary_edges = np.asarray(boundary_edges, dtype=np.int64).reshape(-1, 2)
+        if generated_vertex_range is not None:
+            generated_start, generated_end = map(int, generated_vertex_range)
+            boundary_vertices = np.unique(boundary_edges)
+            if not np.any(
+                (boundary_vertices >= generated_start)
+                & (boundary_vertices < generated_end)
+            ):
+                continue
+        boundary_set = {
+            tuple(sorted((int(edge[0]), int(edge[1]))))
+            for edge in boundary_edges
+        }
+        facet_edges = {
+            edge
+            for face in faces[facet]
+            for edge in _constraint_face_edges(face)
+        }
+        if (facet_edges & protected) - boundary_set:
+            continue
+        lengths = np.linalg.norm(
+            vertices[boundary_edges[:, 0]] - vertices[boundary_edges[:, 1]],
+            axis=1,
+        )
+        positive = lengths[lengths > 0.0]
+        if len(positive) == 0:
+            continue
+        fine_boundary_length = float(np.percentile(positive, 25.0))
+        if float(positive.max()) < (
+            fine_boundary_length * float(minimum_boundary_ratio)
+        ):
+            continue
+        local_target = min(
+            float(maximum_edge_length),
+            fine_boundary_length * float(growth_ratio),
+        )
+        if not np.isfinite(local_target) or local_target <= 0.0:
+            continue
+        selected = 0
+        for edge, length in zip(boundary_edges, lengths):
+            if float(length) <= local_target * (1.0 + 1e-8):
+                continue
+            key = tuple(sorted((int(edge[0]), int(edge[1]))))
+            targets[key] = min(targets.get(key, local_target), local_target)
+            selected += 1
+        if selected:
+            region_count += 1
+    return targets, region_count
+
+
+def _split_selected_edges_by_length(
+    vertices,
+    faces,
+    edge_targets,
+    edge_lineages=None,
+    propagated_edges=None,
+    maximum_splits=100000,
+):
+    """Conformingly bisect selected edges and propagate tracked edge state."""
+    vertices_list = [
+        np.asarray(vertex, dtype=np.float64).copy() for vertex in vertices
+    ]
+    faces_list = [list(map(int, face)) for face in np.asarray(faces)]
+    active_targets = {
+        tuple(sorted((int(edge[0]), int(edge[1])))): float(target)
+        for edge, target in edge_targets.items()
+    }
+    lineages = dict(edge_lineages or {})
+    propagated = set(propagated_edges or ())
+    edge_faces = _build_edge_faces(np.asarray(faces_list, dtype=np.int64))
+    heap = []
+    for edge, target in active_targets.items():
+        length = float(
+            np.linalg.norm(vertices_list[edge[0]] - vertices_list[edge[1]])
+        )
+        heapq.heappush(heap, (-length, edge, target))
+
+    split_count = 0
+    while heap and split_count < int(maximum_splits):
+        _, edge, queued_target = heapq.heappop(heap)
+        target = active_targets.get(edge)
+        if target is None or not np.isclose(target, queued_target):
+            continue
+        length = float(
+            np.linalg.norm(vertices_list[edge[0]] - vertices_list[edge[1]])
+        )
+        if length <= target * (1.0 + 1e-8):
+            del active_targets[edge]
+            continue
+        incident_faces = sorted(edge_faces.get(edge, ()))
+        if not incident_faces:
+            del active_targets[edge]
+            continue
+
+        midpoint_index = len(vertices_list)
+        vertices_list.append(
+            (vertices_list[edge[0]] + vertices_list[edge[1]]) * 0.5
+        )
+        replacements = []
+        for face_index in incident_faces:
+            first, second = _constraint_split_face(
+                faces_list[face_index], edge, midpoint_index
+            )
+            replacements.append((face_index, first, second))
+        for face_index, first, second in replacements:
+            for old_edge in _constraint_face_edges(faces_list[face_index]):
+                memberships = edge_faces.get(old_edge)
+                if memberships is not None:
+                    memberships.discard(face_index)
+                    if not memberships:
+                        del edge_faces[old_edge]
+            faces_list[face_index] = first
+            second_index = len(faces_list)
+            faces_list.append(second)
+            for new_edge in _constraint_face_edges(first):
+                edge_faces.setdefault(new_edge, set()).add(face_index)
+            for new_edge in _constraint_face_edges(second):
+                edge_faces.setdefault(new_edge, set()).add(second_index)
+
+        del active_targets[edge]
+        children = (
+            tuple(sorted((edge[0], midpoint_index))),
+            tuple(sorted((midpoint_index, edge[1]))),
+        )
+        root_index = lineages.pop(edge, None)
+        if root_index is not None:
+            lineages[children[0]] = root_index
+            lineages[children[1]] = root_index
+        if edge in propagated:
+            propagated.discard(edge)
+            propagated.update(children)
+        for child in children:
+            active_targets[child] = target
+            child_length = float(
+                np.linalg.norm(
+                    vertices_list[child[0]] - vertices_list[child[1]]
+                )
+            )
+            heapq.heappush(heap, (-child_length, child, target))
+        split_count += 1
+
+    remaining_max = 0.0
+    for edge in active_targets:
+        remaining_max = max(
+            remaining_max,
+            float(
+                np.linalg.norm(
+                    vertices_list[edge[0]] - vertices_list[edge[1]]
+                )
+            ),
+        )
+    return (
+        np.asarray(vertices_list, dtype=np.float64),
+        np.asarray(faces_list, dtype=np.int64),
+        lineages,
+        propagated,
+        {
+            "splits": split_count,
+            "remaining_max_length": remaining_max,
+            "hit_split_limit": bool(active_targets),
+        },
+    )
+
+
 def _build_edge_faces(faces):
     edge_faces = {}
     for face_index, face in enumerate(faces):
@@ -2470,6 +2669,7 @@ def refine_original_mesh_by_longest_edge(
             flush=True,
         )
 
+    curved_generated_vertex_start = len(vertices)
     if cylinder_minimum_faces is not None:
         stage_start = time.perf_counter()
         vertices, faces, cylinder_stats = retriangulate_cylindrical_walls(
@@ -2595,6 +2795,8 @@ def refine_original_mesh_by_longest_edge(
             ),
             flush=True,
         )
+
+    curved_generated_vertex_end = len(vertices)
 
     def retriangulate_planar_after_boundary_refinement(
         current_vertices, current_faces, current_hard_edges, edge_target
@@ -2736,6 +2938,86 @@ def refine_original_mesh_by_longest_edge(
                 ),
                 flush=True,
             )
+            transition_targets, transition_regions = (
+                _planar_transition_edge_targets(
+                    current_vertices,
+                    current_faces,
+                    current_hard_edges,
+                    minimum_faces=planar_region_minimum_faces,
+                    maximum_region_area=minimum_planar_area,
+                    maximum_edge_length=edge_target,
+                    generated_vertex_range=(
+                        curved_generated_vertex_start,
+                        curved_generated_vertex_end,
+                    ),
+                )
+            )
+            if transition_targets:
+                transition_start = time.perf_counter()
+                (
+                    current_vertices,
+                    current_faces,
+                    updated_lineages,
+                    updated_coplanar_edges,
+                    split_stats,
+                ) = _split_selected_edges_by_length(
+                    current_vertices,
+                    current_faces,
+                    transition_targets,
+                    edge_lineages=root_for_edge,
+                    propagated_edges=coplanar_edges,
+                )
+                if split_stats["hit_split_limit"]:
+                    raise RuntimeError(
+                        "Planar transition-edge split limit was reached."
+                    )
+                root_for_edge.clear()
+                root_for_edge.update(updated_lineages)
+                coplanar_edges.clear()
+                coplanar_edges.update(updated_coplanar_edges)
+                current_hard_edges = np.asarray(
+                    sorted(root_for_edge), dtype=np.int64
+                ).reshape(-1, 2)
+                current_vertices, current_faces, transition_stats = (
+                    retriangulate_planar_annuli(
+                        current_vertices,
+                        current_faces,
+                        protected_edges=current_hard_edges,
+                        minimum_faces=planar_region_minimum_faces,
+                        minimum_holes=0,
+                        maximum_holes=0,
+                        maximum_target_edge_length=planar_edge_target,
+                        maximum_result_edge_length=edge_target,
+                        minimum_angle_degrees=28.0,
+                        accept_strong_mean_gain=True,
+                        skip_satisfactory_quality=True,
+                        # This recovery iteration intentionally includes the
+                        # narrow planar strips skipped by the main area gate.
+                        minimum_region_area=None,
+                        gradual_target_spacing=True,
+                    )
+                )
+                transition_elapsed = time.perf_counter() - transition_start
+                stage_timings.append(
+                    ("curve-to-plane transition recovery", transition_elapsed)
+                )
+                print(
+                    "Curve-to-plane transition recovery: {} narrow region(s), "
+                    "{} conforming edge split(s), {} planar region(s), {} "
+                    "new interior vertices, {} old -> {} new faces; mean "
+                    "quality {:.6g} -> {:.6g}; time {:.3f}s.".format(
+                        transition_regions,
+                        split_stats["splits"],
+                        transition_stats["regions"],
+                        transition_stats["new_vertices"],
+                        transition_stats["removed_faces"],
+                        transition_stats["new_faces"],
+                        transition_stats["old_quality"],
+                        transition_stats["new_quality"],
+                        transition_elapsed,
+                    ),
+                    flush=True,
+                )
         return current_vertices, current_faces
 
     def print_timing_summary():
@@ -2831,6 +3113,9 @@ def refine_original_mesh_by_longest_edge(
                 max_edge_length,
             )
         )
+        optimized_hard_edges = np.asarray(
+            sorted(root_for_edge), dtype=np.int64
+        ).reshape(-1, 2)
         collapse_count = 0
         if short_edge_collapse_passes and short_edge_collapse_ratio > 0.0:
             stage_start = time.perf_counter()
@@ -2838,7 +3123,7 @@ def refine_original_mesh_by_longest_edge(
                 collapse_short_coplanar_edges(
                     optimized_vertices,
                     optimized_faces,
-                    hard_edges_array,
+                    optimized_hard_edges,
                     maximum_short_edge_length=(
                         max_edge_length * float(short_edge_collapse_ratio)
                     ),
@@ -2860,7 +3145,7 @@ def refine_original_mesh_by_longest_edge(
                 retriangulate_planar_fans(
                     optimized_vertices,
                     optimized_faces,
-                    hard_edges_array,
+                    optimized_hard_edges,
                     minimum_valence=planar_fan_minimum_valence,
                     maximum_planar_angle_degrees=coplanar_angle_degrees,
                 )
@@ -2878,7 +3163,7 @@ def refine_original_mesh_by_longest_edge(
         optimized_faces, flip_count = _flip_quality_edges(
             optimized_vertices,
             optimized_faces,
-            hard_edges_array,
+            optimized_hard_edges,
             passes=flip_passes,
             maximum_dihedral_degrees=coplanar_angle_degrees,
             maximum_edge_length=max_edge_length,
@@ -3072,6 +3357,9 @@ def refine_original_mesh_by_longest_edge(
             max_edge_length,
         )
     )
+    current_hard_edges = np.asarray(
+        sorted(root_for_edge), dtype=np.int64
+    ).reshape(-1, 2)
     collapse_count = 0
     if short_edge_collapse_passes and short_edge_collapse_ratio > 0.0:
         stage_start = time.perf_counter()
