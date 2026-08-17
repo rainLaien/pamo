@@ -146,6 +146,81 @@ class FeatureOptimizeTest(unittest.TestCase):
         self.assertGreater(stats["new_quality_p5"], stats["old_quality_p5"])
         self.assertGreater(float(qualities.mean()), 0.5)
 
+    def test_slightly_tapered_fillet_band_uses_relaxed_safe_fit(self):
+        count = 33
+        angles = np.linspace(0.0, 0.5 * np.pi, count)
+        lower_radius = 5.0
+        upper_radius = 6.5
+        length = 10.0
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (
+                        lower_radius * np.cos(angles),
+                        np.zeros(count),
+                        lower_radius * np.sin(angles),
+                    )
+                ),
+                np.column_stack(
+                    (
+                        upper_radius * np.cos(angles),
+                        np.full(count, length),
+                        upper_radius * np.sin(angles),
+                    )
+                ),
+            )
+        )
+        faces = []
+        for index in range(count - 1):
+            faces.extend(
+                (
+                    [index, index + 1, count + index],
+                    [index + 1, count + index + 1, count + index],
+                )
+            )
+        faces = np.asarray(faces, dtype=np.int64)
+        common_options = dict(
+            minimum_faces=12,
+            normal_tolerance=0.12,
+            minimum_angle_degrees=5.0,
+            target_edge_ratio=2.0,
+            isolate_rounded_faces=True,
+            minimum_curvature_degrees=0.2,
+            maximum_source_quality=0.15,
+            minimum_triangle_angle_degrees=28.0,
+            minimum_radial_alignment=0.95,
+        )
+
+        _, _, strict_stats = (
+            original_constrained.retriangulate_partial_cylindrical_walls(
+                vertices,
+                faces,
+                np.empty((0, 2), dtype=np.int64),
+                radius_tolerance=0.01,
+                **common_options,
+            )
+        )
+        result_vertices, result_faces, relaxed_stats = (
+            original_constrained.retriangulate_partial_cylindrical_walls(
+                vertices,
+                faces,
+                np.empty((0, 2), dtype=np.int64),
+                radius_tolerance=0.05,
+                **common_options,
+            )
+        )
+        qualities = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+
+        self.assertEqual(strict_stats["patches"], 0)
+        self.assertEqual(relaxed_stats["patches"], 1)
+        self.assertGreater(
+            relaxed_stats["new_quality_p5"],
+            relaxed_stats["old_quality_p5"],
+        )
+        self.assertGreater(float(qualities.mean()), 0.5)
+
     def test_solid_planar_fan_uses_uniform_constrained_mesh(self):
         count = 40
         angles = np.arange(count) * (2.0 * np.pi / count)

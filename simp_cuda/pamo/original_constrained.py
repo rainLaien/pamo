@@ -604,6 +604,7 @@ def retriangulate_partial_cylindrical_walls(
     minimum_curvature_degrees=0.2,
     maximum_source_quality=None,
     minimum_triangle_angle_degrees=None,
+    minimum_radial_alignment=0.98,
 ):
     """Remesh open or irregularly trimmed cylinder patches with one boundary loop."""
     if constrained_triangle is None:
@@ -737,7 +738,10 @@ def retriangulate_partial_cylindrical_walls(
         radial_alignment = np.abs(
             np.sum(normals * centroid_radial, axis=1) / centroid_radial_lengths
         )
-        if float(np.percentile(radial_alignment, 5.0)) < 0.98:
+        if (
+            float(np.percentile(radial_alignment, 5.0))
+            < float(minimum_radial_alignment)
+        ):
             continue
 
         all_offsets = vertices[component_vertex_ids] - axis_origin
@@ -2309,8 +2313,12 @@ def refine_original_mesh_by_longest_edge(
             faces,
             protected_edges=hard_edges_array,
             minimum_faces=rounded_fillet_minimum_faces,
-            radius_tolerance=max(partial_cylinder_radius_tolerance, 1e-2),
-            normal_tolerance=max(partial_cylinder_normal_tolerance, 8e-2),
+            # Fillets created by blends and boolean joins are often only
+            # approximately cylindrical. Projection is restricted to the
+            # source band and the result still has to improve both mean and
+            # lower-tail quality, so these relaxed fit gates remain safe.
+            radius_tolerance=max(partial_cylinder_radius_tolerance, 5e-2),
+            normal_tolerance=max(partial_cylinder_normal_tolerance, 1.2e-1),
             minimum_angle_degrees=5.0,
             target_edge_ratio=rounded_fillet_target_edge_ratio,
             isolate_rounded_faces=True,
@@ -2319,6 +2327,7 @@ def refine_original_mesh_by_longest_edge(
             minimum_triangle_angle_degrees=(
                 rounded_fillet_minimum_triangle_angle
             ),
+            minimum_radial_alignment=0.95,
         )
         old_fillet_p5 = fillet_stats.get("old_quality_p5", 0.0)
         new_fillet_p5 = fillet_stats.get("new_quality_p5", 0.0)
