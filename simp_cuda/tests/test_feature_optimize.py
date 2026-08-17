@@ -129,10 +129,11 @@ class FeatureOptimizeTest(unittest.TestCase):
                 radius_tolerance=0.01,
                 normal_tolerance=0.08,
                 minimum_angle_degrees=5.0,
-                target_edge_ratio=4.0,
+                target_edge_ratio=2.0,
                 isolate_rounded_faces=True,
                 minimum_curvature_degrees=0.2,
                 maximum_source_quality=0.15,
+                minimum_triangle_angle_degrees=28.0,
             )
         )
         qualities = feature_optimize._triangle_quality_values(
@@ -142,6 +143,7 @@ class FeatureOptimizeTest(unittest.TestCase):
         self.assertEqual(stats["candidates"], 2)
         self.assertEqual(stats["patches"], 2)
         self.assertGreater(stats["new_quality"], 0.7)
+        self.assertGreater(stats["new_quality_p5"], stats["old_quality_p5"])
         self.assertGreater(float(qualities.mean()), 0.5)
 
     def test_solid_planar_fan_uses_uniform_constrained_mesh(self):

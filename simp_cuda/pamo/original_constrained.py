@@ -972,6 +972,7 @@ def retriangulate_partial_cylindrical_walls(
             "candidates": candidates, "patches": 0, "new_vertices": 0,
             "removed_faces": 0, "new_faces": 0,
             "old_quality": 0.0, "new_quality": 0.0,
+            "old_quality_p5": 0.0, "new_quality_p5": 0.0,
         }
     return (
         np.vstack((vertices, np.asarray(appended_vertices, dtype=np.float64))),
@@ -984,6 +985,8 @@ def retriangulate_partial_cylindrical_walls(
             "new_faces": len(appended_faces),
             "old_quality": float(np.mean(old_qualities)),
             "new_quality": float(np.mean(new_qualities)),
+            "old_quality_p5": float(np.percentile(old_qualities, 5.0)),
+            "new_quality_p5": float(np.percentile(new_qualities, 5.0)),
         },
     )
 
@@ -2171,6 +2174,7 @@ def refine_original_mesh_by_longest_edge(
     rounded_fillet_minimum_curvature=0.2,
     rounded_fillet_maximum_source_quality=0.15,
     rounded_fillet_target_edge_ratio=4.0,
+    rounded_fillet_minimum_triangle_angle=28.0,
     planar_region_minimum_faces=None,
 ):
     """
@@ -2312,16 +2316,21 @@ def refine_original_mesh_by_longest_edge(
             isolate_rounded_faces=True,
             minimum_curvature_degrees=rounded_fillet_minimum_curvature,
             maximum_source_quality=rounded_fillet_maximum_source_quality,
-            minimum_triangle_angle_degrees=20.0,
+            minimum_triangle_angle_degrees=(
+                rounded_fillet_minimum_triangle_angle
+            ),
         )
+        old_fillet_p5 = fillet_stats.get("old_quality_p5", 0.0)
+        new_fillet_p5 = fillet_stats.get("new_quality_p5", 0.0)
         print(
             "Rounded fillet retriangulation: {} / {} candidate band(s), "
             "{} new vertices, {} old -> {} new faces; mean quality "
-            "{:.6g} -> {:.6g}.".format(
+            "{:.6g} -> {:.6g}; P5 {:.6g} -> {:.6g}.".format(
                 fillet_stats["patches"], fillet_stats["candidates"],
                 fillet_stats["new_vertices"], fillet_stats["removed_faces"],
                 fillet_stats["new_faces"], fillet_stats["old_quality"],
                 fillet_stats["new_quality"],
+                old_fillet_p5, new_fillet_p5,
             ),
             flush=True,
         )

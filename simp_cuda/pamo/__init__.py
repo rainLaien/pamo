@@ -334,6 +334,7 @@ class PaMO(nn.Module):
         rounded_fillet_minimum_curvature=0.2,
         rounded_fillet_maximum_source_quality=0.15,
         rounded_fillet_target_edge_ratio=4.0,
+        rounded_fillet_minimum_triangle_angle=28.0,
         planar_region_minimum_faces=None,
         quality_iterations=20,
         quality_step=0.4,
@@ -457,6 +458,9 @@ class PaMO(nn.Module):
                 rounded_fillet_maximum_source_quality
             ),
             rounded_fillet_target_edge_ratio=rounded_fillet_target_edge_ratio,
+            rounded_fillet_minimum_triangle_angle=(
+                rounded_fillet_minimum_triangle_angle
+            ),
             planar_region_minimum_faces=planar_region_minimum_faces,
         )
         quality_iterations = int(quality_iterations)

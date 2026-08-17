@@ -630,6 +630,12 @@ def main():
         help="Fillet target edge length divided by boundary median",
     )
     parser.add_argument(
+        '--constraint-rounded-fillet-minimum-triangle-angle',
+        type=float,
+        default=28.0,
+        help="Minimum Triangle angle used for rounded-fillet remeshing",
+    )
+    parser.add_argument(
         '--constraint-planar-region-minimum-faces',
         type=int,
         default=None,
@@ -905,6 +911,15 @@ def main():
         parser.error(
             "--constraint-rounded-fillet-target-edge-ratio must be positive"
         )
+    if not (
+        0.0
+        < args.constraint_rounded_fillet_minimum_triangle_angle
+        < 34.0
+    ):
+        parser.error(
+            "--constraint-rounded-fillet-minimum-triangle-angle must be "
+            "in (0, 34)"
+        )
     if (
         args.constraint_planar_region_minimum_faces is not None
         and args.constraint_planar_region_minimum_faces < 4
@@ -1106,6 +1121,9 @@ def main():
             ),
             rounded_fillet_target_edge_ratio=(
                 args.constraint_rounded_fillet_target_edge_ratio
+            ),
+            rounded_fillet_minimum_triangle_angle=(
+                args.constraint_rounded_fillet_minimum_triangle_angle
             ),
             planar_region_minimum_faces=(
                 args.constraint_planar_region_minimum_faces
