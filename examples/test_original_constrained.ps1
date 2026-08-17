@@ -13,6 +13,7 @@ $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $inputPath = Join-Path $projectRoot "examples\222.stl"
 $outputDirectory = Join-Path $projectRoot "examples\test_outputs"
 $outputPath = Join-Path $outputDirectory "222_constrained.stl"
+$logPath = Join-Path $outputDirectory "222_constrained.log"
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python virtual environment not found: $pythonPath"
@@ -30,7 +31,7 @@ try {
     # implementation. The default performs safe constrained refinement only.
     # Targeted fan cleanup is safe for this large mesh: it only scans edges
     # around abnormally high-valence vertices instead of every mesh edge.
-    $flipPasses = 2
+    $flipPasses = 0
     $qualityIterations = if ($EnableQualityOptimization) { 1 } else { 0 }
     $qualityFlipPasses = if ($EnableQualityOptimization) { 1 } else { 0 }
 
@@ -69,10 +70,11 @@ try {
         "--constraint-quality-step", "0.4"
         "--constraint-quality-flip-passes", "$qualityFlipPasses"
     )
-    & $pythonPath @arguments
+    & $pythonPath @arguments 2>&1 | Tee-Object -FilePath $logPath
+    $pythonExitCode = $LASTEXITCODE
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "Mesh optimization failed with exit code $LASTEXITCODE"
+    if ($pythonExitCode -ne 0) {
+        throw "Mesh optimization failed with exit code $pythonExitCode"
     }
 }
 finally {
@@ -80,3 +82,4 @@ finally {
 }
 
 Write-Host "Optimized mesh written to: $outputPath"
+Write-Host "Timing log written to: $logPath"

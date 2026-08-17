@@ -49,6 +49,61 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
+    def test_short_coplanar_edge_collapse_preserves_boundary_and_quality(self):
+        vertices = np.asarray(
+            (
+                (0.0, 0.0, 0.0),
+                (2.0, 0.0, 0.0),
+                (2.0, 2.0, 0.0),
+                (0.0, 2.0, 0.0),
+                (0.9, 1.0, 0.0),
+                (1.1, 1.0, 0.0),
+            )
+        )
+        faces = np.asarray(
+            (
+                (0, 1, 4),
+                (1, 5, 4),
+                (1, 2, 5),
+                (2, 3, 5),
+                (3, 4, 5),
+                (3, 0, 4),
+            ),
+            dtype=np.int64,
+        )
+        old_quality = feature_optimize._triangle_quality_values(vertices, faces)
+
+        result_vertices, result_faces, collapse_count = (
+            original_constrained.collapse_short_coplanar_edges(
+                vertices,
+                faces,
+                np.empty((0, 2), dtype=np.int64),
+                maximum_short_edge_length=0.5,
+                maximum_edge_length=3.0,
+                passes=1,
+            )
+        )
+        new_quality = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+        result_edges = {
+            tuple(sorted((int(first), int(second))))
+            for face in result_faces
+            for first, second in (
+                (face[0], face[1]),
+                (face[1], face[2]),
+                (face[2], face[0]),
+            )
+        }
+
+        self.assertEqual(collapse_count, 1)
+        self.assertEqual(len(result_faces), 4)
+        self.assertGreaterEqual(float(new_quality.min()), float(old_quality.min()))
+        self.assertGreater(float(new_quality.mean()), float(old_quality.mean()))
+        self.assertTrue(
+            all(edge in result_edges for edge in ((0, 1), (1, 2), (2, 3), (0, 3)))
+        )
+
     def test_concave_planar_loop_uses_verified_interior_point(self):
         polygon = np.asarray(
             (
