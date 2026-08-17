@@ -24,12 +24,6 @@ def resolve_original_surface_mode(mesh, requested_mode):
 
     edge_counts = np.bincount(mesh.edges_unique_inverse)
     nonmanifold_count = int(np.count_nonzero(edge_counts > 2))
-    if nonmanifold_count:
-        raise ValueError(
-            "Original-constrained remeshing found {} non-manifold edge(s) "
-            "with more than two incident faces. Repair those edges first."
-            .format(nonmanifold_count)
-        )
     if not bool(mesh.is_winding_consistent):
         raise ValueError(
             "Original-constrained remeshing requires consistently wound "
@@ -37,11 +31,13 @@ def resolve_original_surface_mode(mesh, requested_mode):
         )
 
     boundary_count = int(np.count_nonzero(edge_counts == 1))
-    if boundary_count:
+    if boundary_count or nonmanifold_count:
         return (
             "exact",
-            "original triangle surface with {} open boundary edge(s) "
-            "preserved".format(boundary_count),
+            "original triangle surface with {} open boundary edge(s) and {} "
+            "hard non-manifold edge(s) preserved".format(
+                boundary_count, nonmanifold_count
+            ),
         )
     return "exact", "watertight original triangle surface"
 

@@ -1,7 +1,9 @@
 param(
     [switch]$EnableQualityOptimization,
     [ValidateRange(0.0, 180.0)]
-    [double]$FeatureAngle = 15.0
+    [double]$FeatureAngle = 15.0,
+    [ValidateRange(0.000001, [double]::MaxValue)]
+    [double]$MaxEdgeLength = 10.0
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +42,7 @@ try {
         "--original-constrained-remesh"
         "--sdf-mode", "exact"
         "--constraint-feature-angle", "$FeatureAngle"
+        "--constraint-max-edge-length", "$MaxEdgeLength"
         "--coplanar-angle-tolerance", "0.1"
         "--constraint-flip-passes", "$flipPasses"
         "--constraint-flip-minimum-valence", "12"

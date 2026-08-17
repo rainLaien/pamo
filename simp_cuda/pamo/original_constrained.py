@@ -76,9 +76,12 @@ def _points_in_polygon(points, polygon):
     result = np.zeros(len(points), dtype=bool)
     for start, end in zip(first, second):
         crosses_y = (start[1] > points[:, 1]) != (end[1] > points[:, 1])
+        delta_y = float(end[1] - start[1])
+        if abs(delta_y) <= np.finfo(np.float64).eps:
+            continue
         intersection_x = (
             (end[0] - start[0]) * (points[:, 1] - start[1])
-            / (end[1] - start[1] + np.finfo(np.float64).eps)
+            / delta_y
             + start[0]
         )
         result ^= crosses_y & (points[:, 0] < intersection_x)
@@ -91,6 +94,29 @@ def _polygon_signed_area(polygon):
     return 0.5 * float(
         np.sum(polygon[:, 0] * following[:, 1] - polygon[:, 1] * following[:, 0])
     )
+
+
+def _polygon_interior_point(polygon):
+    """Return a point verified inside a possibly concave simple polygon."""
+    polygon = np.asarray(polygon, dtype=np.float64)
+    mean_point = polygon.mean(axis=0)
+    if _points_in_polygon(mean_point[None, :], polygon)[0]:
+        return mean_point
+    try:
+        simplices = Delaunay(polygon).simplices
+    except QhullError:
+        return None
+    triangles = polygon[simplices]
+    centroids = triangles.mean(axis=1)
+    inside = _points_in_polygon(centroids, polygon)
+    if not np.any(inside):
+        return None
+    crosses = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    candidate_ids = np.flatnonzero(inside)
+    return centroids[candidate_ids[np.argmax(np.abs(crosses[candidate_ids]))]]
 
 
 def _recover_planar_constraint_edges(points, faces, required_edges):
@@ -192,6 +218,7 @@ def retriangulate_planar_annuli(
     maximum_target_edge_length=None,
     maximum_result_edge_length=None,
     minimum_angle_degrees=None,
+    accept_strong_mean_gain=False,
 ):
     """Uniformly retriangulate exact planar facets with constrained boundaries."""
     vertices = np.asarray(vertices, dtype=np.float64)
@@ -274,7 +301,13 @@ def retriangulate_planar_annuli(
             polygon for index, polygon in enumerate(projected_cycles)
             if index != outer_index
         ]
-        if any(not _points_in_polygon([hole.mean(axis=0)], outer)[0] for hole in holes):
+        hole_points = [_polygon_interior_point(hole) for hole in holes]
+        if any(point is None for point in hole_points):
+            continue
+        if any(
+            not _points_in_polygon(point[None, :], outer)[0]
+            for point in hole_points
+        ):
             continue
 
         ordered_cycles = [cycles[outer_index]] + [
@@ -290,17 +323,26 @@ def retriangulate_planar_annuli(
         spacing = float(np.median(boundary_lengths[boundary_lengths > 0.0]))
         if not np.isfinite(spacing) or spacing <= 0.0:
             continue
-        if hole_count == 0:
-            domain_area = max(float(areas[outer_index]), 0.0)
-            maximum_interior_points = max(len(facet) * 8, 100)
-            density_spacing = np.sqrt(
-                domain_area
-                / max(
-                    (np.sqrt(3.0) * 0.5) * maximum_interior_points,
-                    np.finfo(np.float64).eps,
+        domain_area = max(
+            float(areas[outer_index])
+            - float(
+                sum(
+                    areas[index]
+                    for index in range(len(areas))
+                    if index != outer_index
                 )
+            ),
+            0.0,
+        )
+        maximum_interior_points = max(len(facet) * 8, 100)
+        density_spacing = np.sqrt(
+            domain_area
+            / max(
+                (np.sqrt(3.0) * 0.5) * maximum_interior_points,
+                np.finfo(np.float64).eps,
             )
-            spacing = max(spacing, density_spacing)
+        )
+        spacing = max(spacing, density_spacing)
         if maximum_target_edge_length is not None:
             spacing = min(spacing, float(maximum_target_edge_length))
 
@@ -382,7 +424,7 @@ def retriangulate_planar_annuli(
             }
             if holes:
                 triangle_input["holes"] = np.asarray(
-                    [hole.mean(axis=0) for hole in holes], dtype=np.float64
+                    hole_points, dtype=np.float64
                 )
             triangle_options = "pQY"
             if minimum_angle_degrees is not None:
@@ -462,10 +504,18 @@ def retriangulate_planar_annuli(
                 continue
         old_quality = _triangle_quality_values(vertices, faces[facet])
         new_quality = _triangle_quality_values(coordinate_pool, new_faces)
+        strong_mean_gain = (
+            bool(accept_strong_mean_gain)
+            and float(new_quality.mean()) >= float(old_quality.mean()) + 0.15
+            and float(new_quality.min()) >= float(old_quality.min()) - 1e-8
+        )
         if (
-            np.percentile(new_quality, 5.0)
-            < np.percentile(old_quality, 5.0) - 1e-8
-            or float(new_quality.mean()) < float(old_quality.mean()) - 1e-8
+            (
+                np.percentile(new_quality, 5.0)
+                < np.percentile(old_quality, 5.0) - 1e-8
+                or float(new_quality.mean()) < float(old_quality.mean()) - 1e-8
+            )
+            and not strong_mean_gain
         ):
             quality_rejection_count += 1
             continue
@@ -2292,7 +2342,7 @@ def refine_original_mesh_by_longest_edge(
                     minimum_faces=planar_annulus_minimum_faces,
                     maximum_target_edge_length=planar_edge_target,
                     maximum_result_edge_length=edge_target,
-                    minimum_angle_degrees=20.0,
+                    accept_strong_mean_gain=True,
                 )
             )
             print(
@@ -2322,6 +2372,7 @@ def refine_original_mesh_by_longest_edge(
                     maximum_target_edge_length=planar_edge_target,
                     maximum_result_edge_length=edge_target,
                     minimum_angle_degrees=20.0,
+                    accept_strong_mean_gain=True,
                 )
             )
             print(

@@ -49,6 +49,34 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
+    def test_concave_planar_loop_uses_verified_interior_point(self):
+        polygon = np.asarray(
+            (
+                (0.0, 0.0),
+                (4.0, 0.0),
+                (4.0, 1.0),
+                (1.0, 1.0),
+                (1.0, 3.0),
+                (4.0, 3.0),
+                (4.0, 4.0),
+                (0.0, 4.0),
+            )
+        )
+        mean_point = polygon.mean(axis=0)
+        interior_point = original_constrained._polygon_interior_point(polygon)
+
+        self.assertFalse(
+            original_constrained._points_in_polygon(
+                mean_point[None, :], polygon
+            )[0]
+        )
+        self.assertIsNotNone(interior_point)
+        self.assertTrue(
+            original_constrained._points_in_polygon(
+                interior_point[None, :], polygon
+            )[0]
+        )
+
     def test_two_fillet_bands_are_not_joined_through_a_planar_bridge(self):
         count = 33
         radius = 5.0

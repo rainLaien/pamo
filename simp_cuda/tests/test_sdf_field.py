@@ -30,7 +30,30 @@ class OriginalSurfaceModeTest(unittest.TestCase):
         mode, reason = resolve_original_surface_mode(mesh, "exact")
 
         self.assertEqual(mode, "exact")
-        self.assertIn("4 open boundary edge(s) preserved", reason)
+        self.assertIn("4 open boundary edge(s)", reason)
+        self.assertIn("0 hard non-manifold edge(s) preserved", reason)
+
+    def test_nonmanifold_edge_is_preserved_as_a_hard_constraint(self):
+        mesh = trimesh.Trimesh(
+            vertices=np.asarray(
+                (
+                    (0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                    (0.0, -1.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                )
+            ),
+            faces=np.asarray(
+                ((0, 1, 2), (1, 0, 3), (0, 1, 4)), dtype=np.int64
+            ),
+            process=False,
+        )
+
+        mode, reason = resolve_original_surface_mode(mesh, "exact")
+
+        self.assertEqual(mode, "exact")
+        self.assertIn("1 hard non-manifold edge(s) preserved", reason)
 
     def test_repair_mode_is_rejected_for_original_constraints(self):
         mesh = trimesh.creation.box()
