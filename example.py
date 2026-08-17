@@ -450,14 +450,6 @@ def main():
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        '--constraint-allow-open-surface',
-        action='store_true',
-        help=(
-            "Allow consistently wound thin sheets; boundary and non-manifold "
-            "edges remain hard constraints"
-        ),
-    )
-    parser.add_argument(
         '--constraint-feature-distance',
         type=float,
         default=None,
@@ -473,10 +465,7 @@ def main():
         '--coplanar-distance-ratio',
         type=float,
         default=1e-6,
-        help=(
-            "Maximum point-to-seed-plane distance divided by the model "
-            "diagonal during planar patch classification (default: 1e-6)"
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         '--constraint-max-edge-length',
@@ -498,16 +487,6 @@ def main():
         help=(
             "Input dihedral angle above which an edge is a hard constraint "
             "which may only be split, default=5 degrees"
-        ),
-    )
-    parser.add_argument(
-        '--constraint-feature-target-edge-length',
-        type=float,
-        default=None,
-        help=(
-            "Maximum edge length on hard feature, boundary, and non-manifold "
-            "chains; smooth high-quality regions retain the coarser global "
-            "limit"
         ),
     )
     parser.add_argument(
@@ -585,6 +564,24 @@ def main():
         help="Cylinder target edge length divided by boundary median (default: 1)",
     )
     parser.add_argument(
+        '--constraint-trimmed-cylinder-minimum-faces',
+        type=int,
+        default=None,
+        help="Remesh cylinders with two irregular Boolean-trimmed boundary loops",
+    )
+    parser.add_argument(
+        '--constraint-trimmed-cylinder-radius-tolerance',
+        type=float,
+        default=1e-2,
+        help="Relative radial-fit tolerance for Boolean-trimmed cylinders",
+    )
+    parser.add_argument(
+        '--constraint-trimmed-cylinder-normal-tolerance',
+        type=float,
+        default=8e-2,
+        help="Maximum axial face-normal RMS for Boolean-trimmed cylinders",
+    )
+    parser.add_argument(
         '--constraint-partial-cylinder-minimum-faces',
         type=int,
         default=None,
@@ -621,55 +618,22 @@ def main():
         help="Minimum nonzero dihedral in degrees used to isolate fillets",
     )
     parser.add_argument(
-        '--constraint-extrusion-region-minimum-faces',
-        type=int,
-        default=None,
-        help=(
-            "Unwrap and boundary-rebuild classified extrusion/developable "
-            "regions at or above this face count"
-        ),
+        '--constraint-rounded-fillet-maximum-source-quality',
+        type=float,
+        default=0.15,
+        help="Exclude better-shaped planar bridge faces from fillet bands",
     )
     parser.add_argument(
-        '--constraint-extrusion-maximum-input-quality',
+        '--constraint-rounded-fillet-target-edge-ratio',
         type=float,
-        default=0.05,
-        help=(
-            "Only rebuild extrusion/developable regions whose input P5 "
-            "triangle quality is below this threshold (default: 0.05)"
-        ),
+        default=4.0,
+        help="Fillet target edge length divided by boundary median",
     )
     parser.add_argument(
         '--constraint-planar-region-minimum-faces',
         type=int,
         default=None,
         help="Uniformly retriangulate solid planar regions of at least this size",
-    )
-    parser.add_argument(
-        '--constraint-planar-largest-opposed-pair-only',
-        action='store_true',
-        help=(
-            "Only boundary-rebuild the largest planar patch and its largest "
-            "opposite-facing mate (the primary top/bottom plate skins)"
-        ),
-    )
-    parser.add_argument(
-        '--constraint-planar-target-edge-length',
-        type=float,
-        default=None,
-        help=(
-            "Maximum interior grid spacing used when retriangulating planar "
-            "regions with or without holes"
-        ),
-    )
-    parser.add_argument(
-        '--constraint-planar-minimum-angle',
-        type=float,
-        default=None,
-        help=(
-            "Minimum triangle angle requested from boundary-only planar "
-            "or developable reconstruction; SciPy fallback is used when "
-            "the triangle package is unavailable"
-        ),
     )
     parser.add_argument(
         '--constraint-quality-iterations',
@@ -816,10 +780,6 @@ def main():
         args.constraint_projection_distance is not None
         or args.constraint_feature_distance is not None
         or args.constraint_max_edge_length is not None
-        or args.constraint_feature_target_edge_length is not None
-        or args.constraint_planar_minimum_angle is not None
-        or args.constraint_extrusion_region_minimum_faces is not None
-        or args.constraint_allow_open_surface
     )
     if (
         constraint_options_used
@@ -850,13 +810,6 @@ def main():
         parser.error("--constraint-max-edge-length must be positive")
     if not 0.0 <= args.constraint_feature_angle < 180.0:
         parser.error("--constraint-feature-angle must be in [0, 180)")
-    if (
-        args.constraint_feature_target_edge_length is not None
-        and args.constraint_feature_target_edge_length <= 0.0
-    ):
-        parser.error(
-            "--constraint-feature-target-edge-length must be positive"
-        )
     if (
         args.constraint_max_splits is not None
         and args.constraint_max_splits <= 0
@@ -900,6 +853,21 @@ def main():
     if args.constraint_cylinder_target_edge_ratio <= 0.0:
         parser.error("--constraint-cylinder-target-edge-ratio must be positive")
     if (
+        args.constraint_trimmed_cylinder_minimum_faces is not None
+        and args.constraint_trimmed_cylinder_minimum_faces < 4
+    ):
+        parser.error(
+            "--constraint-trimmed-cylinder-minimum-faces must be at least 4"
+        )
+    if args.constraint_trimmed_cylinder_radius_tolerance <= 0.0:
+        parser.error(
+            "--constraint-trimmed-cylinder-radius-tolerance must be positive"
+        )
+    if args.constraint_trimmed_cylinder_normal_tolerance <= 0.0:
+        parser.error(
+            "--constraint-trimmed-cylinder-normal-tolerance must be positive"
+        )
+    if (
         args.constraint_partial_cylinder_minimum_faces is not None
         and args.constraint_partial_cylinder_minimum_faces < 4
     ):
@@ -929,16 +897,13 @@ def main():
         parser.error(
             "--constraint-rounded-fillet-minimum-curvature must be positive"
         )
-    if (
-        args.constraint_extrusion_region_minimum_faces is not None
-        and args.constraint_extrusion_region_minimum_faces < 2
-    ):
+    if not 0.0 < args.constraint_rounded_fillet_maximum_source_quality <= 1.0:
         parser.error(
-            "--constraint-extrusion-region-minimum-faces must be at least 2"
+            "--constraint-rounded-fillet-maximum-source-quality must be in (0, 1]"
         )
-    if not 0.0 < args.constraint_extrusion_maximum_input_quality <= 1.0:
+    if args.constraint_rounded_fillet_target_edge_ratio <= 0.0:
         parser.error(
-            "--constraint-extrusion-maximum-input-quality must be in (0, 1]"
+            "--constraint-rounded-fillet-target-edge-ratio must be positive"
         )
     if (
         args.constraint_planar_region_minimum_faces is not None
@@ -946,39 +911,6 @@ def main():
     ):
         parser.error(
             "--constraint-planar-region-minimum-faces must be at least 4"
-        )
-    if (
-        args.constraint_planar_target_edge_length is not None
-        and args.constraint_planar_target_edge_length <= 0.0
-    ):
-        parser.error(
-            "--constraint-planar-target-edge-length must be positive"
-        )
-    if (
-        args.constraint_planar_largest_opposed_pair_only
-        and args.constraint_planar_annulus_minimum_faces is None
-        and args.constraint_planar_region_minimum_faces is None
-    ):
-        parser.error(
-            "--constraint-planar-largest-opposed-pair-only requires planar "
-            "annulus or planar region reconstruction"
-        )
-    if (
-        args.constraint_planar_minimum_angle is not None
-        and not 0.0 < args.constraint_planar_minimum_angle < 34.0
-    ):
-        parser.error(
-            "--constraint-planar-minimum-angle must be in (0, 34)"
-        )
-    if (
-        args.constraint_planar_minimum_angle is not None
-        and args.constraint_planar_annulus_minimum_faces is None
-        and args.constraint_planar_region_minimum_faces is None
-        and args.constraint_extrusion_region_minimum_faces is None
-    ):
-        parser.error(
-            "--constraint-planar-minimum-angle requires planar annulus or "
-            "planar region reconstruction"
         )
     if args.constraint_quality_iterations < 0:
         parser.error("--constraint-quality-iterations must be non-negative")
@@ -1119,12 +1051,8 @@ def main():
             coplanar_angle_tolerance=args.coplanar_angle_tolerance,
             coplanar_distance_ratio=args.coplanar_distance_ratio,
             sdf_mode=args.sdf_mode,
-            allow_open_surface=args.constraint_allow_open_surface,
             max_edge_length=args.constraint_max_edge_length,
             feature_angle=args.constraint_feature_angle,
-            feature_target_edge_length=(
-                args.constraint_feature_target_edge_length
-            ),
             max_splits=args.constraint_max_splits,
             coplanar_flip_passes=args.constraint_flip_passes,
             coplanar_flip_minimum_valence=(
@@ -1146,6 +1074,15 @@ def main():
             cylinder_target_edge_ratio=(
                 args.constraint_cylinder_target_edge_ratio
             ),
+            trimmed_cylinder_minimum_faces=(
+                args.constraint_trimmed_cylinder_minimum_faces
+            ),
+            trimmed_cylinder_radius_tolerance=(
+                args.constraint_trimmed_cylinder_radius_tolerance
+            ),
+            trimmed_cylinder_normal_tolerance=(
+                args.constraint_trimmed_cylinder_normal_tolerance
+            ),
             partial_cylinder_minimum_faces=(
                 args.constraint_partial_cylinder_minimum_faces
             ),
@@ -1164,23 +1101,14 @@ def main():
             rounded_fillet_minimum_curvature=(
                 args.constraint_rounded_fillet_minimum_curvature
             ),
-            extrusion_region_minimum_faces=(
-                args.constraint_extrusion_region_minimum_faces
+            rounded_fillet_maximum_source_quality=(
+                args.constraint_rounded_fillet_maximum_source_quality
             ),
-            extrusion_maximum_input_quality=(
-                args.constraint_extrusion_maximum_input_quality
+            rounded_fillet_target_edge_ratio=(
+                args.constraint_rounded_fillet_target_edge_ratio
             ),
             planar_region_minimum_faces=(
                 args.constraint_planar_region_minimum_faces
-            ),
-            planar_target_edge_length=(
-                args.constraint_planar_target_edge_length
-            ),
-            planar_minimum_angle_degrees=(
-                args.constraint_planar_minimum_angle
-            ),
-            planar_largest_opposed_pair_only=(
-                args.constraint_planar_largest_opposed_pair_only
             ),
             quality_iterations=args.constraint_quality_iterations,
             quality_step=args.constraint_quality_step,

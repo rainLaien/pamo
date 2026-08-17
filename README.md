@@ -89,7 +89,6 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--original-constrained-remesh`**: Preserve sharp, boundary, and non-manifold input edges as hard constraint chains. After conforming longest-edge refinement, quality-improving flips remove non-feature seams inside coplanar patches.
 - **`--constraint-feature-angle`**: Mark every original manifold edge whose adjacent-face dihedral is strictly greater than this angle as a hard feature, default=5 degrees.
 - **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. When omitted, the limit is `5% of the bounding-box diagonal`. This tighter scale-based default improves edge-length consistency on ordinary planar regions.
-- **`--constraint-feature-target-edge-length`**: Apply a separate, finer length bound only to hard feature, boundary, and non-manifold chains. Combine it with a coarser global or planar target to concentrate resolution at geometric features.
 - **`--constraint-max-splits`**: Optional safety limit for longest-edge bisection. When omitted, the edge-only binary-bisection estimate receives a 4x conformity margin with a minimum budget of 100000.
 - **`--constraint-flip-passes`**: Number of quality-driven coplanar non-feature edge-flip passes after refinement, default=8. Hard feature chains are never flipped.
 - **`--constraint-flip-minimum-valence`**: Restrict coplanar flips to edges touching unusually high-valence vertices. A value such as `12` efficiently removes planar center-fan triangulations without scanning every edge for expensive quality tests.
@@ -99,18 +98,22 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--constraint-cylinder-minimum-faces`**: Detect cylindrical wall components with two circular hard boundaries, unwrap them, add axial transition rows, and retriangulate them in the cylinder parameter domain.
 - **`--constraint-cylinder-radius-tolerance`**: Relative tolerance used for circular-boundary and constant-radius validation, default=`0.001`. Cones, fillets, and irregular curved surfaces are skipped.
 - **`--constraint-cylinder-target-edge-ratio`**: Target cylinder-wall edge length divided by the median boundary edge length, default=`1.0`.
+- **`--constraint-trimmed-cylinder-minimum-faces`**: Remesh cylindrical walls whose two closed ends were irregularly cut by Boolean joins while preserving every join-boundary edge.
+- **`--constraint-trimmed-cylinder-radius-tolerance`**: Relative whole-patch radial-fit tolerance for irregularly trimmed cylinders, default=`0.01`.
+- **`--constraint-trimmed-cylinder-normal-tolerance`**: Maximum RMS face-normal component along the fitted axis for irregularly trimmed cylinders, default=`0.08`.
 - **`--constraint-partial-cylinder-minimum-faces`**: Remesh open, half, or irregularly trimmed cylindrical patches with one constrained boundary loop.
 - **`--constraint-partial-cylinder-radius-tolerance`**: Relative radial-fit tolerance for partial cylinders, default=`0.002`.
 - **`--constraint-partial-cylinder-normal-tolerance`**: RMS face-normal component allowed along the fitted cylinder axis, default=`0.02`.
 - **`--constraint-partial-cylinder-minimum-angle`**: Minimum angular coverage accepted as a partial cylinder, default=`30` degrees.
 - **`--constraint-rounded-fillet-minimum-faces`**: Isolate tangent cylindrical fillet bands by smooth nonzero curvature and remesh them without requiring hard feature boundaries.
 - **`--constraint-rounded-fillet-minimum-curvature`**: Minimum face-adjacency angle used to separate a fillet from tangent planes, default=`0.2` degrees.
-- **`--constraint-extrusion-region-minimum-faces`**: Detect skinny extrusion/developable regions from their common axis, unwrap each accepted region to a 2D chart, discard its old internal shared edges, and retriangulate from its boundary.
-- **`--constraint-extrusion-maximum-input-quality`**: Restrict developable reconstruction to regions whose input P5 triangle quality is below this threshold, so effort is concentrated on genuinely poor regions.
+- **`--constraint-rounded-fillet-maximum-source-quality`**: Maximum source triangle quality admitted into a rounded band, default=`0.15`; this prevents large planar bridge faces from joining fillets with different centers.
+- **`--constraint-rounded-fillet-target-edge-ratio`**: Target fillet edge length divided by the median boundary edge, default=`4.0`; larger values avoid over-refining finely sampled CAD arcs.
+
+Curved cylinders and fillets are rebuilt first, shared hard boundaries are then
+subdivided to the strict edge-length limit, and planar regions are rebuilt last.
+This lets planar triangulation consume the refined curve/plane join edges.
 - **`--constraint-planar-region-minimum-faces`**: Replace sufficiently large solid planar facets with a uniform constrained triangulation, preserving their complete outer boundary instead of repeatedly splitting the old skinny topology.
-- **`--constraint-planar-largest-opposed-pair-only`**: Limit planar reconstruction to the largest planar patch and its largest opposite-facing mate, which isolates the primary top and bottom skins of a plate while leaving other classified surfaces unchanged.
-- **`--constraint-planar-target-edge-length`**: Maximum interior grid spacing for reconstructed planar regions. This can remain coarser than the feature target when planar triangle shape matters more than uniform size.
-- **`--constraint-planar-minimum-angle`**: Minimum-angle target shared by planar and developable boundary reconstruction. When the optional `triangle` package is unavailable, the SciPy constrained-Delaunay boundary-layer fallback is used.
 - **`--constraint-quality-iterations`**: Number of feature-safe tangential relocation iterations after constrained refinement, default=20.
 - **`--constraint-quality-step`**: Tangential relocation step for constrained quality optimization, default=0.4.
 - **`--constraint-quality-flip-passes`**: Number of feature-safe global quality edge-flip passes, default=12. The maximum edge-length bound remains enforced.
@@ -428,7 +431,6 @@ verts, faces = pamo.original_constrained_remesh(
     sdf_mode="exact",
     feature_angle=5.0,
     max_edge_length=0.5,
-    feature_target_edge_length=0.2,
 )
 ```
 

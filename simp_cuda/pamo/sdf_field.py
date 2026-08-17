@@ -5,6 +5,47 @@ import torch
 SDF_MODES = ("auto", "exact", "repair")
 
 
+def resolve_original_surface_mode(mesh, requested_mode):
+    """Validate topology for connectivity-preserving original-surface remeshing."""
+    mode = str(requested_mode).lower()
+    if mode not in SDF_MODES:
+        raise ValueError(
+            "Unknown SDF mode '{}'. Expected one of: {}.".format(
+                requested_mode, ", ".join(SDF_MODES)
+            )
+        )
+    if mode == "repair":
+        raise ValueError(
+            "Original-constrained remeshing cannot use sdf_mode='repair': "
+            "an offset repair envelope would replace the original topology "
+            "and feature-edge identities. Use 'exact' or 'auto' to preserve "
+            "open boundaries, or repair the input mesh before remeshing."
+        )
+
+    edge_counts = np.bincount(mesh.edges_unique_inverse)
+    nonmanifold_count = int(np.count_nonzero(edge_counts > 2))
+    if nonmanifold_count:
+        raise ValueError(
+            "Original-constrained remeshing found {} non-manifold edge(s) "
+            "with more than two incident faces. Repair those edges first."
+            .format(nonmanifold_count)
+        )
+    if not bool(mesh.is_winding_consistent):
+        raise ValueError(
+            "Original-constrained remeshing requires consistently wound "
+            "faces, including for an open mesh. Repair face orientation first."
+        )
+
+    boundary_count = int(np.count_nonzero(edge_counts == 1))
+    if boundary_count:
+        return (
+            "exact",
+            "original triangle surface with {} open boundary edge(s) "
+            "preserved".format(boundary_count),
+        )
+    return "exact", "watertight original triangle surface"
+
+
 def resolve_sdf_mode(mesh, requested_mode):
     """
     Resolve the requested SDF semantics for an input mesh.

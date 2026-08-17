@@ -49,200 +49,72 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
-    def test_planar_classifier_merges_tolerant_faces_but_not_hard_edges(self):
-        vertices = np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [1.0, 1.0, 1e-7],
-                [0.0, 1.0, 0.0],
-            ]
-        )
-        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    def test_two_fillet_bands_are_not_joined_through_a_planar_bridge(self):
+        count = 33
+        radius = 5.0
+        length = 10.0
+        left_angles = np.linspace(0.0, 0.5 * np.pi, count)
+        right_angles = np.linspace(0.5 * np.pi, np.pi, count)
 
-        regions, stats = original_constrained.classify_planar_face_regions(
-            vertices,
-            faces,
-            minimum_faces=2,
-            maximum_normal_angle_degrees=0.5,
-            maximum_plane_distance_ratio=1e-5,
-        )
-        separated, separated_stats = (
-            original_constrained.classify_planar_face_regions(
-                vertices,
-                faces,
-                protected_edges=np.array([[0, 2]], dtype=np.int64),
-                minimum_faces=2,
-                maximum_normal_angle_degrees=0.5,
-                maximum_plane_distance_ratio=1e-5,
+        def band(center_x, angles):
+            return np.asarray(
+                [
+                    [
+                        center_x + radius * np.cos(angle),
+                        axial,
+                        radius * np.sin(angle),
+                    ]
+                    for axial in (0.0, length)
+                    for angle in angles
+                ]
             )
-        )
 
-        self.assertEqual(len(regions), 1)
-        self.assertEqual(stats["planar_faces"], 2)
-        self.assertFalse(separated)
-        self.assertEqual(separated_stats["planar_faces"], 0)
-
-    def test_selects_largest_opposed_planar_pair_by_area(self):
-        vertices = np.asarray(
-            (
-                (0.0, 0.0, 0.0),
-                (4.0, 0.0, 0.0),
-                (4.0, 4.0, 0.0),
-                (0.0, 4.0, 0.0),
-                (0.0, 0.0, 1.0),
-                (4.0, 0.0, 1.0),
-                (4.0, 3.0, 1.0),
-                (0.0, 3.0, 1.0),
-                (10.0, 0.0, 0.0),
-                (10.0, 5.0, 0.0),
-                (10.0, 5.0, 3.0),
-                (10.0, 0.0, 3.0),
-            ),
-            dtype=np.float64,
-        )
-        faces = np.asarray(
-            (
-                (0, 1, 2), (0, 2, 3),
-                (4, 6, 5), (4, 7, 6),
-                (8, 9, 10), (8, 10, 11),
-            ),
-            dtype=np.int64,
-        )
-        regions = [
-            np.asarray((0, 1), dtype=np.int64),
-            np.asarray((2, 3), dtype=np.int64),
-            np.asarray((4, 5), dtype=np.int64),
-        ]
-
-        selected, stats = (
-            original_constrained.select_largest_opposed_planar_regions(
-                vertices,
-                faces,
-                regions,
-            )
-        )
-
-        self.assertEqual([region.tolist() for region in selected], [[0, 1], [2, 3]])
-        self.assertAlmostEqual(stats["primary_area"], 16.0)
-        self.assertAlmostEqual(stats["opposite_area"], 12.0)
-        self.assertAlmostEqual(stats["normal_dot"], -1.0)
-
-    def test_surface_classifier_separates_plane_and_general_extrusion(self):
-        vertices = []
+        vertices = np.vstack((band(0.0, left_angles), band(20.0, right_angles)))
         faces = []
-
-        # A 2x2 planar grid is large enough to form one planar region.
-        for y in range(3):
-            for x in range(3):
-                vertices.append((float(x), 10.0 + float(y), 0.0))
-        for y in range(2):
-            for x in range(2):
-                lower_left = y * 3 + x
-                lower_right = lower_left + 1
-                upper_left = lower_left + 3
-                upper_right = upper_left + 1
+        for base in (0, 2 * count):
+            for index in range(count - 1):
                 faces.extend(
                     (
-                        (lower_left, lower_right, upper_right),
-                        (lower_left, upper_right, upper_left),
+                        [base + index, base + index + 1, base + count + index],
+                        [
+                            base + index + 1,
+                            base + count + index + 1,
+                            base + count + index,
+                        ],
                     )
                 )
-
-        # This non-circular profile is extruded along X.  Its old triangles
-        # are deliberately very long in the extrusion direction.
-        profile = (
-            (-3.0, 0.0),
-            (-2.0, 2.0),
-            (-1.0, 0.0),
-            (0.0, 3.0),
-            (1.0, 0.0),
-            (2.0, 1.0),
-            (3.0, 0.0),
-        )
-        profile_start = len(vertices)
-        for y, z in profile:
-            vertices.extend(((0.0, y, z), (50.0, y, z)))
-        for index in range(len(profile) - 1):
-            lower_first = profile_start + index * 2
-            upper_first = lower_first + 1
-            lower_second = lower_first + 2
-            upper_second = lower_first + 3
-            faces.extend(
-                (
-                    (lower_first, upper_first, upper_second),
-                    (lower_first, upper_second, lower_second),
-                )
+        # A two-triangle tangent plane joins the two different-radius-center bands.
+        faces.extend(
+            (
+                [count - 1, 2 * count, 2 * count - 1],
+                [2 * count, 3 * count, 2 * count - 1],
             )
-
-        vertices = np.asarray(vertices, dtype=np.float64)
+        )
         faces = np.asarray(faces, dtype=np.int64)
-        planar_regions, planar_stats = (
-            original_constrained.classify_planar_face_regions(
-                vertices,
-                faces,
-                minimum_faces=4,
-                maximum_normal_angle_degrees=0.1,
-                maximum_plane_distance_ratio=1e-8,
-            )
-        )
-        regions, stats = original_constrained.classify_nonplanar_face_regions(
-            vertices,
-            faces,
-            planar_regions,
-            minimum_faces=4,
-            axial_normal_tolerance=1e-8,
-            radius_tolerance=1e-3,
-        )
-
-        self.assertEqual(planar_stats["planar_faces"], 8)
-        self.assertGreaterEqual(stats["extrusion_regions"], 1, stats)
-        self.assertEqual(stats["extrusion_faces"], 12, stats)
-        self.assertEqual(stats["general_curved_faces"], 0, stats)
-        self.assertFalse(regions["cylinders"])
-        self.assertFalse(regions["fillets"])
-
-    def test_developable_region_discards_internal_edges_in_uv_chart(self):
-        boundary = []
-        for x in range(10):
-            boundary.append((float(x), 0.0, 0.0))
-        for y in range(10):
-            boundary.append((10.0, float(y), 0.0))
-        for x in range(10, 0, -1):
-            boundary.append((float(x), 10.0, 0.0))
-        for y in range(10, 0, -1):
-            boundary.append((0.0, float(y), 0.0))
-        vertices = np.asarray(boundary + [(1.0, 1.0, 0.0)], dtype=np.float64)
-        center = len(vertices) - 1
-        faces = np.asarray(
-            [
-                (center, index, (index + 1) % len(boundary))
-                for index in range(len(boundary))
-            ],
-            dtype=np.int64,
-        )
-        old_quality = feature_optimize._triangle_quality_values(vertices, faces)
 
         result_vertices, result_faces, stats = (
-            original_constrained.retriangulate_developable_regions(
+            original_constrained.retriangulate_partial_cylindrical_walls(
                 vertices,
                 faces,
-                [{"faces": np.arange(len(faces), dtype=np.int64)}],
-                minimum_faces=4,
-                maximum_target_edge_length=1.0,
-                minimum_triangle_angle_degrees=28.0,
+                np.empty((0, 2), dtype=np.int64),
+                minimum_faces=12,
+                radius_tolerance=0.01,
+                normal_tolerance=0.08,
+                minimum_angle_degrees=5.0,
+                target_edge_ratio=4.0,
+                isolate_rounded_faces=True,
+                minimum_curvature_degrees=0.2,
+                maximum_source_quality=0.15,
             )
         )
-        new_quality = feature_optimize._triangle_quality_values(
+        qualities = feature_optimize._triangle_quality_values(
             result_vertices, result_faces
         )
 
-        self.assertEqual(stats["regions"], 1, stats)
-        self.assertGreater(float(new_quality.mean()), float(old_quality.mean()))
-        self.assertGreater(
-            float(np.percentile(new_quality, 5.0)),
-            float(np.percentile(old_quality, 5.0)),
-        )
+        self.assertEqual(stats["candidates"], 2)
+        self.assertEqual(stats["patches"], 2)
+        self.assertGreater(stats["new_quality"], 0.7)
+        self.assertGreater(float(qualities.mean()), 0.5)
 
     def test_solid_planar_fan_uses_uniform_constrained_mesh(self):
         count = 40
@@ -279,7 +151,7 @@ class FeatureOptimizeTest(unittest.TestCase):
             result_vertices, result_faces
         )
 
-        self.assertEqual(stats["regions"], 1, stats)
+        self.assertEqual(stats["regions"], 1)
         self.assertGreater(float(qualities.mean()), 0.9)
         self.assertGreater(float(np.percentile(qualities, 5.0)), 0.7)
 
@@ -429,6 +301,69 @@ class FeatureOptimizeTest(unittest.TestCase):
             )
         )
 
+    def test_boolean_trimmed_cylinder_keeps_irregular_join_loops(self):
+        count = 60
+        angles = np.arange(count) * (2.0 * np.pi / count)
+        lower_z = 0.8 * np.sin(2.0 * angles)
+        upper_z = 8.0 + 0.7 * np.cos(3.0 * angles)
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (10.0 * np.cos(angles), 10.0 * np.sin(angles), lower_z)
+                ),
+                np.column_stack(
+                    (10.0 * np.cos(angles), 10.0 * np.sin(angles), upper_z)
+                ),
+            )
+        )
+        faces = []
+        for index in range(count):
+            following = (index + 1) % count
+            faces.extend(
+                (
+                    [index, following, count + index],
+                    [following, count + following, count + index],
+                )
+            )
+        faces = np.asarray(faces, dtype=np.int64)
+        boundaries = np.asarray(
+            [[index, (index + 1) % count] for index in range(count)]
+            + [
+                [count + index, count + (index + 1) % count]
+                for index in range(count)
+            ],
+            dtype=np.int64,
+        )
+        old_quality = feature_optimize._triangle_quality_values(vertices, faces)
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_trimmed_cylindrical_walls(
+                vertices,
+                faces,
+                boundaries,
+                minimum_faces=20,
+                radius_tolerance=0.01,
+                normal_tolerance=0.08,
+            )
+        )
+        new_quality = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+        result_edges = {
+            tuple(sorted((int(first), int(second))))
+            for face in result_faces
+            for first, second in (
+                (face[0], face[1]), (face[1], face[2]), (face[2], face[0])
+            )
+        }
+
+        self.assertEqual(stats["walls"], 1)
+        self.assertGreater(float(new_quality.mean()), float(old_quality.mean()))
+        self.assertGreater(float(np.percentile(new_quality, 5.0)), 0.5)
+        self.assertTrue(
+            all(tuple(sorted(map(int, edge))) in result_edges for edge in boundaries)
+        )
+
     def test_planar_annulus_bridges_are_retriangulated_uniformly(self):
         count = 80
         angles = np.arange(count) * (2.0 * np.pi / count)
@@ -481,102 +416,6 @@ class FeatureOptimizeTest(unittest.TestCase):
                     for index in range(count)
                 )
             )
-
-    def test_planar_multi_hole_fallback_recovers_every_boundary(self):
-        width = 12
-        height = 6
-        vertices = np.asarray(
-            [
-                (float(x), float(y), 0.0)
-                for y in range(height + 1)
-                for x in range(width + 1)
-            ],
-            dtype=np.float64,
-        )
-
-        def vertex_id(x, y):
-            return y * (width + 1) + x
-
-        removed_cells = {
-            (x, y)
-            for x_start in (2, 8)
-            for x in range(x_start, x_start + 2)
-            for y in range(2, 4)
-        }
-        faces = []
-        for y in range(height):
-            for x in range(width):
-                if (x, y) in removed_cells:
-                    continue
-                lower_left = vertex_id(x, y)
-                lower_right = vertex_id(x + 1, y)
-                upper_left = vertex_id(x, y + 1)
-                upper_right = vertex_id(x + 1, y + 1)
-                faces.extend(
-                    (
-                        (lower_left, lower_right, upper_right),
-                        (lower_left, upper_right, upper_left),
-                    )
-                )
-        faces = np.asarray(faces, dtype=np.int64)
-        input_edges = np.sort(
-            faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2),
-            axis=1,
-        )
-        unique_input_edges, input_counts = np.unique(
-            input_edges,
-            axis=0,
-            return_counts=True,
-        )
-        boundary_edges = unique_input_edges[input_counts == 1]
-        boundary_vertices = set(boundary_edges.reshape(-1).tolist())
-        for vertex_index in range(len(vertices)):
-            if vertex_index in boundary_vertices:
-                continue
-            row = vertex_index // (width + 1)
-            vertices[vertex_index, 0] += 0.45 if row % 2 else -0.45
-
-        saved_triangle = original_constrained.constrained_triangle
-        original_constrained.constrained_triangle = None
-        try:
-            result_vertices, result_faces, stats = (
-                original_constrained.retriangulate_planar_annuli(
-                    vertices,
-                    faces,
-                    minimum_faces=20,
-                    minimum_holes=2,
-                    maximum_holes=2,
-                    maximum_target_edge_length=1.0,
-                    minimum_triangle_angle_degrees=28.0,
-                )
-            )
-        finally:
-            original_constrained.constrained_triangle = saved_triangle
-
-        result_edges = {
-            tuple(sorted((int(first), int(second))))
-            for face in result_faces
-            for first, second in (
-                (face[0], face[1]),
-                (face[1], face[2]),
-                (face[2], face[0]),
-            )
-        }
-        maximum_edge_length = max(
-            np.linalg.norm(result_vertices[first] - result_vertices[second])
-            for first, second in result_edges
-        )
-        qualities = feature_optimize._triangle_quality_values(
-            result_vertices,
-            result_faces,
-        )
-
-        self.assertEqual(stats["regions"], 1, stats)
-        self.assertTrue(
-            all(tuple(map(int, edge)) in result_edges for edge in boundary_edges)
-        )
-        self.assertLessEqual(maximum_edge_length, 2.0 + 1e-8)
-        self.assertGreater(float(np.percentile(qualities, 5.0)), 0.4)
 
     def test_planar_annulus_with_internal_hard_edge_is_not_replaced(self):
         count = 12
@@ -688,78 +527,6 @@ class FeatureOptimizeTest(unittest.TestCase):
 
         self.assertEqual(estimate, 4)
         self.assertEqual(budget, 100000)
-
-    def test_shared_region_boundary_is_sampled_conformingly(self):
-        vertices = np.asarray(
-            (
-                (0.0, 0.0, 0.0),
-                (10.0, 0.0, 0.0),
-                (0.0, 2.0, 0.0),
-                (10.0, -2.0, 0.0),
-            ),
-            dtype=np.float64,
-        )
-        faces = np.asarray(((0, 1, 2), (1, 0, 3)), dtype=np.int64)
-        tracked_roots = {(0, 1): 7}
-        result_vertices, result_faces, stats = (
-            original_constrained.sample_region_boundary_edges(
-                vertices,
-                faces,
-                [(0, 1)],
-                target_edge_length=2.0,
-                tracked_edge_roots=tracked_roots,
-                tracked_face_labels=np.asarray((3, 9), dtype=np.int64),
-            )
-        )
-        edge_faces = original_constrained._build_edge_faces(result_faces)
-        sampled_edges = [
-            edge
-            for edge in edge_faces
-            if abs(result_vertices[edge[0], 1]) < 1e-12
-            and abs(result_vertices[edge[1], 1]) < 1e-12
-        ]
-
-        self.assertEqual(stats["splits"], 7, stats)
-        self.assertEqual(len(sampled_edges), 8)
-        self.assertTrue(all(len(edge_faces[edge]) == 2 for edge in sampled_edges))
-        self.assertLessEqual(stats["final_max_length"], 2.0 + 1e-8)
-        self.assertEqual(set(tracked_roots), set(sampled_edges))
-        self.assertEqual(set(tracked_roots.values()), {7})
-        result_labels = stats["face_labels"]
-        self.assertEqual(len(result_labels), len(result_faces))
-        self.assertEqual(np.count_nonzero(result_labels == 3), 8)
-        self.assertEqual(np.count_nonzero(result_labels == 9), 8)
-
-    def test_feature_target_refines_hard_chains_without_global_refinement(self):
-        vertices = np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [10.0, 0.0, 0.0],
-                [10.0, 10.0, 0.0],
-                [0.0, 10.0, 0.0],
-            ]
-        )
-        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
-        reference = trimesh.Trimesh(
-            vertices=vertices,
-            faces=faces,
-            process=False,
-        )
-
-        refined_vertices, _, stats = (
-            original_constrained.refine_original_mesh_by_longest_edge(
-                reference,
-                max_edge_length=100.0,
-                feature_angle_degrees=30.0,
-                feature_target_edge_length=2.0,
-                flip_passes=0,
-            )
-        )
-
-        self.assertGreater(stats["feature_driven_splits"], 0)
-        self.assertLessEqual(stats["final_feature_max_length"], 2.0 + 1e-8)
-        self.assertGreater(stats["final_max_length"], 2.0)
-        self.assertGreater(len(refined_vertices), len(vertices))
 
     def test_feature_snap_backtracks_instead_of_flipping_triangle(self):
         vertices = np.array(
