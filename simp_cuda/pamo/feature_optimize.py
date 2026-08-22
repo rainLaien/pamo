@@ -479,6 +479,7 @@ def _relocation_valid_faces(
     faces,
     minimum_area_squared,
     minimum_quality=None,
+    maximum_edge_length=None,
 ):
     """Return per-face validity relative to the pre-relocation orientation."""
     new_cross = _triangle_cross_products(proposed, faces)
@@ -492,6 +493,14 @@ def _relocation_valid_faces(
     )
     if minimum_quality is not None:
         valid &= _triangle_quality_values(proposed, faces) >= minimum_quality
+    if maximum_edge_length is not None:
+        triangles = proposed[faces]
+        edge_lengths = np.linalg.norm(
+            triangles[:, (1, 2, 0)] - triangles[:, (0, 1, 2)], axis=2
+        )
+        valid &= np.max(edge_lengths, axis=1) <= (
+            float(maximum_edge_length) * (1.0 + 1e-8)
+        )
     return valid
 
 
@@ -500,6 +509,7 @@ def _snap_to_feature_constraints(
     faces,
     constraints,
     minimum_area_squared,
+    maximum_edge_length=None,
 ):
     """
     Safely move mapped vertices toward their curve and corner constraints.
@@ -557,6 +567,7 @@ def _snap_to_feature_constraints(
             faces,
             minimum_area_squared,
             minimum_quality=minimum_quality,
+            maximum_edge_length=maximum_edge_length,
         )
     ):
         return targets, np.empty(0, dtype=np.int64)
@@ -584,6 +595,7 @@ def _snap_to_feature_constraints(
             faces,
             minimum_area_squared,
             minimum_quality=minimum_quality,
+            maximum_edge_length=maximum_edge_length,
         )
         if np.all(valid_faces):
             break
@@ -617,6 +629,7 @@ def _snap_to_feature_constraints(
             faces,
             minimum_area_squared,
             minimum_quality=minimum_quality,
+            maximum_edge_length=maximum_edge_length,
         )
         if not np.all(valid_faces):
             fractions[:] = 0.0
@@ -989,6 +1002,7 @@ def optimize_feature_constrained_mesh(
         current_faces,
         constraints,
         minimum_area_squared,
+        maximum_edge_length=maximum_edge_length,
     )
     topology_locked[relaxed_constraint_vertices] = True
     constrained_metrics = mesh_quality_metrics(

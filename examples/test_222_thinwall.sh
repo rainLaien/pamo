@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-INPUT_PATH="${SCRIPT_DIR}/222.stl"
+INPUT_PATH="${SCRIPT_DIR}/222_li.stl"
 OUTPUT_DIR="${SCRIPT_DIR}/test_outputs"
 OUTPUT_PATH="${OUTPUT_DIR}/222_primary_planes_rebuilt.stl"
 PYTHON_BIN="${PYTHON_BIN:-python}"

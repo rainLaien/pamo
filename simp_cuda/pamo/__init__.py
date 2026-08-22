@@ -323,6 +323,9 @@ class PaMO(nn.Module):
         cylinder_minimum_faces=None,
         cylinder_radius_tolerance=1e-3,
         cylinder_target_edge_ratio=1.0,
+        analytic_cylinder_recovery_distance=None,
+        isolate_outer_cylinder_remainder=False,
+        outer_cylinder_remainder_distance=0.2,
         trimmed_cylinder_minimum_faces=None,
         trimmed_cylinder_radius_tolerance=1e-2,
         trimmed_cylinder_normal_tolerance=8e-2,
@@ -419,7 +422,7 @@ class PaMO(nn.Module):
             )
         )
         start_constraints = time.time()
-        verts, faces, _ = refine_original_mesh_by_longest_edge(
+        verts, faces, refinement_stats = refine_original_mesh_by_longest_edge(
             self.gt_mesh,
             max_edge_length=max_edge_length,
             feature_angle_degrees=feature_angle,
@@ -435,6 +438,15 @@ class PaMO(nn.Module):
             cylinder_minimum_faces=cylinder_minimum_faces,
             cylinder_radius_tolerance=cylinder_radius_tolerance,
             cylinder_target_edge_ratio=cylinder_target_edge_ratio,
+            analytic_cylinder_recovery_distance=(
+                analytic_cylinder_recovery_distance
+            ),
+            isolate_outer_cylinder_remainder=(
+                isolate_outer_cylinder_remainder
+            ),
+            outer_cylinder_remainder_distance=(
+                outer_cylinder_remainder_distance
+            ),
             trimmed_cylinder_minimum_faces=trimmed_cylinder_minimum_faces,
             trimmed_cylinder_radius_tolerance=(
                 trimmed_cylinder_radius_tolerance
@@ -473,11 +485,25 @@ class PaMO(nn.Module):
         if quality_flip_passes < 0:
             raise ValueError("Constraint quality flip passes must be non-negative.")
         if quality_iterations > 0:
+            quality_reference_mesh = self.gt_mesh
+            reference_vertices = refinement_stats.get("reference_vertices")
+            if reference_vertices is not None:
+                reference_faces = refinement_stats.get(
+                    "reference_faces", self.gt_mesh.faces
+                )
+                quality_reference_mesh = trimesh.Trimesh(
+                    vertices=np.asarray(reference_vertices, dtype=np.float64),
+                    faces=np.asarray(reference_faces, dtype=np.int64),
+                    process=False,
+                )
             verts, faces, _ = optimize_feature_constrained_mesh(
-                self.gt_mesh,
+                quality_reference_mesh,
                 verts,
                 faces,
                 resolution=resolution,
+                feature_edges=refinement_stats.get(
+                    "reference_feature_edges"
+                ),
                 feature_angle_degrees=feature_angle,
                 iterations=quality_iterations,
                 smoothing_step=quality_step,

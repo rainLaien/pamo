@@ -3,17 +3,18 @@ param(
     [ValidateRange(0.0, 180.0)]
     [double]$FeatureAngle = 15.0,
     [ValidateRange(0.000001, [double]::MaxValue)]
-    [double]$MaxEdgeLength = 10.0
+    [double]$MaxEdgeLength =10.0
 )
 
 $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
-$inputPath = Join-Path $projectRoot "examples\Unnamed-Body.stl"
+$pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"dfrr
+$inputPath = Join-Path $projectRoot "examples\222_li.stl"
 $outputDirectory = Join-Path $projectRoot "examples\test_outputs"
-$outputPath = Join-Path $outputDirectory "Unnamed-Body_constrained.stl"
-$logPath = Join-Path $outputDirectory "Unnamed-Body_constrained.log"
+$outputPath = Join-Path $outputDirectory "222_li_constrained.stl"
+$partitionOutputPath = Join-Path $outputDirectory "222_li_constrained_partitions.ply"
+$logPath = Join-Path $outputDirectory "222_li_constrained.log"
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python virtual environment not found: $pythonPath"
@@ -40,6 +41,7 @@ try {
         ".\example.py"
         "--input", $inputPath
         "--output", $outputPath
+        "--partition-color-ply", $partitionOutputPath
         "--original-constrained-remesh"
         "--sdf-mode", "exact"
         "--constraint-feature-angle", "$FeatureAngle"
@@ -51,14 +53,16 @@ try {
         "--constraint-planar-fan-minimum-valence", "30"
         "--constraint-planar-annulus-minimum-faces", "20"
         "--constraint-cylinder-minimum-faces", "20"
-        "--constraint-cylinder-radius-tolerance", "0.001"
+        "--constraint-cylinder-radius-tolerance", "0.03"
         "--constraint-cylinder-target-edge-ratio", "1.0"
+        "--constraint-isolate-outer-cylinder-remainder"
+        "--constraint-outer-cylinder-remainder-distance", "0.2"
         "--constraint-trimmed-cylinder-minimum-faces", "20"
-        "--constraint-trimmed-cylinder-radius-tolerance", "0.01"
-        "--constraint-trimmed-cylinder-normal-tolerance", "0.08"
+        "--constraint-trimmed-cylinder-radius-tolerance", "0.03"
+        "--constraint-trimmed-cylinder-normal-tolerance", "0.03"
         "--constraint-partial-cylinder-minimum-faces", "20"
-        "--constraint-partial-cylinder-radius-tolerance", "0.002"
-        "--constraint-partial-cylinder-normal-tolerance", "0.02"
+        "--constraint-partial-cylinder-radius-tolerance", "0.03"
+        "--constraint-partial-cylinder-normal-tolerance", "0.03"
         "--constraint-partial-cylinder-minimum-angle", "30"
         "--constraint-rounded-fillet-minimum-faces", "12"
         "--constraint-rounded-fillet-minimum-curvature", "0.2"
@@ -82,4 +86,5 @@ finally {
 }
 
 Write-Host "Optimized mesh written to: $outputPath"
+Write-Host "Partition-color mesh written to: $partitionOutputPath"
 Write-Host "Timing log written to: $logPath"

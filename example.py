@@ -130,6 +130,36 @@ def main():
         default='./BirdHouse_pamo.obj',
         help="Output mesh path; use .ply to export PLY",
     )
+    parser.add_argument(
+        '--partition-color-ply',
+        nargs='?',
+        const='auto',
+        default=None,
+        help=(
+            "Also export a face-colored diagnostic PLY of final feature "
+            "partitions; omit the path to use <output>_partitions.ply"
+        ),
+    )
+    parser.add_argument(
+        '--outer-cylinder-diagnostic-ply',
+        nargs='?',
+        const='auto',
+        default=None,
+        help=(
+            "Export the exact input-face candidate selected for largest-"
+            "cylinder processing as a category-colored diagnostic PLY"
+        ),
+    )
+    parser.add_argument(
+        '--outer-cylinder-remainder-ply',
+        nargs='?',
+        const='auto',
+        default=None,
+        help=(
+            "Export input faces in the same outer-cylinder band which are "
+            "not included in the exact cylinder candidate"
+        ),
+    )
     parser.add_argument('-r', '--ratio', type=float, default=0.1)
     parser.add_argument('-mv', '--min-vertex', type=int, default=0)
     parser.add_argument('--disable_stage1', action='store_true', help="Disable remeshing")
@@ -564,6 +594,29 @@ def main():
         help="Cylinder target edge length divided by boundary median (default: 1)",
     )
     parser.add_argument(
+        '--constraint-cylinder-recovery-distance',
+        type=float,
+        default=None,
+        help=(
+            "Maximum absolute distance used to project Boolean-disturbed "
+            "support onto a fitted cylinder; disabled by default"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-isolate-outer-cylinder-remainder',
+        action='store_true',
+        help=(
+            "Lock the detected outer-cylinder remainder boundary as virtual "
+            "hard edges while remeshing the complete model"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-outer-cylinder-remainder-distance',
+        type=float,
+        default=0.2,
+        help="Radial guard used to reproduce the isolated remainder mask",
+    )
+    parser.add_argument(
         '--constraint-trimmed-cylinder-minimum-faces',
         type=int,
         default=None,
@@ -859,6 +912,31 @@ def main():
     if args.constraint_cylinder_target_edge_ratio <= 0.0:
         parser.error("--constraint-cylinder-target-edge-ratio must be positive")
     if (
+        args.constraint_cylinder_recovery_distance is not None
+        and args.constraint_cylinder_recovery_distance <= 0.0
+    ):
+        parser.error("--constraint-cylinder-recovery-distance must be positive")
+    if (
+        args.constraint_cylinder_recovery_distance is not None
+        and args.constraint_cylinder_minimum_faces is None
+    ):
+        parser.error(
+            "--constraint-cylinder-recovery-distance requires "
+            "--constraint-cylinder-minimum-faces"
+        )
+    if args.constraint_outer_cylinder_remainder_distance <= 0.0:
+        parser.error(
+            "--constraint-outer-cylinder-remainder-distance must be positive"
+        )
+    if (
+        args.constraint_isolate_outer_cylinder_remainder
+        and args.constraint_cylinder_minimum_faces is None
+    ):
+        parser.error(
+            "--constraint-isolate-outer-cylinder-remainder requires "
+            "--constraint-cylinder-minimum-faces"
+        )
+    if (
         args.constraint_trimmed_cylinder_minimum_faces is not None
         and args.constraint_trimmed_cylinder_minimum_faces < 4
     ):
@@ -1089,6 +1167,15 @@ def main():
             cylinder_target_edge_ratio=(
                 args.constraint_cylinder_target_edge_ratio
             ),
+            analytic_cylinder_recovery_distance=(
+                args.constraint_cylinder_recovery_distance
+            ),
+            isolate_outer_cylinder_remainder=(
+                args.constraint_isolate_outer_cylinder_remainder
+            ),
+            outer_cylinder_remainder_distance=(
+                args.constraint_outer_cylinder_remainder_distance
+            ),
             trimmed_cylinder_minimum_faces=(
                 args.constraint_trimmed_cylinder_minimum_faces
             ),
@@ -1147,6 +1234,128 @@ def main():
     print("# of output verts : {}".format(len(output_mesh.vertices)))
     print("# of output faces : {}".format(len(output_mesh.faces)))
     output_mesh.export(args.output)
+    if args.partition_color_ply is not None:
+        if not args.original_constrained_remesh:
+            parser.error(
+                "--partition-color-ply currently requires "
+                "--original-constrained-remesh"
+            )
+        partition_path = args.partition_color_ply
+        if partition_path == 'auto':
+            output_path = Path(args.output)
+            partition_path = str(
+                output_path.with_name(output_path.stem + '_partitions.ply')
+            )
+        from pamo.original_constrained import export_feature_partition_ply
+        partition_stats = export_feature_partition_ply(
+            partition_path,
+            verts,
+            faces,
+            feature_angle_degrees=args.constraint_feature_angle,
+        )
+        print(
+            "Partition-color PLY: {} partition(s), largest {} faces, "
+            "{} cylindrical tessellation seam(s) relaxed; written to {}"
+            .format(
+                partition_stats['partitions'],
+                partition_stats['largest_partition_faces'],
+                partition_stats['cylinder_seams_relaxed'],
+                partition_path,
+            )
+        )
+    if args.outer_cylinder_diagnostic_ply is not None:
+        if not args.original_constrained_remesh:
+            parser.error(
+                "--outer-cylinder-diagnostic-ply currently requires "
+                "--original-constrained-remesh"
+            )
+        diagnostic_path = args.outer_cylinder_diagnostic_ply
+        if diagnostic_path == 'auto':
+            output_path = Path(args.output)
+            diagnostic_path = str(
+                output_path.with_name(
+                    output_path.stem + '_outer_cylinder_candidate_input.ply'
+                )
+            )
+        from pamo.original_constrained import (
+            export_outer_cylinder_diagnostic_ply,
+        )
+        diagnostic_stats = export_outer_cylinder_diagnostic_ply(
+            diagnostic_path,
+            input_mesh.vertices,
+            input_mesh.faces,
+            feature_angle_degrees=args.constraint_feature_angle,
+            cylinder_minimum_faces=(
+                args.constraint_cylinder_minimum_faces or 20
+            ),
+            cylinder_radius_tolerance=(
+                args.constraint_cylinder_radius_tolerance
+            ),
+            recovery_distance=(
+                args.constraint_cylinder_recovery_distance or 0.2
+            ),
+        )
+        print(
+            "Outer-cylinder input candidate PLY: radius {:.6g}, {} faces "
+            "(support {}, near {}, transition {}), {} connected candidate "
+            "component(s), guard {:.6g}; written to {}".format(
+                diagnostic_stats['radius'],
+                diagnostic_stats['faces'],
+                diagnostic_stats['reliable_support_faces'],
+                diagnostic_stats['near_cylinder_faces'],
+                diagnostic_stats['transition_faces'],
+                diagnostic_stats['candidate_components'],
+                diagnostic_stats['recovery_distance'],
+                diagnostic_path,
+            )
+        )
+    if args.outer_cylinder_remainder_ply is not None:
+        if not args.original_constrained_remesh:
+            parser.error(
+                "--outer-cylinder-remainder-ply currently requires "
+                "--original-constrained-remesh"
+            )
+        remainder_path = args.outer_cylinder_remainder_ply
+        if remainder_path == 'auto':
+            output_path = Path(args.output)
+            remainder_path = str(
+                output_path.with_name(
+                    output_path.stem + '_outer_cylinder_remainder_input.ply'
+                )
+            )
+        from pamo.original_constrained import (
+            export_outer_cylinder_diagnostic_ply,
+        )
+        remainder_stats = export_outer_cylinder_diagnostic_ply(
+            remainder_path,
+            input_mesh.vertices,
+            input_mesh.faces,
+            feature_angle_degrees=args.constraint_feature_angle,
+            cylinder_minimum_faces=(
+                args.constraint_cylinder_minimum_faces or 20
+            ),
+            cylinder_radius_tolerance=(
+                args.constraint_cylinder_radius_tolerance
+            ),
+            recovery_distance=(
+                args.constraint_cylinder_recovery_distance or 0.2
+            ),
+            export_remainder=True,
+        )
+        print(
+            "Outer-cylinder remainder input PLY: radius {:.6g}, {} faces "
+            "(support {}, near {}, transition {}, outside guard {}), shell "
+            "+/- {:.6g}; written to {}".format(
+                remainder_stats['radius'],
+                remainder_stats['faces'],
+                remainder_stats['reliable_support_faces'],
+                remainder_stats['near_cylinder_faces'],
+                remainder_stats['transition_faces'],
+                remainder_stats['raised_feature_faces'],
+                remainder_stats['shell_halfwidth'],
+                remainder_path,
+            )
+        )
 
     # # test PaSP
     # pasp = PaSP()

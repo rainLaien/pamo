@@ -49,6 +49,147 @@ else:
     "Feature optimization dependencies are unavailable",
 )
 class FeatureOptimizeTest(unittest.TestCase):
+    @staticmethod
+    def _disturbed_cylinder_patch(center_radius):
+        angles = (0.0, 0.2, 0.4)
+        heights = (0.0, 1.0, 2.0)
+        vertices = []
+        for row, height in enumerate(heights):
+            for column, angle in enumerate(angles):
+                radius = center_radius if (row, column) == (1, 1) else 10.0
+                vertices.append(
+                    (radius * np.cos(angle), radius * np.sin(angle), height)
+                )
+        faces = []
+        for row in range(2):
+            for column in range(2):
+                lower_left = row * 3 + column
+                lower_right = lower_left + 1
+                upper_left = lower_left + 3
+                upper_right = upper_left + 1
+                faces.extend(
+                    (
+                        (lower_left, lower_right, upper_left),
+                        (lower_right, upper_right, upper_left),
+                    )
+                )
+        model = {
+            "axis": np.asarray((0.0, 0.0, 1.0)),
+            "origin": np.asarray((0.0, 0.0, 0.0)),
+            "radius": 10.0,
+            "source_face_ids": np.asarray((0,), dtype=np.int64),
+            "axial_min": 0.0,
+            "axial_max": 2.0,
+        }
+        return np.asarray(vertices), np.asarray(faces), model
+
+    def test_analytic_cylinder_recovery_projects_and_relaxes_internal_edge(self):
+        vertices, faces, model = self._disturbed_cylinder_patch(10.1)
+        internal_edge = (1, 3)
+        boundary_edge = (0, 1)
+
+        recovered, protected, stats = (
+            original_constrained.recover_analytic_cylinder_support(
+                vertices,
+                faces,
+                np.asarray((internal_edge, boundary_edge)),
+                (model,),
+                maximum_projection_distance=0.2,
+            )
+        )
+
+        self.assertAlmostEqual(np.linalg.norm(recovered[4, :2]), 10.0)
+        protected_set = {tuple(edge) for edge in protected.tolist()}
+        self.assertNotIn(internal_edge, protected_set)
+        self.assertIn(boundary_edge, protected_set)
+        self.assertEqual(stats["relaxed_edges"], 1)
+        self.assertGreater(stats["projected_vertices"], 0)
+        self.assertLessEqual(stats["maximum_displacement"], 0.2)
+
+    def test_analytic_cylinder_recovery_preserves_geometry_beyond_guard(self):
+        vertices, faces, model = self._disturbed_cylinder_patch(10.3)
+
+        recovered, _, stats = (
+            original_constrained.recover_analytic_cylinder_support(
+                vertices,
+                faces,
+                np.empty((0, 2), dtype=np.int64),
+                (model,),
+                maximum_projection_distance=0.2,
+            )
+        )
+
+        np.testing.assert_allclose(recovered[4], vertices[4])
+        self.assertLessEqual(stats["maximum_displacement"], 0.2)
+
+    def test_partition_colors_distinguish_disconnected_surface_regions(self):
+        vertices = np.asarray(
+            (
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (1.0, 1.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (3.0, 0.0, 0.0),
+                (4.0, 0.0, 0.0),
+                (4.0, 1.0, 0.0),
+                (3.0, 1.0, 0.0),
+            ),
+            dtype=np.float64,
+        )
+        faces = np.asarray(
+            ((0, 1, 2), (0, 2, 3), (4, 5, 6), (4, 6, 7)),
+            dtype=np.int64,
+        )
+
+        colors, labels, stats = (
+            original_constrained.build_feature_partition_face_colors(
+                vertices,
+                faces,
+                feature_angle_degrees=15.0,
+            )
+        )
+
+        self.assertEqual(stats["partitions"], 2)
+        self.assertEqual(colors.shape, (4, 4))
+        self.assertTrue(np.all(colors[:, 3] == 255))
+        self.assertEqual(labels[0], labels[1])
+        self.assertEqual(labels[2], labels[3])
+        self.assertNotEqual(labels[0], labels[2])
+        self.assertFalse(np.array_equal(colors[0], colors[2]))
+
+    def test_false_hard_edge_inside_one_cylinder_support_is_relaxed(self):
+        angles = np.asarray([0.0, 0.2])
+        vertices = np.asarray(
+            [
+                [10.0 * np.cos(angle), 10.0 * np.sin(angle), height]
+                for height in (0.0, 1.0)
+                for angle in angles
+            ],
+            dtype=np.float64,
+        )
+        faces = np.asarray(((0, 1, 2), (1, 3, 2)), dtype=np.int64)
+        shared_diagonal = (1, 2)
+        true_boundary = (0, 1)
+        model = {
+            "axis": np.asarray([0.0, 0.0, 1.0]),
+            "origin": np.zeros(3),
+            "radius": 10.0,
+        }
+
+        remaining, relaxed = (
+            original_constrained._relax_false_cylinder_feature_edges(
+                vertices,
+                faces,
+                np.asarray((shared_diagonal, true_boundary), dtype=np.int64),
+                [model],
+            )
+        )
+        remaining = {tuple(map(int, edge)) for edge in remaining}
+
+        self.assertEqual(relaxed, 1)
+        self.assertNotIn(shared_diagonal, remaining)
+        self.assertIn(true_boundary, remaining)
+
     def test_targeted_edge_splits_are_conforming_and_keep_lineage(self):
         vertices = np.asarray(
             (
@@ -421,6 +562,159 @@ class FeatureOptimizeTest(unittest.TestCase):
             all(tuple(sorted(map(int, edge))) in result_edges for edge in boundary)
         )
 
+    def test_short_cylinder_can_retriangulate_without_new_vertices(self):
+        count = 30
+        angles = np.arange(count) * (2.0 * np.pi / count)
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (10 * np.cos(angles), 10 * np.sin(angles), np.zeros(count))
+                ),
+                np.column_stack(
+                    (10 * np.cos(angles), 10 * np.sin(angles), np.ones(count))
+                ),
+            )
+        )
+        faces = np.asarray(
+            [
+                face
+                for index in range(count)
+                for face in (
+                    [index, (index + 1) % count, count + index],
+                    [
+                        (index + 1) % count,
+                        count + (index + 1) % count,
+                        count + index,
+                    ],
+                )
+            ],
+            dtype=np.int64,
+        )
+        boundaries = np.asarray(
+            [[index, (index + 1) % count] for index in range(count)]
+            + [
+                [count + index, count + (index + 1) % count]
+                for index in range(count)
+            ],
+            dtype=np.int64,
+        )
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_cylindrical_walls(
+                vertices,
+                faces,
+                boundaries,
+                minimum_faces=20,
+            )
+        )
+
+        self.assertEqual(stats["walls"], 1)
+        self.assertEqual(len(result_vertices), len(vertices))
+        self.assertEqual(result_vertices.shape[1], 3)
+        self.assertEqual(len(result_faces), len(faces))
+
+    def test_embossing_interrupted_cylinder_support_is_recovered(self):
+        angular_count = 41
+        axial_count = 6
+        angles = np.linspace(-0.75 * np.pi, 0.75 * np.pi, angular_count)
+        heights = np.asarray([0.0, 4.8, 4.9, 5.0, 5.1, 10.0])
+        vertices = np.asarray(
+            [
+                [10.0 * np.cos(angle), 10.0 * np.sin(angle), height]
+                for height in heights
+                for angle in angles
+            ],
+            dtype=np.float64,
+        )
+        faces = []
+        for axial_index in range(axial_count - 1):
+            for angular_index in range(angular_count - 1):
+                # A rectangular opening represents the support removed by
+                # an embossed feature Boolean union.
+                if 2 <= axial_index <= 3 and 16 <= angular_index <= 23:
+                    continue
+                lower = axial_index * angular_count + angular_index
+                upper = lower + angular_count
+                faces.extend(
+                    (
+                        [lower, lower + 1, upper],
+                        [lower + 1, upper + 1, upper],
+                    )
+                )
+        faces = np.asarray(faces, dtype=np.int64)
+        edges = np.sort(
+            faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1
+        )
+        unique_edges, edge_counts = np.unique(edges, axis=0, return_counts=True)
+        boundary = unique_edges[edge_counts == 1]
+        internal_constraints = np.asarray(
+            [
+                [
+                    axial_index * angular_count + 10,
+                    (axial_index + 1) * angular_count + 10,
+                ]
+                for axial_index in range(axial_count - 1)
+            ],
+            dtype=np.int64,
+        )
+        protected = np.vstack((boundary, internal_constraints))
+        model = {
+            "axis": np.asarray([0.0, 0.0, 1.0]),
+            "origin": np.zeros(3),
+            "first_basis": np.asarray([1.0, 0.0, 0.0]),
+            "second_basis": np.asarray([0.0, 1.0, 0.0]),
+            "radius": 10.0,
+            "source_faces": len(faces),
+        }
+        old_quality = feature_optimize._triangle_quality_values(vertices, faces)
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_interrupted_cylindrical_walls(
+                vertices,
+                faces,
+                protected,
+                [model],
+                minimum_faces=20,
+                radius_tolerance=0.03,
+                preferred_edge_length=1.5,
+            )
+        )
+        new_quality = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )
+        periodic_vertices, periodic_faces, periodic_stats = (
+            original_constrained.retriangulate_interrupted_cylindrical_walls(
+                result_vertices,
+                result_faces,
+                protected,
+                [model],
+                minimum_faces=20,
+                radius_tolerance=0.03,
+                preferred_edge_length=1.5,
+                seam_angle_offset=np.pi,
+            )
+        )
+        periodic_quality = feature_optimize._triangle_quality_values(
+            periodic_vertices, periodic_faces
+        )
+        result_edges = {
+            tuple(sorted((int(first), int(second))))
+            for face in periodic_faces
+            for first, second in (
+                (face[0], face[1]), (face[1], face[2]), (face[2], face[0])
+            )
+        }
+
+        self.assertGreaterEqual(stats["patches"], 1, stats)
+        self.assertGreaterEqual(periodic_stats["patches"], 1, periodic_stats)
+        self.assertGreater(float(new_quality.mean()), float(old_quality.mean()))
+        self.assertGreaterEqual(
+            float(periodic_quality.mean()), float(new_quality.mean()) - 1e-8
+        )
+        self.assertTrue(
+            all(tuple(map(int, edge)) in result_edges for edge in protected)
+        )
+
     def test_mismatched_cylinder_rings_get_axial_transition_rows(self):
         lower_count = 60
         upper_count = 20
@@ -515,6 +809,65 @@ class FeatureOptimizeTest(unittest.TestCase):
                 for edge, count in zip(unique_edges, edge_counts)
             )
         )
+
+    def test_closed_cylinder_uses_integer_periodic_column_count(self):
+        count = 60
+        angles = np.arange(count) * (2.0 * np.pi / count)
+        vertices = np.vstack(
+            (
+                np.column_stack(
+                    (10.0 * np.cos(angles), 10.0 * np.sin(angles), np.zeros(count))
+                ),
+                np.column_stack(
+                    (
+                        10.0 * np.cos(angles),
+                        10.0 * np.sin(angles),
+                        np.full(count, 8.0),
+                    )
+                ),
+            )
+        )
+        faces = np.asarray(
+            [
+                face
+                for index in range(count)
+                for face in (
+                    [index, (index + 1) % count, count + index],
+                    [
+                        (index + 1) % count,
+                        count + (index + 1) % count,
+                        count + index,
+                    ],
+                )
+            ],
+            dtype=np.int64,
+        )
+        boundaries = np.asarray(
+            [[index, (index + 1) % count] for index in range(count)]
+            + [
+                [count + index, count + (index + 1) % count]
+                for index in range(count)
+            ],
+            dtype=np.int64,
+        )
+
+        result_vertices, result_faces, stats = (
+            original_constrained.retriangulate_cylindrical_walls(
+                vertices,
+                faces,
+                boundaries,
+                minimum_faces=20,
+                preferred_edge_length=1.5,
+            )
+        )
+        centroids = result_vertices[result_faces].mean(axis=1)
+        middle = (centroids[:, 2] > 1.0) & (centroids[:, 2] < 7.0)
+        qualities = feature_optimize._triangle_quality_values(
+            result_vertices, result_faces
+        )[middle]
+
+        self.assertEqual(stats["walls"], 1)
+        self.assertGreater(float(qualities.min()), 0.65)
 
     def test_boolean_trimmed_cylinder_keeps_irregular_join_loops(self):
         count = 60
