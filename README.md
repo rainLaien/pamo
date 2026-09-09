@@ -44,6 +44,15 @@ bash demo.sh
 We offer three meshes stored under `./mesh` folder (from [DTC dataset](https://ai.meta.com/blog/digital-twin-catalog-3d-reconstruction-shopify-reality-labs-research/)) for the demo. The results will be saved under `./examples` folder.
 
 ## Example
+
+For CAD surface segmentation followed by remeshing, see
+[cad_mesh/README.md](cad_mesh/README.md). Its Windows entry point is
+`cad_mesh/run_segmentation.ps1 -InputStl model.stl -Remesh`;
+`cad_mesh/run_remesh.ps1 -PartitionDirectory partition_output` processes an
+existing partition. The default `surface` method rebuilds whole analytic charts
+and optimizes other patches against their complete reference surfaces, with
+shared geometric boundaries and retained source-label provenance.
+
 ```
 python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 ```
@@ -76,6 +85,9 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--feature-flip-passes`**: Set the number of quality-driven non-feature edge-flip passes, default=2.
 - **`--surface-sample-count`**: Requested candidate-point budget for original-surface sampling. Dense input meshes should use a conservative value; adding too many points over-refines the mesh.
 - **`--surface-poisson-radius`**: Optional world-space minimum sample spacing. By default it is derived from surface area and `--surface-sample-count`.
+- **`--surface-curvature-adaptive`**: Replace the uniform split/collapse thresholds with a patch-independent curvature sizing field. The target is clamped between the adaptive minimum and maximum lengths; true sharp edges and boundaries remain constrained.
+- **`--surface-curvature-tolerance`**: World-space approximation tolerance used with maximum absolute principal curvature. Lower values create shorter edges. The automatic value is `0.1 * Poisson radius`.
+- **`--surface-adaptive-min-edge-length`** / **`--surface-adaptive-max-edge-length`**: Clamp the curvature target. Defaults are `Poisson radius` and `4 * Poisson radius`.
 - **`--surface-flip-passes`**: Number of conflict-free CUDA edge-flip batches for sampled remeshing, default=5.
 - **`--surface-max-edge-ratio`**: Hard output edge-length bound divided by the Poisson radius, default=2.0. The two-radius default avoids over-refining narrow walls while still eliminating extreme long edges.
 - **`--surface-min-edge-ratio`**: Short-edge collapse threshold divided by the Poisson radius, default=0.5. Collapses must remain inside one smooth patch and improve local quality.
@@ -87,9 +99,15 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 - **`--surface-min-collapse-quality`**: Also make edges adjacent to triangles below this normalized quality eligible for controlled collapse, even when the edge is not shorter than the minimum edge ratio. The default is `0.25`; use `0` to keep short-edge-only behavior.
 - **`--surface-coplanar-angle`**: Treat adjacent source faces within this normal angle as one coplanar patch for source-edge refinement. Internal coplanar edges are no longer subdivided as hard source boundaries; the default is `1` degree.
 - **`--original-constrained-remesh`**: Preserve sharp, boundary, and non-manifold input edges as hard constraint chains. After conforming longest-edge refinement, quality-improving flips remove non-feature seams inside coplanar patches.
+- **`--constraint-topology-backend {auto,cpu,cuda}`**: Select the backend for constrained short-edge cleanup. `auto` uses CUDA for dense meshes and avoids GPU launch overhead for small local patches.
+- **`--semantic-partition-ply [PATH]`**: Export an experimental input-surface partition driven by creases and curvature-gradient changes. This detects tangent plane/fillet transitions that a dihedral threshold alone can miss.
+- **`--semantic-gradient-threshold`**: Equivalent normal-rate change used by semantic partitioning, in degrees; default=`1`.
+- **`--semantic-min-region-faces`**: Merge soft-boundary fragments smaller than this size while retaining strong creases; default=`20`.
 - **`--constraint-feature-angle`**: Mark every original manifold edge whose adjacent-face dihedral is strictly greater than this angle as a hard feature, default=5 degrees.
 - **`--constraint-max-edge-length`**: Globally bisect longest edges until every output edge satisfies this world-space length bound. When omitted, the limit is `5% of the bounding-box diagonal`. This tighter scale-based default improves edge-length consistency on ordinary planar regions.
 - **`--constraint-max-splits`**: Optional safety limit for longest-edge bisection. When omitted, the edge-only binary-bisection estimate receives a 4x conformity margin with a minimum budget of 100000.
+- **`--constraint-short-edge-collapse-ratio`**: Collapse topology-safe coplanar interior edges shorter than this fraction of the maximum edge length, default=`0.5`. Hard features and mesh boundaries remain locked.
+- **`--constraint-short-edge-collapse-passes`**: Maximum number of safe short-edge collapse passes, default=`3`. Set it to `0` to retain the previous split-only behavior.
 - **`--constraint-flip-passes`**: Number of quality-driven coplanar non-feature edge-flip passes after refinement, default=8. Hard feature chains are never flipped.
 - **`--constraint-flip-minimum-valence`**: Restrict coplanar flips to edges touching unusually high-valence vertices. A value such as `12` efficiently removes planar center-fan triangulations without scanning every edge for expensive quality tests.
 - **`--constraint-flip-maximum-candidate-quality`**: Also inspect edges adjacent to triangles below this normalized quality. A value such as `0.1` repairs skinny coplanar triangles introduced by strict longest-edge splitting while retaining the edge-length limit.
@@ -143,6 +161,26 @@ python example.py \
   --surface-max-deviation-ratio 0.05 \
   --surface-flip-passes 32
 ```
+
+For CGAL-style curvature-adaptive density without semantic patch recovery:
+```
+python example.py \
+  --input ./model.stl \
+  --output ./examples/model_adaptive.stl \
+  --surface-sample-remesh \
+  --surface-curvature-adaptive \
+  --surface-poisson-radius 8 \
+  --surface-curvature-tolerance 1 \
+  --surface-adaptive-min-edge-length 5 \
+  --surface-adaptive-max-edge-length 30 \
+  --surface-collapse-passes 4 \
+  --surface-flip-passes 4
+```
+
+This is a scalar isotropic field: on a cylinder, high circumferential
+curvature also shortens axial edges. It can therefore increase the face count
+on long, small-radius cylinders. An anisotropic principal-direction field is
+more efficient when different axial and circumferential lengths are desired.
 
 The directly executable validation command is:
 ```

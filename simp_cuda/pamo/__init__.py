@@ -339,6 +339,9 @@ class PaMO(nn.Module):
         rounded_fillet_target_edge_ratio=4.0,
         rounded_fillet_minimum_triangle_angle=28.0,
         planar_region_minimum_faces=None,
+        short_edge_collapse_ratio=0.5,
+        short_edge_collapse_passes=3,
+        topology_backend="auto",
         quality_iterations=20,
         quality_step=0.4,
         quality_flip_passes=12,
@@ -474,6 +477,9 @@ class PaMO(nn.Module):
                 rounded_fillet_minimum_triangle_angle
             ),
             planar_region_minimum_faces=planar_region_minimum_faces,
+            short_edge_collapse_ratio=short_edge_collapse_ratio,
+            short_edge_collapse_passes=short_edge_collapse_passes,
+            topology_backend=topology_backend,
         )
         quality_iterations = int(quality_iterations)
         quality_step = float(quality_step)
@@ -510,6 +516,20 @@ class PaMO(nn.Module):
                 flip_passes=quality_flip_passes,
                 maximum_edge_length=max_edge_length,
             )
+        referenced_vertices, compact_faces = np.unique(
+            np.asarray(faces, dtype=np.int64),
+            return_inverse=True,
+        )
+        removed_vertices = len(verts) - len(referenced_vertices)
+        if removed_vertices:
+            verts = np.asarray(verts)[referenced_vertices]
+            faces = compact_faces.reshape(np.asarray(faces).shape)
+            print(
+                "Short-edge cleanup removed {} unreferenced vertex/vertices."
+                .format(removed_vertices),
+                flush=True,
+            )
+        self.last_original_constraint_stats = refinement_stats
         print(
             "Time for Strict Original Constraint Refinement: {} sec".format(
                 time.time() - start_constraints
@@ -759,6 +779,10 @@ class PaMO(nn.Module):
         maximum_surface_deviation_ratio=0.05,
         minimum_collapse_quality=0.25,
         coplanar_angle_degrees=1.0,
+        curvature_adaptive=False,
+        curvature_tolerance=None,
+        adaptive_minimum_edge_length=None,
+        adaptive_maximum_edge_length=None,
     ):
         """
         Remesh from points sampled directly on the original triangle surface.
@@ -799,6 +823,10 @@ class PaMO(nn.Module):
             ),
             minimum_collapse_quality=minimum_collapse_quality,
             coplanar_angle_degrees=coplanar_angle_degrees,
+            curvature_adaptive=curvature_adaptive,
+            curvature_tolerance=curvature_tolerance,
+            adaptive_minimum_edge_length=adaptive_minimum_edge_length,
+            adaptive_maximum_edge_length=adaptive_maximum_edge_length,
         )
         return verts, faces
 

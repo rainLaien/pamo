@@ -3,18 +3,18 @@ param(
     [ValidateRange(0.0, 180.0)]
     [double]$FeatureAngle = 15.0,
     [ValidateRange(0.000001, [double]::MaxValue)]
-    [double]$MaxEdgeLength =10.0
+    [double]$MaxEdgeLength = 15.0
 )
 
 $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"dfrr
-$inputPath = Join-Path $projectRoot "examples\222_li.stl"
+$pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
+$inputPath = Join-Path $projectRoot "examples\2.stl"
 $outputDirectory = Join-Path $projectRoot "examples\test_outputs"
-$outputPath = Join-Path $outputDirectory "222_li_constrained.stl"
-$partitionOutputPath = Join-Path $outputDirectory "222_li_constrained_partitions.ply"
-$logPath = Join-Path $outputDirectory "222_li_constrained.log"
+$outputPath = Join-Path $outputDirectory "2_constrained.stl"
+$partitionOutputPath = Join-Path $outputDirectory "2_constrained_partitions.ply"
+$logPath = Join-Path $outputDirectory "2_constrained.log"
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python virtual environment not found: $pythonPath"

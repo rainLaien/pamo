@@ -141,6 +141,34 @@ def main():
         ),
     )
     parser.add_argument(
+        '--semantic-partition-ply',
+        nargs='?',
+        const='auto',
+        default=None,
+        help=(
+            "Export an input-mesh diagnostic partition using crease and "
+            "curvature-gradient cues; omit the path to derive it from output"
+        ),
+    )
+    parser.add_argument(
+        '--semantic-gradient-threshold',
+        type=float,
+        default=1.0,
+        help=(
+            "Equivalent normal-rate change in degrees used to split tangent "
+            "plane/fillet transitions (default: 1)"
+        ),
+    )
+    parser.add_argument(
+        '--semantic-min-region-faces',
+        type=int,
+        default=20,
+        help=(
+            "Merge soft-boundary semantic fragments below this face count; "
+            "strong creases remain protected (default: 20)"
+        ),
+    )
+    parser.add_argument(
         '--outer-cylinder-diagnostic-ply',
         nargs='?',
         const='auto',
@@ -531,6 +559,65 @@ def main():
         ),
     )
     parser.add_argument(
+        '--surface-curvature-adaptive',
+        action='store_true',
+        help=(
+            "Use a CGAL-style curvature sizing field instead of a uniform "
+            "edge target; patch classification is not required"
+        ),
+    )
+    parser.add_argument(
+        '--surface-curvature-tolerance',
+        type=float,
+        default=None,
+        help=(
+            "World-space approximation tolerance for adaptive sizing; "
+            "default is 0.1 times the Poisson radius"
+        ),
+    )
+    parser.add_argument(
+        '--surface-adaptive-min-edge-length',
+        type=float,
+        default=None,
+        help="Minimum adaptive target edge length (default: Poisson radius)",
+    )
+    parser.add_argument(
+        '--surface-adaptive-max-edge-length',
+        type=float,
+        default=None,
+        help=(
+            "Maximum adaptive target edge length on flat regions "
+            "(default: 4 times Poisson radius)"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-short-edge-collapse-ratio',
+        type=float,
+        default=0.5,
+        help=(
+            "Collapse topology-safe coplanar interior edges shorter than "
+            "this fraction of the maximum edge length (default: 0.5)"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-short-edge-collapse-passes',
+        type=int,
+        default=3,
+        help=(
+            "Maximum safe short-edge collapse passes; use 0 to disable "
+            "(default: 3)"
+        ),
+    )
+    parser.add_argument(
+        '--constraint-topology-backend',
+        choices=('auto', 'cpu', 'cuda'),
+        default='auto',
+        help=(
+            "Topology backend for constrained short-edge cleanup. Auto uses "
+            "CUDA for dense meshes and CPU for small patches (default: auto)"
+        ),
+    )
+    parser.add_argument(
         '--constraint-flip-passes',
         type=int,
         default=8,
@@ -786,6 +873,28 @@ def main():
         and args.surface_poisson_radius <= 0.0
     ):
         parser.error("--surface-poisson-radius must be positive")
+    for option_name, option_value in (
+        ("--surface-curvature-tolerance", args.surface_curvature_tolerance),
+        (
+            "--surface-adaptive-min-edge-length",
+            args.surface_adaptive_min_edge_length,
+        ),
+        (
+            "--surface-adaptive-max-edge-length",
+            args.surface_adaptive_max_edge_length,
+        ),
+    ):
+        if option_value is not None and option_value <= 0.0:
+            parser.error("{} must be positive".format(option_name))
+    if (
+        args.surface_adaptive_min_edge_length is not None
+        and args.surface_adaptive_max_edge_length is not None
+        and args.surface_adaptive_min_edge_length
+        > args.surface_adaptive_max_edge_length
+    ):
+        parser.error(
+            "--surface-adaptive-min-edge-length must not exceed the maximum"
+        )
     if args.surface_sample_oversample <= 0:
         parser.error("--surface-sample-oversample must be positive")
     if args.surface_flip_passes < 0:
@@ -874,6 +983,14 @@ def main():
         and args.constraint_max_splits <= 0
     ):
         parser.error("--constraint-max-splits must be positive")
+    if not 0.0 <= args.constraint_short_edge_collapse_ratio < 1.0:
+        parser.error(
+            "--constraint-short-edge-collapse-ratio must be in [0, 1)"
+        )
+    if args.constraint_short_edge_collapse_passes < 0:
+        parser.error(
+            "--constraint-short-edge-collapse-passes must be non-negative"
+        )
     if args.constraint_flip_passes < 0:
         parser.error("--constraint-flip-passes must be non-negative")
     if (
@@ -1011,6 +1128,10 @@ def main():
         parser.error("--constraint-quality-step must be in (0, 1]")
     if args.constraint_quality_flip_passes < 0:
         parser.error("--constraint-quality-flip-passes must be non-negative")
+    if args.semantic_gradient_threshold <= 0.0:
+        parser.error("--semantic-gradient-threshold must be positive")
+    if args.semantic_min_region_faces < 1:
+        parser.error("--semantic-min-region-faces must be positive")
 
 
     input_mesh = load_input_mesh(args.input)
@@ -1021,6 +1142,38 @@ def main():
     )
     print("# of input verts : {}".format(len(input_mesh.vertices)))
     print("# of input faces : {}".format(len(input_mesh.faces)))
+
+    if args.semantic_partition_ply is not None:
+        semantic_path = args.semantic_partition_ply
+        if semantic_path == 'auto':
+            output_path = Path(args.output)
+            semantic_path = str(
+                output_path.with_name(
+                    output_path.stem + '_semantic_input_partitions.ply'
+                )
+            )
+        from pamo.semantic_partition import export_semantic_partition_ply
+        semantic_result = export_semantic_partition_ply(
+            semantic_path,
+            input_mesh.vertices,
+            input_mesh.faces,
+            feature_angle_degrees=args.constraint_feature_angle,
+            curvature_gradient_degrees=args.semantic_gradient_threshold,
+            minimum_region_faces=args.semantic_min_region_faces,
+        )
+        print(
+            "Semantic input partition: {} region(s), {} crease edge(s), {} "
+            "curvature-gradient edge(s), types {}; time {:.3f}s; written to {}"
+            .format(
+                semantic_result.stats['partitions'],
+                semantic_result.stats['crease_edges'],
+                semantic_result.stats['gradient_edges'],
+                semantic_result.stats['region_types'],
+                semantic_result.stats['elapsed'],
+                semantic_path,
+            ),
+            flush=True,
+        )
 
     points = torch.from_numpy(input_mesh.vertices).float().cuda()
     triangles = torch.from_numpy(input_mesh.faces).int().cuda()
@@ -1090,6 +1243,14 @@ def main():
             ),
             minimum_collapse_quality=args.surface_min_collapse_quality,
             coplanar_angle_degrees=args.surface_coplanar_angle,
+            curvature_adaptive=args.surface_curvature_adaptive,
+            curvature_tolerance=args.surface_curvature_tolerance,
+            adaptive_minimum_edge_length=(
+                args.surface_adaptive_min_edge_length
+            ),
+            adaptive_maximum_edge_length=(
+                args.surface_adaptive_max_edge_length
+            ),
         )
     elif args.feature_remesh:
         verts, faces = pamo.feature_remesh(
@@ -1147,6 +1308,13 @@ def main():
             max_edge_length=args.constraint_max_edge_length,
             feature_angle=args.constraint_feature_angle,
             max_splits=args.constraint_max_splits,
+            short_edge_collapse_ratio=(
+                args.constraint_short_edge_collapse_ratio
+            ),
+            short_edge_collapse_passes=(
+                args.constraint_short_edge_collapse_passes
+            ),
+            topology_backend=args.constraint_topology_backend,
             coplanar_flip_passes=args.constraint_flip_passes,
             coplanar_flip_minimum_valence=(
                 args.constraint_flip_minimum_valence
@@ -1246,13 +1414,39 @@ def main():
             partition_path = str(
                 output_path.with_name(output_path.stem + '_partitions.ply')
             )
-        from pamo.original_constrained import export_feature_partition_ply
-        partition_stats = export_feature_partition_ply(
-            partition_path,
-            verts,
-            faces,
-            feature_angle_degrees=args.constraint_feature_angle,
+        constraint_stats = getattr(
+            pamo, "last_original_constraint_stats", {}
         )
+        brep_stats = constraint_stats.get("brep_model_first")
+        if brep_stats is not None:
+            from pamo.brep_partition import (
+                transfer_patch_labels,
+                write_patch_id_ply,
+            )
+            final_patch_ids = transfer_patch_labels(
+                constraint_stats["reference_vertices"],
+                constraint_stats["reference_faces"],
+                brep_stats["face_labels"],
+                verts,
+                faces,
+            )
+            write_patch_id_ply(
+                partition_path, verts, faces, final_patch_ids
+            )
+            final_sizes = np.bincount(final_patch_ids)
+            partition_stats = {
+                "partitions": int(len(final_sizes)),
+                "largest_partition_faces": int(final_sizes.max()),
+                "cylinder_seams_relaxed": 0,
+            }
+        else:
+            from pamo.original_constrained import export_feature_partition_ply
+            partition_stats = export_feature_partition_ply(
+                partition_path,
+                verts,
+                faces,
+                feature_angle_degrees=args.constraint_feature_angle,
+            )
         print(
             "Partition-color PLY: {} partition(s), largest {} faces, "
             "{} cylindrical tessellation seam(s) relaxed; written to {}"

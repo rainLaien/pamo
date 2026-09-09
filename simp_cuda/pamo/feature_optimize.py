@@ -74,11 +74,19 @@ def _triangle_quality_values(vertices, faces):
     ab = triangles[:, 1] - triangles[:, 0]
     bc = triangles[:, 2] - triangles[:, 1]
     ca = triangles[:, 0] - triangles[:, 2]
-    twice_area = np.linalg.norm(np.cross(ab, -ca), axis=1)
+    # This helper is called on many tiny face batches during local topology
+    # optimization.  np.cross and np.linalg.norm carry substantial dispatch
+    # overhead for those batches, so keep the arithmetic as plain ufuncs.
+    cross_x = ab[:, 2] * ca[:, 1] - ab[:, 1] * ca[:, 2]
+    cross_y = ab[:, 0] * ca[:, 2] - ab[:, 2] * ca[:, 0]
+    cross_z = ab[:, 1] * ca[:, 0] - ab[:, 0] * ca[:, 1]
+    twice_area = np.sqrt(
+        cross_x * cross_x + cross_y * cross_y + cross_z * cross_z
+    )
     squared_length_sum = (
-        np.einsum("ij,ij->i", ab, ab)
-        + np.einsum("ij,ij->i", bc, bc)
-        + np.einsum("ij,ij->i", ca, ca)
+        np.sum(ab * ab, axis=1)
+        + np.sum(bc * bc, axis=1)
+        + np.sum(ca * ca, axis=1)
     )
     return np.divide(
         2.0 * np.sqrt(3.0) * twice_area,
