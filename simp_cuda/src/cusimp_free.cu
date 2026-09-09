@@ -890,6 +890,7 @@ namespace cusimp_free
 
     __host__ void CUSimp_Free::forward(Vertex<float> *pts, Triangle<int> *tris, int *verts_undo, int n_verts_undo, int nPts, int nTris, float scale, float threshold, bool is_stuck, bool init)
     {
+        if (profile) profile->mark(ProfileStage::InputTransfer);
         float epsilon = 1e-3;
         // processing input vertex map
         n_vertices_undo = 0;
@@ -947,6 +948,7 @@ namespace cusimp_free
 
         size_t temp_storage_bytes = 0;
 
+        if (profile) profile->mark(ProfileStage::BuildVertexFace);
         // get number of near_tris
         ensure_near_count_storage_size(n_pts);
         CHECK_CUDA(cudaMemset(first_near_tris, 0, (n_pts + 1) * sizeof(int)));
@@ -963,6 +965,7 @@ namespace cusimp_free
         CHECK_CUDA(cudaMemset(near_offset, 0, (n_pts + 1) * sizeof(int)));
         create_near_tris_kernel<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
+        if (profile) profile->mark(ProfileStage::BuildEdge);
         // get number of edge
         ensure_edge_count_storage_size(n_tris);
         CHECK_CUDA(cudaMemset(first_edge, 0, (n_tris + 1) * sizeof(int)));
@@ -977,20 +980,24 @@ namespace cusimp_free
         ensure_edge_storage_size(n_edges);
         create_edge_kernel<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
+        if (profile) profile->mark(ProfileStage::ComputeVertexQuadric);
         // compute cost for each edges
         ensure_vert_Q_storage_size(n_pts);
         compute_vert_Q_kernel<<<(n_pts + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
+        if (profile) profile->mark(ProfileStage::ComputeEdgeCost);
         ensure_edge_cost_storage_size(n_edges);
         compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, is_stuck);
         CHECK_CUDA(cudaMemcpy(original_edge_cost, edge_cost, n_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
 
+        if (profile) profile->mark(ProfileStage::PropagateCost);
         // cost propagate
         ensure_tri_min_cost_storage_size(n_tris);
         std::vector<uint64_cu> temp(n_tris, std::numeric_limits<uint64_cu>::max());
         CHECK_CUDA(cudaMemcpy(tri_min_cost, temp.data(), n_tris * sizeof(uint64_cu), cudaMemcpyHostToDevice));
         propagate_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
+        if (profile) profile->mark(ProfileStage::Collapse);
         // collapsed edge
         CHECK_CUDA(cudaMalloc((void **)&n_collapsed, sizeof(int)));
         CHECK_CUDA(cudaMemset(n_collapsed, 0, sizeof(int)));
@@ -1012,6 +1019,7 @@ namespace cusimp_free
         remove_line_edge_collapse<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
         // self intersection check after collapse
         bool isIntersect = selfx::self_intersect(this, n_pts, n_tris, epsilon);
+        if (profile) profile->mark(ProfileStage::Undo);
         CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
         get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
         cudaDeviceSynchronize();
@@ -1022,6 +1030,7 @@ namespace cusimp_free
         n_vertices_undo += 2 * h_n_edges_undo;
         int i = 0;
         while(h_n_edges_undo != 0){
+            if (profile && profile->enabled) profile->undone += h_n_edges_undo;
             i++;
             undo_collapse_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
             rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
@@ -1030,6 +1039,7 @@ namespace cusimp_free
 
             bool afterUndo = selfx::self_intersect(this, n_pts, n_tris, epsilon);
             cudaDeviceSynchronize();
+            if (profile) profile->mark(ProfileStage::Undo);
             CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
             get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
             cudaDeviceSynchronize();
@@ -1039,11 +1049,17 @@ namespace cusimp_free
             if(i == 5) break;
         }
 
+        if (profile) profile->mark(ProfileStage::Compact);
         CHECK_CUDA(cudaMemcpy(pts_map, pts_occ, (n_pts + 1) * sizeof(int), cudaMemcpyDeviceToDevice));
         cub::DeviceScan::ExclusiveSum(nullptr, temp_storage_bytes, pts_map, pts_map, n_pts + 1);
         ensure_temp_storage_size(temp_storage_bytes);
         cub::DeviceScan::ExclusiveSum(temp_storage, allocated_temp_storage_size, pts_map, pts_map, n_pts + 1);
 
+        if (profile && profile->enabled) {
+            profile->inputVertices = nPts; profile->inputFaces = nTris;
+            profile->edges = n_edges; profile->collapsed = h_n_collapsed;
+            profile->undoRounds = i;
+        }
         CHECK_CUDA(cudaFree(n_intersect));
     }
 }

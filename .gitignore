@@ -21,3 +21,10 @@ make.sh
 !mesh/*obj
 
 /examples/test_outputs
+/cad_mesh/__pycache__
+/cad_mesh/win
+/cad_mesh/tests/__pycache__
+/__pycache__
+/__pycache__
+/examples
+/examples

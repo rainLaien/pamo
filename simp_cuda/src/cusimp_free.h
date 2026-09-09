@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cuda_runtime.h>
+#include "simplify_profile.h"
 #include <vector>
 #include <thrust/device_vector.h>
 #include "bvh/bvh.cuh"
@@ -183,6 +184,7 @@ namespace cusimp_free
 
   struct CUSimp_Free
   {
+    SimplifyProfile* profile = nullptr;
     float tres{};
     uint32_t collapse_t{};
     float edge_s{};

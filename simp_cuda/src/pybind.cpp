@@ -1,6 +1,7 @@
 #include "cusimp.h"
 #include "cusimp_free.h"
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 
 namespace cusimp_free
 {
@@ -15,9 +16,36 @@ namespace cusimp_free
 
   class CUDSP_Free
   {
+    SimplifyProfile profile;
     CUSimp_Free pamo;
 
 public:
+    void set_profiling(bool enabled) {
+      profile.clear();
+      profile.enabled = enabled;
+      pamo.profile = enabled ? &profile : nullptr;
+    }
+    pybind11::dict profiling_report() const {
+      static const char* names[] = {"InputTransferMs", "BuildVertexFaceMs", "BuildEdgeMs",
+        "ComputeFaceQuadricMs", "ComputeVertexQuadricMs", "ComputeEdgeCostMs", "PropagateCostMs",
+        "CollapseMs", "BuildBvhMs", "IntersectionMs", "UndoMs", "CompactMs", "ExportMs"};
+      pybind11::dict result;
+      float total = 0.f;
+      for (size_t i = 0; i < profile.milliseconds.size(); ++i) {
+        result[names[i]] = profile.milliseconds[i];
+        total += profile.milliseconds[i];
+      }
+      result["TotalMs"] = total;
+      result["enabled"] = profile.enabled;
+      result["input_vertices"] = profile.inputVertices;
+      result["input_faces"] = profile.inputFaces;
+      result["edges"] = profile.edges;
+      result["collapsed_edges"] = profile.collapsed;
+      result["undone_edges"] = profile.undone;
+      result["undo_rounds"] = profile.undoRounds;
+      result["face_quadric_fused"] = true;
+      return result;
+    }
     ~CUDSP_Free()
     {
       cudaDeviceSynchronize();
@@ -65,12 +93,15 @@ public:
       int nPts = points.size(0);
       int nTris = triangles.size(0);
 
+      if (profile.enabled) profile.clear();
+
       pamo.forward(reinterpret_cast<Vertex<float> *>(points.data_ptr<float>()),
             reinterpret_cast<Triangle<int> *>(triangles.data_ptr<int>()),
             reinterpret_cast<int *>(verts_undo.data_ptr<int>()),
             n_verts_undo,
             nPts, nTris, scale, threshold, is_stuck, init);
       
+      if (profile.enabled) profile.mark(ProfileStage::Export, at::cuda::getCurrentCUDAStream());
       auto verts =
           torch::from_blob(
               pamo.points, torch::IntArrayRef{pamo.n_pts, 3},
@@ -99,6 +130,7 @@ public:
               torch::TensorOptions().device(torch::kCUDA).dtype(indexType))
               .clone();
 
+      profile.finish(at::cuda::getCurrentCUDAStream());
       return {verts, tris, verts_occ, verts_map, vertices_undo};
     }
   }; 
@@ -190,6 +222,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   pybind11::class_<cusimp_free::CUDSP_Free>(m, "CUDSP_Free")
       .def(py::init<>())
+      .def("set_profiling", &cusimp_free::CUDSP_Free::set_profiling)
+      .def("profiling_report", &cusimp_free::CUDSP_Free::profiling_report)
       .def("forward", pybind11::overload_cast<torch::Tensor, torch::Tensor, torch::Tensor, int, float, float, bool, bool>(&cusimp_free::CUDSP_Free::forward));
       
   pybind11::class_<cusimp::CUDSP>(m, "CUDSP")

@@ -23,6 +23,7 @@ class PaMO(nn.Module):
     def __init__(self, input_mesh, use_stage1 = True, use_stage3 = True):
         super().__init__()
         pamo = _C.CUDSP_Free()
+        self.simplifier = pamo
 
         self.use_stage1 = use_stage1
         self.use_stage3 = use_stage3
@@ -840,6 +841,7 @@ class PaMO(nn.Module):
         iter=1000000,
         min_verts=10000000000,
         sdf_mode="auto",
+        profiling=False,
     ):
         
         self.target_faces = max(int(ratio * len(triangles)), min_verts)
@@ -874,6 +876,11 @@ class PaMO(nn.Module):
             faces = triangles
 
         # stage2 (Simplification)
+        if profiling and not hasattr(self.simplifier, 'set_profiling'):
+            raise RuntimeError('Rebuild pamo._C to enable Stage2 profiling.')
+        if hasattr(self.simplifier, 'set_profiling'):
+            self.simplifier.set_profiling(bool(profiling))
+        self.last_simplify_report = {'profiling': bool(profiling), 'epochs': []}
         start_stage2 =time.time()
         verts_undo = torch.empty(0, dtype=torch.int32, device='cuda')
         n_verts_undo = 0
@@ -887,6 +894,11 @@ class PaMO(nn.Module):
             verts, faces, verts_occ, verts_map, verts_undo = self.func.apply(verts, faces, verts_undo, n_verts_undo, scale, threshold, is_stuck, init)
             init = False
             n_verts_undo = verts_undo.shape[0]
+            if profiling:
+                epoch_report = dict(self.simplifier.profiling_report())
+                compact_start = torch.cuda.Event(enable_timing=True)
+                compact_end = torch.cuda.Event(enable_timing=True)
+                compact_start.record()
             
             # set verts and faces after 1 step of simplification
             verts = verts[verts_occ.view(-1).bool()]
@@ -896,6 +908,12 @@ class PaMO(nn.Module):
             faces[:,2] = verts_map[faces[:,2].long()].view(-1)
             
             num_faces_current = faces.shape[0]
+            if profiling:
+                compact_end.record()
+                compact_end.synchronize()
+                epoch_report.update(iteration=it, output_vertices=len(verts), output_faces=len(faces),
+                                    PythonCompactMs=compact_start.elapsed_time(compact_end))
+                self.last_simplify_report['epochs'].append(epoch_report)
             
             if num_faces_current <= self.target_faces or num_faces_current <= 10:
                 break # simplified to target ratio
@@ -914,6 +932,7 @@ class PaMO(nn.Module):
                 break
         
         end_stage2 = time.time()
+        self.last_simplify_report['stage2_wall_seconds'] = end_stage2 - start_stage2
         verts = verts.cpu().numpy()+ tris_mean
         faces = faces.cpu().numpy()
         print(f"Time for Simplification: {end_stage2 - start_stage2} sec")

@@ -155,6 +155,7 @@ namespace selfx{
         int* near_tris_raw = sp->near_tris;
         Triangle<float3>* triangles_d_raw = thrust::raw_pointer_cast(sp->bvh_triangles.data());
 
+        if (sp->profile) sp->profile->mark(cusimp_free::ProfileStage::BuildBvh);
         // get triangle data to build bvh -----------------
         thrust::for_each(thrust::device,
                          thrust::make_counting_iterator<std::size_t>(0),
@@ -178,6 +179,7 @@ namespace selfx{
         // get device ptr
         const auto bvh_dev = bvh.get_device_repr();
 
+        if (sp->profile) sp->profile->mark(cusimp_free::ProfileStage::Intersection);
         // run query ----------------------------
         thrust::fill(thrust::device, sp->num_found_query.begin(), sp->num_found_query.end(), 0);
         cudaDeviceSynchronize();
