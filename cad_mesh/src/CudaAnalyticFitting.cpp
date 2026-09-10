@@ -7,6 +7,8 @@
 #include "CadMesh/CudaAnalyticFitting.h"
 #include "CudaAnalyticKernels.h"
 #include "CudaRemeshKernels.h"
+#include "CudaChartKernels.h"
+#include "CadMesh/CudaChartRemesher.h"
 
 #include <algorithm>
 #include <chrono>
@@ -618,6 +620,103 @@ public:
                   "copy remesh midpoints from CUDA");
   }
 
+  void rebuildCharts(std::vector<CudaPlanarChart> &charts, double &milliseconds) {
+    CurrentContext current(mDriver, mContext);
+    if (charts.empty()) return;
+    if (charts.size() > 16) throw std::runtime_error("CUDA chart batch exceeds 16 jobs");
+    // Local RAII buffers survive all iterations and are freed before the
+    // current-context guard. Inputs/results cross PCIe only once per batch.
+    struct Buffers {
+      DriverApi &Driver;
+      std::vector<CUdeviceptr> Pointers;
+      ~Buffers() { for (auto p : Pointers) Driver.MemFree(p); }
+      CUdeviceptr allocate(std::size_t bytes) {
+        CUdeviceptr p=0; Driver.check(Driver.MemAlloc(&p, bytes), "allocate CUDA charts");
+        Pointers.push_back(p); return p;
+      }
+    } buffers{mDriver, {}};
+    std::vector<std::array<int,8>> jobs(charts.size()), states(charts.size());
+    std::vector<double> targets(charts.size());
+    int totalPoints=0,totalFaces=0,totalEdges=0,totalScratch=0;
+    for (std::size_t i=0;i<charts.size();++i) {
+      auto &chart=charts[i]; chart.Complete=false; chart.Status=0;
+      if (!(chart.Target>0) || !std::isfinite(chart.Target) || chart.Points.size()<3 ||
+          chart.Points.size()>200000 || chart.Faces.empty() || chart.Faces.size()>200000)
+        throw std::runtime_error("invalid CUDA planar chart dimensions");
+      double area=0;
+      for (const auto &p:chart.Points) for(double x:p)
+        if(!std::isfinite(x)) throw std::runtime_error("nonfinite CUDA chart coordinate");
+      for (const auto &f:chart.Faces) {
+        for(int v:f) if(v<0 || std::size_t(v)>=chart.Points.size())
+          throw std::runtime_error("invalid CUDA chart triangle index");
+        const auto &a=chart.Points[f[0]], &b=chart.Points[f[1]], &c=chart.Points[f[2]];
+        area+=.5*std::abs((b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]));
+      }
+      const double estimate=std::min(200000.0,area/(.15*chart.Target*chart.Target)+2*chart.Points.size()+64);
+      const int vc=std::min(200000,std::max({256,int(chart.Points.size()),int(estimate),chart.CapacityHint}));
+      const int fc=std::min(200000,std::max(int(chart.Faces.size()),2*vc));
+      int hc=1;while(hc<4*fc)hc*=2;
+      jobs[i]={totalPoints,totalFaces,totalEdges,totalScratch,vc,fc,hc,int(chart.Points.size())};
+      states[i]={int(chart.Points.size()),int(chart.Faces.size()),0,0,0,0,0,0};
+      targets[i]=chart.Target; chart.CapacityHint=vc;
+      totalPoints+=2*vc; totalFaces+=fc; totalEdges+=hc;
+      totalScratch+=3*hc+2*vc+3*fc;
+    }
+    CUdeviceptr dj=buffers.allocate(jobs.size()*sizeof(jobs[0]));
+    CUdeviceptr dt=buffers.allocate(targets.size()*sizeof(double));
+    CUdeviceptr dp=buffers.allocate(std::size_t(totalPoints)*2*sizeof(double));
+    CUdeviceptr df=buffers.allocate(std::size_t(totalFaces)*3*sizeof(int));
+    CUdeviceptr dk=buffers.allocate(std::size_t(totalEdges)*sizeof(unsigned long long));
+    CUdeviceptr ds=buffers.allocate(std::size_t(totalScratch)*sizeof(int));
+    CUdeviceptr dst=buffers.allocate(states.size()*sizeof(states[0]));
+    auto upload=[&](CUdeviceptr dest,const void *src,std::size_t bytes) {
+      mDriver.check(mDriver.CopyToDevice(dest,src,bytes),"upload CUDA chart");
+    };
+    upload(dj,jobs.data(),jobs.size()*sizeof(jobs[0]));
+    upload(dt,targets.data(),targets.size()*sizeof(double));
+    upload(dst,states.data(),states.size()*sizeof(states[0]));
+    for(std::size_t i=0;i<charts.size();++i) {
+      upload(dp+std::size_t(jobs[i][0])*2*sizeof(double),charts[i].Points.data(),charts[i].Points.size()*sizeof(charts[i].Points[0]));
+      upload(df+std::size_t(jobs[i][1])*3*sizeof(int),charts[i].Faces.data(),charts[i].Faces.size()*sizeof(charts[i].Faces[0]));
+    }
+    if(!mKernelStart)mDriver.check(mDriver.EventCreate(&mKernelStart,0),"create chart start event");
+    if(!mKernelEnd)mDriver.check(mDriver.EventCreate(&mKernelEnd,0),"create chart end event");
+    auto begin=[&]{mDriver.check(mDriver.EventRecord(mKernelStart,nullptr),"start chart timing");};
+    auto launch=[&](int operation) {
+      void *args[]={&dj,&dt,&dp,&df,&dk,&ds,&dst,&operation};
+      mDriver.check(mDriver.Launch(mChartFunction,unsigned(charts.size()),1,1,128,1,1,0,nullptr,args,nullptr),"launch CUDA chart step");
+    };
+    auto read=[&] {
+      mDriver.check(mDriver.EventRecord(mKernelEnd,nullptr),"end chart timing");
+      mDriver.check(mDriver.CopyToHost(states.data(),dst,states.size()*sizeof(states[0])),"read CUDA chart progress");
+      float ms=0;mDriver.check(mDriver.EventElapsedTime(&ms,mKernelStart,mKernelEnd),"time CUDA charts");
+      milliseconds+=ms;
+    };
+    for(int round=0;round<64;++round) {
+      begin();for(int flip=0;flip<(round==0?32:8);++flip)launch(0);
+      launch(1);read();
+      bool active=false;
+      for(auto &state:states)if(state[2]==0){if(state[3]==0)state[2]=1;else active=true;}
+      upload(dst,states.data(),states.size()*sizeof(states[0]));
+      if(!active)break;
+    }
+    for(auto &state:states){if(state[2]==0)state[2]=4;else if(state[2]==1)state[2]=0;}
+    upload(dst,states.data(),states.size()*sizeof(states[0]));
+    begin();for(int flip=0;flip<32;++flip)launch(0);
+    for(int sweep=0;sweep<8;++sweep){launch(2);for(int flip=0;flip<4;++flip)launch(0);}
+    read();
+    for(std::size_t i=0;i<charts.size();++i) {
+      auto &chart=charts[i];chart.Status=states[i][2]?states[i][2]:1;
+      if(chart.Status!=1)continue;
+      if(states[i][0]<3||states[i][0]>jobs[i][4]||states[i][1]<1||states[i][1]>jobs[i][5])
+        throw std::runtime_error("CUDA chart returned invalid counts");
+      chart.Points.resize(states[i][0]);chart.Faces.resize(states[i][1]);
+      mDriver.check(mDriver.CopyToHost(chart.Points.data(),dp+std::size_t(jobs[i][0])*2*sizeof(double),chart.Points.size()*sizeof(chart.Points[0])),"read CUDA chart points");
+      mDriver.check(mDriver.CopyToHost(chart.Faces.data(),df+std::size_t(jobs[i][1])*3*sizeof(int),chart.Faces.size()*sizeof(chart.Faces[0])),"read CUDA chart faces");
+      chart.Complete=true;
+    }
+  }
+
 private:
   static std::uint64_t CacheHash(const char *data, std::size_t size) {
     std::uint64_t hash = 14695981039346656037ull;
@@ -696,6 +795,7 @@ private:
     std::string source;
     for (const char *part : AnalyticSeedKernelSourceParts) source += part;
     source += std::string("\n") + RemeshKernelSource;
+    source += std::string("\n") + ChartKernelSource;
     const std::string target = "--gpu-architecture=compute_" + std::to_string(architecture);
     const char *options[] = {target.c_str(), "--std=c++14", "--fmad=false", "--ftz=false",
                              "--prec-div=true", "--prec-sqrt=true"};
@@ -777,6 +877,8 @@ private:
     mDriver.check(mDriver.ModuleFunction(&mRemeshFunction, mModule,
                                          "cadmesh_classify_long_edges"),
                   "resolve cadmesh_classify_long_edges");
+    mDriver.check(mDriver.ModuleFunction(&mChartFunction,mModule,"cadmesh_chart_step"),
+                  "resolve cadmesh_chart_step");
     break;
     }
     bool cacheWritten = false;
@@ -807,6 +909,7 @@ private:
   CUmodule mModule = nullptr;
   CUfunction mFunction = nullptr;
   CUfunction mRemeshFunction = nullptr;
+  CUfunction mChartFunction = nullptr;
   CUevent mKernelStart = nullptr, mKernelEnd = nullptr;
   std::array<CUevent, 6> mTypeStart{}, mTypeEnd{};
   CUdeviceptr mSamples = 0, mParameters = 0, mValid = 0;
@@ -822,6 +925,9 @@ private:
 #else
 class CudaRuntime {
 public:
+  void rebuildCharts(std::vector<CudaPlanarChart> &, double &) {
+    throw std::runtime_error("CUDA chart runtime is unavailable on this platform");
+  }
   void initialize(bool = false) {
     throw std::runtime_error("CUDA analytic runtime loading is currently implemented for Windows x64");
   }
@@ -992,6 +1098,19 @@ bool RefineAnalyticSeedBatchCuda(std::vector<AnalyticSeedBatch> &batches) {
     session->Disabled = true;
     std::cerr << "[CadMesh] analytic CUDA unavailable; using CPU seed refinement: " << error.what() << '\n';
     return false;
+  }
+}
+
+bool RebuildPlanarChartsCuda(std::vector<CudaPlanarChart> &charts,
+                            double &kernelMilliseconds, std::string &error) {
+  try {
+    if (!Runtime) {
+      auto runtime=std::make_unique<CudaRuntime>();runtime->initialize();Runtime=std::move(runtime);
+    }
+    Runtime->rebuildCharts(charts,kernelMilliseconds);
+    return true;
+  } catch(const std::exception &failure) {
+    Runtime.reset();error=failure.what();return false;
   }
 }
 

@@ -7,6 +7,26 @@
 #include <vector>
 
 namespace CadMesh {
+// Stable PLY remesh_reason values. Only Rebuilt means accepted reconstruction.
+enum class PatchRemeshReason : unsigned char {
+  Rebuilt=0, Unselected=1, Unsupported=2, Nonanalytic=3,
+  Deviation=4, Parameterization=5, Topology=6, Collision=7,
+  CollisionGuardRestore=8, Unknown=255
+};
+inline const char *PatchRemeshReasonName(PatchRemeshReason reason) {
+  switch(reason) {
+  case PatchRemeshReason::Rebuilt:return "rebuilt";
+  case PatchRemeshReason::Unselected:return "unselected";
+  case PatchRemeshReason::Unsupported:return "unsupported";
+  case PatchRemeshReason::Nonanalytic:return "nonanalytic";
+  case PatchRemeshReason::Deviation:return "deviation";
+  case PatchRemeshReason::Parameterization:return "parameterization_or_construction";
+  case PatchRemeshReason::Topology:return "topology";
+  case PatchRemeshReason::Collision:return "collision";
+  case PatchRemeshReason::CollisionGuardRestore:return "collision_guard_restore";
+  default:return "unknown";
+  }
+}
 enum class PatchSurfaceType {
   Unknown,
   Plane,

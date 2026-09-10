@@ -1,5 +1,7 @@
 #include "CadMesh/AnalyticPatchRemesher.h"
+#include "CadMesh/CudaChartRemesher.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -10,6 +12,15 @@
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
 namespace CadMesh {
 namespace {
@@ -247,7 +258,8 @@ bool Same2(UV a, UV b, double epsilon) {
 }
 
 bool EarClip(const std::vector<UV> &points,
-             std::vector<std::array<int, 3>> &triangles) {
+             std::vector<std::array<int, 3>> &triangles,
+             std::size_t maximumPredicateWork = 100000000) {
   if (points.size() < 3) return false;
   std::vector<int> polygon(points.size());
   std::iota(polygon.begin(), polygon.end(), 0);
@@ -258,7 +270,6 @@ bool EarClip(const std::vector<UV> &points,
   // Degenerate or heavily sampled trims can make ear clipping cubic. Bound
   // predicate work so one chart cannot stall all remaining patches.
   std::size_t predicateWork = 0;
-  constexpr std::size_t maximumPredicateWork = 100000000;
   std::size_t guard = 0;
   while (polygon.size() > 3 && guard++ < points.size() * points.size()) {
     bool clipped = false;
@@ -392,7 +403,7 @@ bool MakeClosedChart(const Frame &frame, double target, Chart &chart) {
 bool MakePeriodicRingChart(const Frame &frame,
                            const std::vector<std::vector<int>> &loops,
                            const std::vector<Point3> &vertices, double target,
-                           Chart &chart) {
+                           Chart &chart, std::size_t maximumPredicateWork=100000000) {
   if (loops.size() != 2 || !(frame.UPeriod > 0)) return false;
   std::vector<std::vector<int>> loopIds = loops;
   std::vector<std::vector<UV>> coordinates(2);
@@ -455,7 +466,7 @@ bool MakePeriodicRingChart(const Frame &frame,
     point.X -= frame.UPeriod;
     append(point, -1 - i);
   }
-  return EarClip(chart.Points, chart.Faces);
+  return EarClip(chart.Points, chart.Faces,maximumPredicateWork);
 }
 
 struct LocalEdge { int A=-1, B=-1; std::vector<int> Faces; };
@@ -628,18 +639,7 @@ void Improve(Chart &chart, double target) {
   }
 }
 
-struct QualityStatistics {
-  double Mean=0,Minimum=0,Percentile05=0,FractionBelow02=1;
-};
-
-QualityStatistics QualitySummary(const std::vector<Point3>&vertices,const std::vector<std::array<int,3>>&faces){
-  QualityStatistics result;if(faces.empty())return result;
-  std::vector<double> values;values.reserve(faces.size());double sum=0,minimum=1;std::size_t below=0;
-  for(const auto&f:faces){const double q=Quality(vertices[f[0]],vertices[f[1]],vertices[f[2]]);values.push_back(q);sum+=q;minimum=std::min(minimum,q);below+=q<.2;}
-  const std::size_t percentile=std::min(values.size()-1,values.size()/20);
-  std::nth_element(values.begin(),values.begin()+percentile,values.end());
-  result.Mean=sum/faces.size();result.Minimum=minimum;result.Percentile05=values[percentile];result.FractionBelow02=double(below)/faces.size();return result;
-}
+#include "PlanarDomain.h"
 
 bool ValidatePatch(const std::vector<Point3>&vertices,
                    const std::vector<std::array<int,3>>&faces,
@@ -651,7 +651,10 @@ bool ValidatePatch(const std::vector<Point3>&vertices,
     auto canonical=face;std::sort(canonical.begin(),canonical.end());
     if(canonical[0]==canonical[1]||canonical[1]==canonical[2]||
        !uniqueFaces.insert(canonical).second)return false;
-    if(Quality(vertices[face[0]],vertices[face[1]],vertices[face[2]])<=1e-12)return false;
+    const Vec3 cross=Cross(Sub(ToVec(vertices[face[1]]),ToVec(vertices[face[0]])),
+                           Sub(ToVec(vertices[face[2]]),ToVec(vertices[face[0]])));
+    const double areaSquared=Dot(cross,cross);
+    if(!std::isfinite(areaSquared)||areaSquared<=0)return false;
     for(int side=0;side<3;++side){
       if(Distance(vertices[face[side]],vertices[face[(side+1)%3]])>
          target*(1+1e-6))return false;
@@ -663,6 +666,57 @@ bool ValidatePatch(const std::vector<Point3>&vertices,
   return actualBoundary==expectedBoundary;
 }
 
+struct PreparedChart {
+  enum Status { Skip, Collision, Deviation, Topology, Parameterization, GpuPending, Ready } State = Skip;
+  Chart Value;
+  double Target = 0;
+  bool UsedCuda = false;
+  bool SeededPlanar = false;
+  bool SeededCylinder = false;
+  ChartBuildDiagnostics CylinderBuild;
+  double MakeSeconds = 0, RefineSeconds = 0, ImproveSeconds = 0;
+};
+
+// A fixed worker pool. Queued tasks contain only captures; each completed
+// chart is retained in its future until the caller commits that patch.
+// Workers only construct local charts from an immutable vertex snapshot.
+class ChartWorkers {
+  std::mutex Mutex;
+  std::condition_variable Wake;
+  std::deque<std::packaged_task<PreparedChart()>> Tasks;
+  std::vector<std::thread> Threads;
+  bool Stop = false;
+  void finish() {
+    { std::lock_guard<std::mutex> lock(Mutex); Stop = true; }
+    Wake.notify_all();
+    for (auto &thread : Threads) if (thread.joinable()) thread.join();
+  }
+public:
+  explicit ChartWorkers(int count) {
+    try {
+      for (int i = 0; i < count; ++i) Threads.emplace_back([this] {
+        for (;;) {
+          std::packaged_task<PreparedChart()> task;
+          {
+            std::unique_lock<std::mutex> lock(Mutex);
+            Wake.wait(lock, [&] { return Stop || !Tasks.empty(); });
+            if (Tasks.empty()) return;
+            task = std::move(Tasks.front()); Tasks.pop_front();
+          }
+          task(); // Exceptions are delivered to the owner through the future.
+        }
+      });
+    } catch (...) { finish(); throw; }
+  }
+  ~ChartWorkers() { finish(); }
+  std::future<PreparedChart> submit(std::function<PreparedChart()> work) {
+    std::packaged_task<PreparedChart()> task(std::move(work));
+    auto result = task.get_future();
+    { std::lock_guard<std::mutex> lock(Mutex); Tasks.push_back(std::move(task)); }
+    Wake.notify_one();
+    return result;
+  }
+};
 } // namespace
 
 bool RebuildAnalyticPatches(
@@ -675,6 +729,8 @@ bool RebuildAnalyticPatches(
     AnalyticPatchRemeshReport &report, bool verbose) {
   using Clock=std::chrono::steady_clock;
   successfullyRebuilt.assign(patches.size(), 0); report = {};
+  report.PatchReasons.assign(patches.size(),PatchRemeshReason::Unknown);
+  (void)targetMeanQuality; // Patch acceptance no longer uses quality thresholds.
   std::vector<std::vector<std::array<int,3>>> patchFaces;
   std::vector<BoundaryData> boundaries;
   std::vector<unsigned char> validBoundaries;
@@ -684,30 +740,47 @@ bool RebuildAnalyticPatches(
                  validBoundaries);
   report.IndexSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
   std::vector<std::vector<std::array<int,3>>> replacements(patches.size());
-  for (int patchId = 0; patchId < int(patches.size()); ++patchId) {
+  // Main-thread commits append/reallocate vertices. Workers must never read
+  // that vector concurrently, even though existing coordinates stay unchanged.
+  const auto sourceVertices = vertices;
+  const char *planeSetting=std::getenv("CADMESH_REMESH_SIMPLE_PLANES_ONLY");
+  const bool simplePlanesOnly=planeSetting && std::string(planeSetting)=="1";
+  const char *cylinderSetting=std::getenv("CADMESH_REMESH_CYLINDERS_ONLY");
+  const bool cylindersOnly=cylinderSetting && std::string(cylinderSetting)=="1";
+  const char *coneSetting=std::getenv("CADMESH_REMESH_CONES_ONLY");
+  const bool conesOnly=coneSetting && std::string(coneSetting)=="1";
+  const char *otherSetting=std::getenv("CADMESH_REMESH_OTHER_FEATURES_ONLY");
+  const bool otherFeaturesOnly=otherSetting && std::string(otherSetting)=="1";
+  if(int(simplePlanesOnly)+int(cylindersOnly)+int(conesOnly)+int(otherFeaturesOnly)>1)throw std::invalid_argument("select only one surface-only mode");
+  const auto selectedSurface=[&](int id){
+    if(otherFeaturesOnly)return patches[id].SurfaceType!=PatchSurfaceType::Plane && patches[id].SurfaceType!=PatchSurfaceType::Cylinder;
+    return patches[id].SurfaceType==(conesOnly?PatchSurfaceType::Cone:cylindersOnly?PatchSurfaceType::Cylinder:PatchSurfaceType::Plane);
+  };
+  const char *cudaSetting = std::getenv("CADMESH_REMESH_CHART_CUDA");
+  const bool useChartCuda = !cudaSetting || std::string(cudaSetting) != "0";
+  const auto prepare = [&](int patchId) {
+    PreparedChart result;
     const auto &patch = patches[patchId];
+    if((simplePlanesOnly||cylindersOnly||conesOnly||otherFeaturesOnly) && !selectedSurface(patchId))return result;
     if (patch.ProjectionTarget != PatchProjectionTarget::AnalyticSurface ||
         patch.SurfaceType == PatchSurfaceType::Freeform ||
-        patch.SurfaceType == PatchSurfaceType::Unknown) continue;
-    ++report.Attempted;
-    const auto chartStart=Clock::now();
-    const auto finishChart=[&](){report.ChartSeconds+=std::chrono::duration<double>(Clock::now()-chartStart).count();};
+        patch.SurfaceType == PatchSurfaceType::Unknown) return result;
     if (patchId < int(excludedPatches.size()) && excludedPatches[patchId]) {
-      ++report.Fallback; ++report.CollisionFallback; finishChart(); continue;
+      result.State = PreparedChart::Collision; return result;
     }
     const double tolerance = std::max(1.0, targetEdgeLength) * 1e-12;
     if (patch.MaxSampledSurfaceDeviation > maximumDeviation + tolerance) {
-      ++report.Fallback; ++report.DeviationFallback; finishChart(); continue;
+      result.State = PreparedChart::Deviation; return result;
     }
     const BoundaryData &boundary=boundaries[patchId];
     if (!validBoundaries[patchId]) {
-      ++report.Fallback; ++report.TopologyFallback; finishChart(); continue;
+      result.State = PreparedChart::Topology; return result;
     }
     std::vector<int> allBoundary;
     for (const auto &loop : boundary.Loops) allBoundary.insert(allBoundary.end(),loop.begin(),loop.end());
     Frame frame;
-    if (!MakeFrame(patch, vertices, allBoundary, frame)) {
-      ++report.Fallback; ++report.ParameterizationFallback; finishChart(); continue;
+    if (!MakeFrame(patch, sourceVertices, allBoundary, frame)) {
+      result.State = PreparedChart::Parameterization; return result;
     }
     double chartTarget = targetEdgeLength;
     double curvatureRadius = 0;
@@ -718,24 +791,315 @@ bool RebuildAnalyticPatches(
         maximumNormalDeviationDegrees < 180)
       chartTarget = std::min(chartTarget, 1.8 * curvatureRadius *
           std::sin(maximumNormalDeviationDegrees * Pi / 360.0));
-    Chart chart;
-    if (verbose)
-      std::clog << "[CadMesh] analytic patch " << patchId + 1 << '/' << patches.size()
-                << ": boundary_vertices=" << allBoundary.size()
-                << ", source_faces=" << patchFaces[patchId].size() << std::endl;
+    Chart &chart = result.Value;
+    auto start = Clock::now();
+    if(frame.Type==PatchSurfaceType::Plane){
+      result.SeededPlanar=true;
+      const bool made=MakeSeededPlanarChart(frame,boundary.Loops,patchFaces[patchId],sourceVertices,chartTarget,chart);
+      result.MakeSeconds=std::chrono::duration<double>(Clock::now()-start).count();
+      result.Target=chartTarget;
+      result.State=made?PreparedChart::Ready:PreparedChart::Parameterization;
+      if(!made)result.Value={};
+      return result;
+    }
+    if(frame.Type==PatchSurfaceType::Cylinder){
+      result.SeededCylinder=true;
+      const bool made=MakeSeededCylinderChart(frame,boundary.Loops,sourceVertices,chartTarget,chart,
+                                             targetEdgeLength,result.CylinderBuild);
+      result.CylinderBuild.Points=chart.Points.size();result.CylinderBuild.Faces=chart.Faces.size();
+      if(!made && result.CylinderBuild.Failure.empty())result.CylinderBuild.Failure=result.CylinderBuild.Stage+"_failed";
+      result.MakeSeconds=std::chrono::duration<double>(Clock::now()-start).count();
+      result.Target=chartTarget;
+      result.State=made?PreparedChart::Ready:PreparedChart::Parameterization;
+      if(!made)result.Value={};
+      return result;
+    }
     bool made = boundary.Loops.empty()
                     ? MakeClosedChart(frame,chartTarget,chart)
                     : boundary.Loops.size()==1
-                          ? MakeSimpleChart(frame,boundary.Loops[0],vertices,chart)
+                          ? MakeSimpleChart(frame,boundary.Loops[0],sourceVertices,chart)
                           : frame.Type==PatchSurfaceType::Plane
                                 ? MakePlanarChartWithHoles(frame,boundary.Loops,
-                                                           vertices,chart)
+                                                           sourceVertices,chart)
                                 : MakePeriodicRingChart(frame,boundary.Loops,
-                                                        vertices,chartTarget,chart);
-    if (!made || (!chart.Closed && !Refine(chart,chartTarget))) {
-      ++report.Fallback; ++report.ParameterizationFallback; finishChart(); continue;
+                                                        sourceVertices,chartTarget,chart);
+    result.MakeSeconds = std::chrono::duration<double>(Clock::now()-start).count();
+    result.Target = chartTarget;
+    // A single triangle has only fixed boundary edges and no movable vertex.
+    // Refine/Improve cannot change it; avoid a GPU launch (or CPU iterations).
+    if(made && boundary.Loops.size()==1 && chart.Faces.size()==1 && chart.Points.size()==3){
+      result.State=PreparedChart::Ready;return result;
     }
+    if (made && useChartCuda && boundary.Loops.size()==1 &&
+        frame.Type==PatchSurfaceType::Plane && frame.UPeriod==0 && frame.VPeriod==0 &&
+        chart.Points.size()<=200000 && chart.Faces.size()<=200000) {
+      result.State = PreparedChart::GpuPending;
+      return result;
+    }
+    start = Clock::now();
+    const bool refined = made && (chart.Closed || Refine(chart,chartTarget));
+    result.RefineSeconds = std::chrono::duration<double>(Clock::now()-start).count();
+    if (!refined) {
+      result.State = PreparedChart::Parameterization;
+      result.Value = {}; return result;
+    }
+    start = Clock::now();
     if (!chart.Closed) Improve(chart,chartTarget);
+    result.ImproveSeconds = std::chrono::duration<double>(Clock::now()-start).count();
+    result.State = PreparedChart::Ready;
+    return result;
+  };
+  int workerCount = int(std::min(4u, std::max(1u, std::thread::hardware_concurrency())));
+  if (const char *setting = std::getenv("CADMESH_REMESH_THREADS")) {
+    char *end = nullptr;
+    const long value = std::strtol(setting, &end, 10);
+    if (end == setting || *end || value < 1 || value > 16)
+      throw std::invalid_argument("CADMESH_REMESH_THREADS must be 1..16");
+    workerCount = int(value);
+  }
+  const auto rebuildStart = Clock::now();
+  struct WorkItem { int Id=0,Type=0,Topology=0,Bucket=0; double Cost=0; };
+  std::vector<WorkItem> order;
+  order.reserve(patches.size());
+  for(int id=0;id<int(patches.size());++id){
+    if((simplePlanesOnly||cylindersOnly||conesOnly||otherFeaturesOnly) && !selectedSurface(id)){
+      order.push_back({id,int(patches[id].SurfaceType),0,0,1.0});continue;
+    }
+    std::size_t boundaryCount=0;
+    for(const auto &loop:boundaries[id].Loops)boundaryCount+=loop.size();
+    double area=0;
+    for(const auto &f:patchFaces[id]){
+      const Vec3 a=ToVec(sourceVertices[f[0]]),b=ToVec(sourceVertices[f[1]]),c=ToVec(sourceVertices[f[2]]);
+      area+=.5*Norm(Cross(Sub(b,a),Sub(c,a)));
+    }
+    const int type=int(patches[id].SurfaceType);
+    const int topology=boundaries[id].Loops.empty()?2:boundaries[id].Loops.size()==1?0:1;
+    double target=targetEdgeLength;
+    double radius=0;
+    if(const auto *p=std::get_if<CylinderParameters>(&patches[id].Parameters))radius=p->Radius;
+    else if(const auto *p=std::get_if<SphereParameters>(&patches[id].Parameters))radius=p->Radius;
+    else if(const auto *p=std::get_if<TorusParameters>(&patches[id].Parameters))radius=p->MinorRadius;
+    if(radius>0 && maximumNormalDeviationDegrees>0 && maximumNormalDeviationDegrees<180)
+      target=std::min(target,1.8*radius*std::sin(maximumNormalDeviationDegrees*Pi/360));
+    double estimate=area/std::max(target*target,1e-24)+double(boundaryCount);
+    if(!std::isfinite(estimate))estimate=1e12;
+    estimate=std::clamp(estimate,1.0,1e12);
+    const int bucket=int(std::log2(estimate));
+    // Large legacy curved/holed jobs tend to dominate the tail. The factor
+    // only changes scheduling, never geometry or acceptance tolerances.
+    const double factor=patches[id].SurfaceType==PatchSurfaceType::Plane?(topology==0?1.0:2.0):4.0;
+    order.push_back({id,type,topology,bucket,estimate*factor});
+  }
+  // Classify by surface/topology and powers-of-two size bands. Prioritize
+  // expensive jobs globally so one type cannot hide a long job until the end.
+  std::stable_sort(order.begin(),order.end(),[](const WorkItem&a,const WorkItem&b){
+    const int bandA=int(std::log2(a.Cost)),bandB=int(std::log2(b.Cost));
+    if(bandA!=bandB)return bandA>bandB;
+    if(a.Type!=b.Type)return a.Type<b.Type;
+    if(a.Topology!=b.Topology)return a.Topology<b.Topology;
+    if(a.Bucket!=b.Bucket)return a.Bucket>b.Bucket;
+    if(a.Cost!=b.Cost)return a.Cost>b.Cost;
+    return a.Id<b.Id;
+  });
+  std::atomic<std::size_t> completed{0};
+  std::mutex progressMutex;
+  std::unordered_map<int,Clock::time_point> running;
+  std::vector<double> taskSeconds(patches.size(),0);
+  // These shared objects precede the pool so its destructor joins workers
+  // before any captured state is destroyed, including exceptional exits.
+  ChartWorkers workers(workerCount);
+  std::vector<std::future<PreparedChart>> pending(patches.size());
+  if(verbose)std::clog << "[CadMesh] analytic scheduler: workers=" << workerCount
+      << ", tasks=" << order.size() << ", type/topology/size buckets, largest first"
+      << "; dynamic work queue, results keyed by patch ID, ordered commits" << std::endl;
+  if(verbose && (simplePlanesOnly||cylindersOnly||conesOnly||otherFeaturesOnly)){
+    std::size_t selected=0;for(int id=0;id<int(patches.size());++id)if(selectedSurface(id))++selected;
+    std::clog << (otherFeaturesOnly?"[CadMesh] other-features-only: selected=":conesOnly?"[CadMesh] cones-only (legacy chart refinement): selected=":cylindersOnly?"[CadMesh] cylinders-only: selected=":"[CadMesh] planes-only (including holes): selected=") << selected
+        << ", skipped=" << patches.size()-selected << "; other patch interiors retained" << std::endl;
+  }
+  for(const auto &item:order){const int id=item.Id;
+    pending[id]=workers.submit([&,id]{
+      const auto start=Clock::now();
+      {std::lock_guard<std::mutex> lock(progressMutex);running[id]=start;}
+      const auto finish=[&]{
+        {std::lock_guard<std::mutex> lock(progressMutex);running.erase(id);
+          taskSeconds[id]=std::chrono::duration<double>(Clock::now()-start).count();}
+        ++completed;
+      };
+      try{auto result=prepare(id);finish();return result;}
+      catch(...){finish();throw;}
+    });
+  }
+  double makeSeconds = 0, refineSeconds = 0, improveSeconds = 0;
+  double waitSeconds=0,detailLogSeconds=0,liftSeconds=0,validationSeconds=0;
+  double cudaMilliseconds=0;
+  std::size_t cudaBatches=0,cudaSubmitted=0,cudaCompleted=0,cudaAccepted=0,cudaFallback=0;
+  std::size_t seededPlanar=0,seededPlanarFailed=0,seededPlanarAccepted=0;
+  std::size_t seededCylinder=0,seededCylinderFailed=0,seededCylinderAccepted=0;
+  std::unordered_map<std::string,std::pair<std::size_t,double>> cylinderFailures;
+  bool cudaDisabled=false;
+  std::deque<PreparedChart> ready;
+  if(verbose)std::clog << "[CadMesh] analytic chart backend: "
+      << "shared boundaries + interior lattice + constrained Delaunay (planes and unwrapped cylinders); legacy other curved surfaces" << std::endl;
+  for (int patchId = 0; patchId < int(patches.size()); ++patchId) {
+    if (verbose && patchId % 64 == 0)
+      std::clog << "[CadMesh] analytic progress: " << patchId << '/' << patches.size()
+                << ", computed=" << completed.load()
+                << ", rebuilt=" << report.Rebuilt << ", fallback=" << report.Fallback
+                << ", elapsed_s=" << std::chrono::duration<double>(Clock::now()-rebuildStart).count() << std::endl;
+    if(ready.empty()) {
+      const int count=std::min(16,int(patches.size())-patchId);
+      std::vector<CudaPlanarChart> gpu;
+      std::vector<int> gpuIndices;
+      for(int i=0;i<count;++i){
+        const auto waitStart=Clock::now();
+        while(pending[patchId+i].wait_for(std::chrono::seconds(5))!=std::future_status::ready)
+          if(verbose){
+            std::lock_guard<std::mutex> lock(progressMutex);
+            std::clog << "[CadMesh] analytic commit waiting: patch=" << patchId+i+1
+                << ", computed=" << completed.load() << '/' << patches.size() << ", running=" << running.size();
+            for(const auto &task:running)std::clog << " [patch=" << task.first+1
+                << ", seconds=" << std::chrono::duration<double>(Clock::now()-task.second).count() << ']';
+            std::clog << std::endl;
+          }
+        ready.push_back(pending[patchId+i].get());
+        waitSeconds+=std::chrono::duration<double>(Clock::now()-waitStart).count();
+        auto &r=ready.back();
+        if(r.State==PreparedChart::GpuPending&&!cudaDisabled){
+          CudaPlanarChart input;input.Target=r.Target;input.Faces=r.Value.Faces;
+          for(auto uv:r.Value.Points)input.Points.push_back({uv.X,uv.Y});
+          gpu.push_back(std::move(input));gpuIndices.push_back(i);
+        }
+      }
+      if(!gpu.empty()){
+        ++cudaBatches;cudaSubmitted+=gpu.size();
+        if(verbose)std::clog << "[CadMesh] analytic CUDA chart batch: first_patch=" << patchId+1
+                            << ", jobs=" << gpu.size() << std::endl;
+        std::string error;
+        bool ran=RebuildPlanarChartsCuda(gpu,cudaMilliseconds,error);
+        // Retry capacity exhaustion on the GPU from the original input, with
+        // geometrically increasing bounds. Never return partial GPU geometry.
+        for(int retry=0;ran&&retry<10;++retry){
+          std::vector<CudaPlanarChart> retryJobs;std::vector<std::size_t> indices;
+          for(std::size_t i=0;i<gpu.size();++i)if(gpu[i].Status==2&&gpu[i].CapacityHint<200000){
+            auto input=gpu[i];input.CapacityHint=std::min(200000,2*input.CapacityHint);
+            retryJobs.push_back(std::move(input));indices.push_back(i);
+          }
+          if(retryJobs.empty())break;
+          if(verbose)std::clog << "[CadMesh] analytic CUDA chart capacity retry: jobs=" << retryJobs.size() << std::endl;
+          ran=RebuildPlanarChartsCuda(retryJobs,cudaMilliseconds,error);
+          if(ran)for(std::size_t i=0;i<indices.size();++i)gpu[indices[i]]=std::move(retryJobs[i]);
+        }
+        if(!ran){
+          cudaDisabled=true;
+          std::clog << "[CadMesh] analytic chart CUDA unavailable; CPU fallback: " << error << std::endl;
+        }else for(std::size_t i=0;i<gpu.size();++i){
+          auto &output=gpu[i];auto &r=ready[gpuIndices[i]];
+          bool valid=output.Complete&&output.Points.size()>=r.Value.Points.size();
+          if(valid){
+            for(const auto &uv:output.Points)valid=valid&&std::isfinite(uv[0])&&std::isfinite(uv[1]);
+            for(const auto &f:output.Faces)for(int v:f)valid=valid&&v>=0&&std::size_t(v)<output.Points.size();
+            for(std::size_t v=0;v<r.Value.Points.size();++v)
+              valid=valid&&output.Points[v][0]==r.Value.Points[v].X&&output.Points[v][1]==r.Value.Points[v].Y;
+          }
+          if(!valid){
+            if(verbose)std::clog << "[CadMesh] analytic CUDA chart CPU retry: patch=" << patchId+gpuIndices[i]+1
+                                << ", status=" << output.Status << std::endl;
+            continue;
+          }
+          auto &chart=r.Value;chart.Points.clear();
+          for(auto uv:output.Points)chart.Points.push_back({uv[0],uv[1]});
+          chart.Aliases.resize(chart.Points.size(),-1);chart.Fixed.resize(chart.Points.size(),0);
+          chart.Faces=std::move(output.Faces);r.State=PreparedChart::Ready;r.UsedCuda=true;++cudaCompleted;
+        }
+      }
+      // Failed/unsupported runtime jobs use the existing worker pool. All
+      // validation and global vertex IDs still commit in patch order.
+      std::vector<std::pair<int,std::future<PreparedChart>>> retries;
+      for(int i=0;i<count;++i)if(ready[i].State==PreparedChart::GpuPending){
+        ++cudaFallback;
+        retries.emplace_back(i,workers.submit([r=std::move(ready[i])]() mutable {
+          auto start=Clock::now();bool ok=Refine(r.Value,r.Target);
+          r.RefineSeconds=std::chrono::duration<double>(Clock::now()-start).count();
+          if(ok){start=Clock::now();Improve(r.Value,r.Target);
+            r.ImproveSeconds=std::chrono::duration<double>(Clock::now()-start).count();r.State=PreparedChart::Ready;
+          }else {r.State=PreparedChart::Parameterization;r.Value={};}
+          return r;
+        }));
+      }
+      for(auto &retry:retries){
+        while(retry.second.wait_for(std::chrono::seconds(5))!=std::future_status::ready)
+          if(verbose)std::clog << "[CadMesh] analytic CPU fallback waiting: patch=" << patchId+retry.first+1 << std::endl;
+        ready[retry.first]=retry.second.get();
+      }
+    }
+    auto prepared=std::move(ready.front());ready.pop_front();
+    const auto detailLogStart=Clock::now();
+    if(prepared.SeededCylinder){
+      ++seededCylinder;if(prepared.State!=PreparedChart::Ready)++seededCylinderFailed;
+      const auto &detail=prepared.CylinderBuild;
+      if(!detail.Failure.empty()){
+        auto &group=cylinderFailures[detail.Failure];++group.first;group.second+=prepared.MakeSeconds;
+      }
+      if(verbose)std::clog << "[CadMesh] cylinder constrained mesh: patch=" << patchId+1
+          << ", method=" << (boundaries[patchId].Loops.size()==2?"direct_periodic_strip":"unwrapped_cdt")
+          << ", boundary_loops=" << boundaries[patchId].Loops.size()
+          << ", points=" << prepared.Value.Points.size() << ", faces=" << prepared.Value.Faces.size()
+          << ", constructed=" << (prepared.State==PreparedChart::Ready?"yes":"no")
+          << ", circumferential_target=" << prepared.Target << ", axial_target=" << targetEdgeLength
+          << ", ring_rows=" << detail.RingRows << ", ring_columns=" << detail.RingColumns
+          << ", ring_interior_spacing=" << detail.RingInteriorSpacing
+          << ", stage=" << detail.Stage << ", failure=" << (detail.Failure.empty()?"none":detail.Failure)
+          << ", generated_points=" << detail.Points << ", generated_faces=" << detail.Faces
+          << ", problem_edge_global=" << detail.GlobalEdgeA << ':' << detail.GlobalEdgeB
+          << ", problem_edge_local=" << detail.EdgeA << ':' << detail.EdgeB
+          << ", problem_edge_metric_length=" << detail.EdgeLength << ", problem_edge_metric_target=" << detail.EdgeTarget
+          << ", work=" << detail.Work << ", legalize_s=" << detail.LegalizeSeconds
+          << ", lattice_s=" << detail.LatticeSeconds << ", repair_s=" << detail.RepairSeconds
+          << ", seconds=" << prepared.MakeSeconds << std::endl;
+    }
+    if(prepared.SeededPlanar){
+      ++seededPlanar;
+      if(prepared.State!=PreparedChart::Ready)++seededPlanarFailed;
+      if(verbose)std::clog << "[CadMesh] planar constrained mesh: patch=" << patchId+1
+          << ", boundary_loops=" << boundaries[patchId].Loops.size()
+          << ", points=" << prepared.Value.Points.size() << ", faces=" << prepared.Value.Faces.size()
+          << ", constructed=" << (prepared.State==PreparedChart::Ready?"yes":"no")
+          << ", seconds=" << prepared.MakeSeconds << std::endl;
+    }
+    detailLogSeconds+=std::chrono::duration<double>(Clock::now()-detailLogStart).count();
+    makeSeconds += prepared.MakeSeconds;
+    refineSeconds += prepared.RefineSeconds;
+    improveSeconds += prepared.ImproveSeconds;
+    auto &reason=report.PatchReasons[patchId];
+    if (prepared.State == PreparedChart::Skip) {
+      if((simplePlanesOnly||cylindersOnly||conesOnly||otherFeaturesOnly) && !selectedSurface(patchId))
+        reason=PatchRemeshReason::Unselected;
+      else if(patches[patchId].SurfaceType==PatchSurfaceType::Freeform ||
+              patches[patchId].SurfaceType==PatchSurfaceType::Unknown)
+        reason=PatchRemeshReason::Unsupported;
+      else reason=PatchRemeshReason::Nonanalytic;
+      continue;
+    }
+    ++report.Attempted;
+    if (prepared.State != PreparedChart::Ready) {
+      reason=prepared.State==PreparedChart::Collision?PatchRemeshReason::Collision:
+          prepared.State==PreparedChart::Deviation?PatchRemeshReason::Deviation:
+          prepared.State==PreparedChart::Topology?PatchRemeshReason::Topology:
+          PatchRemeshReason::Parameterization;
+      ++report.Fallback;
+      switch (prepared.State) {
+      case PreparedChart::Collision: ++report.CollisionFallback; break;
+      case PreparedChart::Deviation: ++report.DeviationFallback; break;
+      case PreparedChart::Topology: ++report.TopologyFallback; break;
+      default: ++report.ParameterizationFallback; break;
+      }
+      continue;
+    }
+    const auto liftStart=Clock::now();
+    Chart &chart = prepared.Value;
+    const Frame &frame = chart.Surface;
+    const BoundaryData &boundary = boundaries[patchId];
     const std::size_t originalVertexCount=vertices.size();
     std::vector<int> mapping(chart.Points.size(),-1);
     std::unordered_map<int,int> periodicAliases;
@@ -756,18 +1120,49 @@ bool RebuildAnalyticPatches(
     }
     orientation = orientation < 0 ? -1 : 1;
     for(auto f:chart.Faces){for(int&i:f)i=mapping[i];Vec3 n=Cross(Sub(ToVec(vertices[f[1]]),ToVec(vertices[f[0]])),Sub(ToVec(vertices[f[2]]),ToVec(vertices[f[0]])));const Point3 center=ToPoint(Mul(Add(Add(ToVec(vertices[f[0]]),ToVec(vertices[f[1]])),ToVec(vertices[f[2]])),1.0/3));if(orientation*Dot(n,frame.normalAt(center))<0)std::swap(f[1],f[2]);if(f[0]!=f[1]&&f[1]!=f[2]&&f[2]!=f[0])candidateFaces.push_back(f);}
-    if(!ValidatePatch(vertices,candidateFaces,boundary.Edges,
-                      targetEdgeLength)){vertices.resize(originalVertexCount);++report.Fallback;++report.TopologyFallback;finishChart();continue;}
-    const auto oldQuality=QualitySummary(vertices,oldFaces),newQuality=QualitySummary(vertices,candidateFaces);
-    const double acceptance=std::max(targetMeanQuality,oldQuality.Mean);
-    if(candidateFaces.empty()||newQuality.Mean+1e-8<acceptance||
-       newQuality.Minimum+1e-8<oldQuality.Minimum||
-       newQuality.Percentile05<.35||newQuality.FractionBelow02>.005){vertices.resize(originalVertexCount);++report.Fallback;++report.QualityFallback;finishChart();continue;}
+    liftSeconds+=std::chrono::duration<double>(Clock::now()-liftStart).count();
+    const auto validationStart=Clock::now();
+    const bool valid=ValidatePatch(vertices,candidateFaces,boundary.Edges,targetEdgeLength);
+    validationSeconds+=std::chrono::duration<double>(Clock::now()-validationStart).count();
+    if(!valid){reason=PatchRemeshReason::Topology;vertices.resize(originalVertexCount);++report.Fallback;++report.TopologyFallback;continue;}
     report.RebuiltFaces+=candidateFaces.size();
     replacements[patchId]=std::move(candidateFaces);
     successfullyRebuilt[patchId]=1;++report.Rebuilt;
-    finishChart();
+    reason=PatchRemeshReason::Rebuilt;
+    if(prepared.UsedCuda)++cudaAccepted;
+    if(prepared.SeededPlanar)++seededPlanarAccepted;
+    if(prepared.SeededCylinder)++seededCylinderAccepted;
   }
+  report.ChartSeconds = std::chrono::duration<double>(Clock::now()-rebuildStart).count();
+  if(verbose){
+    std::vector<int> slowest(patches.size());std::iota(slowest.begin(),slowest.end(),0);
+    std::stable_sort(slowest.begin(),slowest.end(),[&](int a,int b){return taskSeconds[a]>taskSeconds[b];});
+    for(std::size_t i=0;i<std::min<std::size_t>(8,slowest.size());++i){
+      const int id=slowest[i];std::size_t boundaryCount=0;
+      for(const auto &loop:boundaries[id].Loops)boundaryCount+=loop.size();
+      std::clog << "[CadMesh] analytic slow task: patch=" << id+1
+          << ", surface_type=" << int(patches[id].SurfaceType)
+          << ", loops=" << boundaries[id].Loops.size() << ", boundary_vertices=" << boundaryCount
+          << ", source_faces=" << patchFaces[id].size() << ", seconds=" << taskSeconds[id] << std::endl;
+    }
+  }
+  if(verbose)std::clog << "[CadMesh] planar constrained mesh complete: attempted=" << seededPlanar
+      << ", construction_failed=" << seededPlanarFailed << ", accepted=" << seededPlanarAccepted << std::endl;
+  if(verbose)std::clog << "[CadMesh] cylinder constrained mesh complete: attempted=" << seededCylinder
+      << ", construction_failed=" << seededCylinderFailed << ", accepted=" << seededCylinderAccepted << std::endl;
+  if(verbose)for(const auto &group:cylinderFailures)
+    std::clog << "[CadMesh] cylinder construction failure: reason=" << group.first
+        << ", count=" << group.second.first << ", worker_seconds=" << group.second.second << std::endl;
+  if(verbose&&cudaSubmitted)std::clog << "[CadMesh] analytic chart CUDA: batches=" << cudaBatches
+      << ", submitted=" << cudaSubmitted << ", completed=" << cudaCompleted
+      << ", accepted=" << cudaAccepted << ", cpu_fallback=" << cudaFallback
+      << ", gpu_pipeline_ms=" << cudaMilliseconds << std::endl;
+  if (verbose) std::clog << "[CadMesh] analytic charts complete: wall_s=" << report.ChartSeconds
+                        << ", worker_time_sums(make=" << makeSeconds << ", refine=" << refineSeconds
+                        << ", improve=" << improveSeconds << ")" << std::endl;
+  if(verbose)std::clog << "[CadMesh] analytic commit timing: future_wait_s=" << waitSeconds
+      << ", patch_detail_logging_s=" << detailLogSeconds << ", lift_and_orientation_s=" << liftSeconds
+      << ", topology_validation_s=" << validationSeconds << std::endl;
   phaseStart=Clock::now();
   if(report.Rebuilt){
     std::size_t faceCount=faces.size();

@@ -1,17 +1,27 @@
 param(
     [string]$PartitionDirectory = '',
     [string]$OutputDirectory = '',
+    [ValidateRange(1, 16)][int]$AnalyticWorkers = 4,
+    [switch]$CpuAnalytic,
+    [Alias('SimplePlanesOnly')][switch]$PlanesOnly,
+    [switch]$CylindersOnly,
+    [switch]$ConesOnly,
+    [switch]$OtherFeaturesOnly,
     [ValidateRange(0.000001, 1000000000.0)][double]$TargetEdgeLength = 6.0,
     [ValidateRange(0.000001, 180.0)][double]$MaxNormalDeviationDegrees = 10.0,
     [ValidateRange(0.000001, 1.0)][double]$TargetMeanQuality = 0.8,
-    [ValidateRange(0.0, 1000000000.0)][double]$MaxDeviation = 0.0,
+    [ValidateRange(0.0, 1000000000.0)][double]$MaxDeviation = 0.1,
     [ValidateRange(1, 10000)][int]$SplitPasses = 128,
-    [ValidateRange(0, 10000)][int]$CollapsePasses = 12,
-    [ValidateRange(0, 10000)][int]$FlipPasses = 32,
-    [ValidateRange(0, 10000)][int]$RelaxIterations = 8
+    # Compatibility arguments; patch remesh does not run global postprocessing.
+    [ValidateRange(0, 10000)][int]$CollapsePasses = 0,
+    [ValidateRange(0, 10000)][int]$FlipPasses = 0,
+    [ValidateRange(0, 10000)][int]$RelaxIterations = 0
 )
 
 $ErrorActionPreference = 'Stop'
+if (([int]$PlanesOnly.IsPresent + [int]$CylindersOnly.IsPresent + [int]$ConesOnly.IsPresent + [int]$OtherFeaturesOnly.IsPresent) -gt 1) {
+    throw 'Choose only one of -PlanesOnly, -CylindersOnly, -ConesOnly, or -OtherFeaturesOnly.'
+}
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($PartitionDirectory)) {
     $PartitionDirectory = Join-Path $projectRoot 'examples/partition_review'
@@ -36,11 +46,21 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $snapshot = Join-Path $OutputDirectory 'partition_input.bin'
 Write-Host "[remesh] Saved partition: $PartitionDirectory"
 Write-Host "[remesh] Output directory: $OutputDirectory"
+Write-Host '[remesh] Pipeline: shared boundary sampling -> patch reconstruction -> collision rollback -> compact and export.'
+if ($CollapsePasses -ne 0 -or $FlipPasses -ne 0 -or $RelaxIterations -ne 0) {
+    Write-Host '[remesh] CollapsePasses, FlipPasses and RelaxIterations are ignored by the patch-only pipeline.'
+}
 & $pythonExecutable (Join-Path $PSScriptRoot 'prepare_partition_snapshot.py') $PartitionDirectory $snapshot
 if ($LASTEXITCODE -ne 0) { throw "Partition packaging failed (exit $LASTEXITCODE)." }
 
 # Surface fitting is skipped entirely in this entry point.
 $env:CADMESH_CUDA_PROFILE_BY_TYPE = '0'
+$env:CADMESH_REMESH_THREADS = "$AnalyticWorkers"
+$env:CADMESH_REMESH_CHART_CUDA = if ($CpuAnalytic) { '0' } else { '1' }
+$env:CADMESH_REMESH_SIMPLE_PLANES_ONLY = if ($PlanesOnly) { '1' } else { '0' }
+$env:CADMESH_REMESH_CYLINDERS_ONLY = if ($CylindersOnly) { '1' } else { '0' }
+$env:CADMESH_REMESH_CONES_ONLY = if ($ConesOnly) { '1' } else { '0' }
+$env:CADMESH_REMESH_OTHER_FEATURES_ONLY = if ($OtherFeaturesOnly) { '1' } else { '0' }
 $culture = [System.Globalization.CultureInfo]::InvariantCulture
 $nativeArguments = @(
     $snapshot, (Join-Path $OutputDirectory 'remesh_result.ply'), '--partition-snapshot', '--require-remesh-cuda',
@@ -50,9 +70,7 @@ $nativeArguments = @(
     '--split-passes', "$SplitPasses", '--collapse-passes', "$CollapsePasses",
     '--flip-passes', "$FlipPasses", '--relax-iterations', "$RelaxIterations"
 )
-if ($PSBoundParameters.ContainsKey('MaxDeviation')) {
-    $nativeArguments += @('--max-deviation', $MaxDeviation.ToString('R', $culture))
-}
+$nativeArguments += @('--max-deviation', $MaxDeviation.ToString('R', $culture))
 & $nativeExecutable @nativeArguments
 if ($LASTEXITCODE -ne 0) { throw "Native remesh failed (exit $LASTEXITCODE)." }
 Write-Host "[remesh] Result: $(Join-Path $OutputDirectory 'remesh_result.ply')"

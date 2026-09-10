@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(CadMeshPatchSegmentation VERSION 0.1 LANGUAGES CXX)
+find_package(Threads REQUIRED)
 
 option(CADMESH_BUILD_TESTS "Build CadMesh tests" ON)
 set(VCGLIB_ROOT "d:/openSourceInstall/vcglib" CACHE PATH "VCGLib root")
@@ -27,6 +28,7 @@ add_library(CadMesh
     src/StlReader.cpp)
 target_include_directories(CadMesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${VCGLIB_ROOT} ${VCGLIB_ROOT}/eigenlib)
 target_compile_features(CadMesh PUBLIC cxx_std_17)
+target_link_libraries(CadMesh PRIVATE Threads::Threads)
 if(CMAKE_DL_LIBS)
     target_link_libraries(CadMesh PRIVATE ${CMAKE_DL_LIBS})
 endif()

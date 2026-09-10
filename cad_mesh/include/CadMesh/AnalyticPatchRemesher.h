@@ -8,6 +8,7 @@
 namespace CadMesh {
 
 struct AnalyticPatchRemeshReport {
+  std::vector<PatchRemeshReason> PatchReasons;
   std::size_t Attempted = 0;
   std::size_t Rebuilt = 0;
   std::size_t Fallback = 0;

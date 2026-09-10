@@ -203,8 +203,8 @@ int Run(int argc, char **argv) {
     const auto &stats = remeshed.Statistics;
     std::cout << "remesh: vertices=" << stats.InputVertices << " -> "
               << stats.OutputVertices << ", triangles=" << stats.InputTriangles
-              << " -> " << stats.OutputTriangles
-              << ", max_edge=" << stats.MaximumEdgeLength
+              << " -> " << stats.OutputTriangles;
+    if(stats.QualityMeasured)std::cout << ", max_edge=" << stats.MaximumEdgeLength
               << ", mean_quality=" << stats.MeanTriangleQuality
               << ", min_quality=" << stats.MinimumTriangleQuality
               << ", q05_quality=" << stats.Percentile05TriangleQuality
@@ -212,8 +212,9 @@ int Run(int argc, char **argv) {
               << 100.0 * stats.FractionBelow02TriangleQuality << "%"
               << ", min_angle_deg=" << stats.MinimumAngleDegrees
               << ", quality_target="
-              << (stats.QualityTargetMet ? "met" : "not_met")
-              << ", collision_rejections=" << stats.CollisionRejections
+              << (stats.QualityTargetMet ? "met" : "not_met");
+    else std::cout << ", quality=not_measured";
+    std::cout << ", collision_rejections=" << stats.CollisionRejections
               << ", analytic_patches=" << stats.AnalyticPatchesRebuilt
               << "/" << stats.AnalyticPatchesAttempted
               << ", analytic_fallback=" << stats.AnalyticPatchesFallback

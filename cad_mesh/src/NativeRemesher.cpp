@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -584,6 +585,171 @@ void AppendTriangle(std::vector<std::array<int, 3>> &faces,
   faces.push_back({a, b, c}); labels.push_back(label);
 }
 
+// Queue-driven fallback refinement. Stable face slots and intrusive corner
+// links let us replace only the one/two incident triangles of a split. The
+// edge table includes frozen faces, so a shared edge cannot crack a rebuilt
+// patch even when its other incident face belongs to the fallback region.
+std::size_t SplitLocalLongEdges(
+    std::vector<Point3> &vertices, std::vector<std::array<int,3>> &faces,
+    std::vector<int> &labels, std::unordered_set<EdgeKey> &constraints,
+    const NativeRemeshConfig &config,
+    const std::vector<unsigned char> &rebuiltPatches, std::string &error) {
+  if(config.SplitPasses<=0 || faces.empty()) return 0;
+  using Clock=std::chrono::steady_clock;
+  const auto start=Clock::now();
+  const auto elapsed=[&]{return std::chrono::duration<double>(Clock::now()-start).count();};
+  struct Corner { int Previous=-1, Next=-1; };
+  struct LocalEdge {
+    int Head=-1, Count=0, Frozen=0;
+    double Length=0;
+    std::size_t Queued=0;
+  };
+  if(faces.size()>std::size_t(std::numeric_limits<int>::max()/3)) {
+    error="local split exceeds corner indexing capacity";return 0;
+  }
+  std::vector<std::array<Corner,3>> links(faces.size());
+  std::unordered_map<EdgeKey,LocalEdge> edges;
+  edges.reserve(faces.size()+faces.size()/2+1);
+  const auto frozen=[&](int face) {
+    const int patch=labels[face];
+    return patch>=0 && patch<int(rebuiltPatches.size()) && rebuiltPatches[patch];
+  };
+  const auto attach=[&](int face) {
+    for(int side=0;side<3;++side) {
+      const int a=faces[face][side],b=faces[face][(side+1)%3];
+      const EdgeKey key=Key(a,b);
+      auto inserted=edges.try_emplace(key);
+      auto &edge=inserted.first->second;
+      if(inserted.second)edge.Length=Distance(vertices[a],vertices[b]);
+      const int corner=3*face+side;
+      links[face][side]={-1,edge.Head};
+      if(edge.Head>=0)links[edge.Head/3][edge.Head%3].Previous=corner;
+      edge.Head=corner;++edge.Count;if(frozen(face))++edge.Frozen;
+    }
+  };
+  const auto detach=[&](int face) {
+    for(int side=0;side<3;++side) {
+      auto &edge=edges.at(Key(faces[face][side],faces[face][(side+1)%3]));
+      const Corner link=links[face][side];
+      if(link.Previous>=0)links[link.Previous/3][link.Previous%3].Next=link.Next;
+      else edge.Head=link.Next;
+      if(link.Next>=0)links[link.Next/3][link.Next%3].Previous=link.Previous;
+      --edge.Count;if(frozen(face))--edge.Frozen;
+      links[face][side]={};
+    }
+  };
+  if(config.Verbose)std::clog << "[CadMesh] local split queue: building adjacency once" << std::endl;
+  for(int face=0;face<int(faces.size());++face)attach(face);
+  const double maximum=config.TargetEdgeLength*(1+1e-6);
+  const auto eligible=[&](const LocalEdge &edge) {
+    return edge.Count>0 && edge.Count<=2 && edge.Frozen==0 && edge.Length>maximum;
+  };
+  std::vector<EdgeKey> active;
+  std::size_t epoch=1;
+  // Seed in face order, independently of unordered_map iteration order.
+  const auto enqueue=[&](EdgeKey key,std::vector<EdgeKey> &queue,std::size_t generation) {
+    auto found=edges.find(key);
+    if(found==edges.end() || !eligible(found->second) || found->second.Queued==generation)return;
+    found->second.Queued=generation;queue.push_back(key);
+  };
+  for(const auto &face:faces)for(int side=0;side<3;++side)
+    enqueue(Key(face[side],face[(side+1)%3]),active,epoch);
+  if(config.Verbose)std::clog << "[CadMesh] local split queue: edges=" << edges.size()
+      << ", initial_long_edges=" << active.size() << ", setup_s=" << elapsed()
+      << "; CPU local updates, no per-round mesh upload" << std::endl;
+  std::size_t total=0,examined=0,changedFaces=0;
+  int rounds=0;
+  for(;rounds<config.SplitPasses && !active.empty();++rounds) {
+    const auto roundStart=Clock::now();
+    std::vector<EdgeKey> winners;
+    winners.reserve(active.size());
+    // Select against one immutable wave. Mutual longest edges have disjoint
+    // incident faces. Dormant losers are woken only when a neighbor changes.
+    for(EdgeKey key:active) {
+      ++examined;
+      auto found=edges.find(key);
+      if(found==edges.end() || !eligible(found->second))continue;
+      const auto &edge=found->second;
+      bool longest=true;
+      for(int h=edge.Head;h>=0 && longest;h=links[h/3][h%3].Next) {
+        const auto &face=faces[h/3];
+        for(int side=0;side<3;++side) {
+          const EdgeKey otherKey=Key(face[side],face[(side+1)%3]);
+          const auto &other=edges.at(otherKey);
+          if(eligible(other) && (other.Length>edge.Length ||
+               (other.Length==edge.Length && otherKey<key))){longest=false;break;}
+        }
+      }
+      if(longest)winners.push_back(key);
+    }
+    const std::size_t examinedThisRound=active.size();
+    const std::size_t splitsBefore=total;
+    active.clear();++epoch;
+    // Reuse the active queue's capacity. Every touched edge is enqueued once
+    // for the next wave; untouched short edges never get reconsidered.
+    for(EdgeKey key:winners) {
+      auto found=edges.find(key);
+      if(found==edges.end() || !eligible(found->second))continue;
+      std::array<int,2> incident{-1,-1};int count=0;
+      for(int h=found->second.Head;h>=0;h=links[h/3][h%3].Next)incident[count++]=h/3;
+      if(vertices.size()>=std::size_t(std::numeric_limits<int>::max()) ||
+         faces.size()+std::size_t(count)>std::size_t(std::numeric_limits<int>::max()/3)) {
+        error="local split exceeds vertex/corner indexing capacity";return total;
+      }
+      const int a=KeyFirst(key),b=KeySecond(key),mid=int(vertices.size());
+      // No projection: retain the same source-triangle-contained midpoint
+      // rule as the previous splitter.
+      vertices.push_back(ToPoint(Mul(Add(ToVec(vertices[a]),ToVec(vertices[b])),.5)));
+      std::array<EdgeKey,18> touched{};int touchedCount=0;
+      for(int i=0;i<count;++i) {
+        const int faceId=incident[i];const auto old=faces[faceId];const int label=labels[faceId];
+        for(int side=0;side<3;++side)touched[touchedCount++]=Key(old[side],old[(side+1)%3]);
+        int side=0;while(side<3 && Key(old[side],old[(side+1)%3])!=key)++side;
+        if(side==3){error="local split adjacency does not match triangle";return total;}
+        const int x=old[side],y=old[(side+1)%3],c=old[(side+2)%3];
+        detach(faceId);
+        faces[faceId]={x,mid,c};
+        const int child=int(faces.size());
+        faces.push_back({mid,y,c});labels.push_back(label);links.emplace_back();
+        attach(faceId);attach(child);
+        for(int f:{faceId,child})for(int s=0;s<3;++s)
+          touched[touchedCount++]=Key(faces[f][s],faces[f][(s+1)%3]);
+        ++changedFaces;
+      }
+      if(constraints.erase(key)) {
+        constraints.insert(Key(a,mid));constraints.insert(Key(mid,b));
+      }
+      for(int i=0;i<touchedCount;++i) {
+        const EdgeKey changed=touched[i];
+        auto e=edges.find(changed);
+        if(e!=edges.end() && e->second.Count==0)edges.erase(e);
+        else enqueue(changed,active,epoch);
+      }
+      ++total;
+    }
+    if(config.Verbose)std::clog << "[CadMesh] local split queue round " << rounds+1
+        << ": checked=" << examinedThisRound << ", split_edges=" << total-splitsBefore
+        << ", pending_long_edges=" << active.size() << ", faces=" << faces.size()
+        << ", seconds=" << std::chrono::duration<double>(Clock::now()-roundStart).count() << std::endl;
+  }
+  // One final accounting pass; no per-round global rebuild or face copying.
+  // Face slots are replaced in place and children appended, so the arrays are
+  // already dense and require no tombstone compaction.
+  std::size_t remaining=0,frozenLong=0,nonManifoldLong=0;
+  for(const auto &entry:edges) {
+    const auto &edge=entry.second;
+    if(eligible(edge))++remaining;
+    else if(edge.Length>maximum){if(edge.Frozen)++frozenLong;else if(edge.Count>2)++nonManifoldLong;}
+  }
+  if(config.Verbose)std::clog << "[CadMesh] local split queue complete: rounds=" << rounds
+      << ", split_edges=" << total << ", checked=" << examined << ", updated_faces=" << changedFaces
+      << ", remaining_long_edges=" << remaining << ", frozen_long_edges=" << frozenLong
+      << ", nonmanifold_long_edges=" << nonManifoldLong
+      << ", budget_reached=" << (rounds==config.SplitPasses && remaining?"yes":"no")
+      << ", wall_s=" << elapsed() << std::endl;
+  return total;
+}
+
 std::size_t SplitLongEdges(std::vector<Point3> &vertices,
                            std::vector<std::array<int, 3>> &faces,
                            std::vector<int> &labels,
@@ -595,6 +761,28 @@ std::size_t SplitLongEdges(std::vector<Point3> &vertices,
                            bool onlyConstraints,
                            std::string &error) {
   (void)patches;
+  if(!onlyConstraints)
+    return SplitLocalLongEdges(vertices,faces,labels,constraints,config,rebuiltPatches,error);
+  struct CylinderBoundaryMetric {Vec3 Origin{},Axis{};double Radius=0,Circumferential=0;};
+  std::vector<CylinderBoundaryMetric> cylinderMetrics(patches.size());
+  const char *planesSetting=std::getenv("CADMESH_REMESH_SIMPLE_PLANES_ONLY");
+  const bool planesOnly=planesSetting && std::string(planesSetting)=="1";
+  const char *coneBoundarySetting=std::getenv("CADMESH_REMESH_CONES_ONLY");
+  const bool conesBoundaryOnly=coneBoundarySetting && std::string(coneBoundarySetting)=="1";
+  const char *otherBoundarySetting=std::getenv("CADMESH_REMESH_OTHER_FEATURES_ONLY");
+  const bool otherBoundaryOnly=otherBoundarySetting && std::string(otherBoundarySetting)=="1";
+  if(!planesOnly && !conesBoundaryOnly && !otherBoundaryOnly)for(std::size_t id=0;id<patches.size();++id){
+    const auto &patch=patches[id];
+    const auto *p=std::get_if<CylinderParameters>(&patch.Parameters);
+    if(!p||patch.SurfaceType!=PatchSurfaceType::Cylinder||!(p->Radius>0)||
+       patch.ProjectionTarget!=PatchProjectionTarget::AnalyticSurface||
+       patch.MaxSampledSurfaceDeviation>config.MaximumDeviation+std::max(1.0,config.TargetEdgeLength)*1e-12)continue;
+    double circumferential=config.TargetEdgeLength;
+    if(config.MaximumNormalDeviationDegrees>0 && config.MaximumNormalDeviationDegrees<180)
+      circumferential=std::min(circumferential,1.8*p->Radius*
+          std::sin(config.MaximumNormalDeviationDegrees*std::acos(-1.0)/360));
+    cylinderMetrics[id]={ToVec(p->Axis.Origin),Normalize(ToVec(p->Axis.Direction)),p->Radius,circumferential};
+  }
   std::size_t total = 0;
   for (int pass = 0; pass < config.SplitPasses; ++pass) {
     auto edges = BuildEdges(faces, &labels, &rebuiltPatches);
@@ -624,6 +812,30 @@ std::size_t SplitLongEdges(std::vector<Point3> &vertices,
     } else
 #endif
       CpuClassify(vertices, edges, config.TargetEdgeLength, selected, midpoints);
+    std::size_t metricSplits=0;
+    for(std::size_t i=0;i<edges.size();++i){
+      if(selected[i])continue;
+      const auto &edge=edges[i];
+      // Internal feature edges of a single patch do not become interfaces.
+      const bool patchBoundary=edge.FaceCount!=2 || labels[edge.Faces[0]]!=labels[edge.Faces[1]];
+      if(!patchBoundary)continue;
+      for(int face:edge.Faces){
+        if(face<0)continue;const int id=labels[face];
+        if(id<0||id>=int(cylinderMetrics.size()))continue;
+        const auto &metric=cylinderMetrics[id];if(!(metric.Radius>0))continue;
+        const Vec3 a=Sub(ToVec(vertices[edge.A]),metric.Origin),b=Sub(ToVec(vertices[edge.B]),metric.Origin);
+        const double za=Dot(a,metric.Axis),zb=Dot(b,metric.Axis);
+        const Vec3 ra=Sub(a,Mul(metric.Axis,za)),rb=Sub(b,Mul(metric.Axis,zb));
+        if(!(Norm(ra)>0)||!(Norm(rb)>0))continue;
+        const double arc=metric.Radius*std::atan2(Norm(Cross(ra,rb)),Dot(ra,rb));
+        const double scaledHeight=(zb-za)*metric.Circumferential/config.TargetEdgeLength;
+        if(std::hypot(arc,scaledHeight)>metric.Circumferential*(1+1e-6)){
+          selected[i]=1;++metricSplits;break;
+        }
+      }
+    }
+    if(config.Verbose)std::clog << "[CadMesh] boundary compatibility: additional_cylinder_edges="
+                              << metricSplits << " (shared sampling, existing endpoints retained)" << std::endl;
     if (std::none_of(selected.begin(), selected.end(), [](unsigned char value) { return value != 0; }))
       break;
     std::unordered_map<EdgeKey, int> midpointIds;
@@ -669,6 +881,10 @@ std::size_t SplitLongEdges(std::vector<Point3> &vertices,
       if (!longestOnBothSides) continue;
       Point3 midpoint = midpoints[edgeId];
       const EdgeKey key = Key(edge.A, edge.B);
+      if(Distance(midpoint,vertices[edge.A])==0 || Distance(midpoint,vertices[edge.B])==0){
+        error="boundary sampling midpoint precision stall on edge "+std::to_string(edge.A)+"-"+std::to_string(edge.B);
+        return total;
+      }
       const bool constrained = constraints.count(key) != 0;
       // A split on the current edge is geometrically contained in the two
       // incident source triangles. Moving it to an infinite analytic surface
@@ -1121,6 +1337,7 @@ void Compact(NativeRemeshResult &result, std::unordered_set<EdgeKey> &constraint
 
 void Measure(NativeRemeshResult &result, double target) {
   auto &stats = result.Statistics;
+  stats.QualityMeasured = true;
   double sum = 0, minimum = 1, maximumEdge = 0, minimumAngle = 180;
   std::vector<double> qualities;
   qualities.reserve(result.Triangles.size());
@@ -1188,9 +1405,6 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
   }
   auto &stats = result.Statistics;
   stats.InputVertices = result.Vertices.size(); stats.InputTriangles = result.Triangles.size();
-  if (config.Verbose) std::clog << "[CadMesh] native remesh: building reference index" << std::endl;
-  const SurfaceIndex reference(result.Vertices, result.Triangles,
-                               result.PatchIds);
   std::unordered_set<EdgeKey> constraints;
   for (int edgeId : segmenter.getRemeshConstraint().ConstraintEdgeIds) {
     if (edgeId < 0 || edgeId >= int(mesh.getEdges().size())) continue;
@@ -1202,6 +1416,13 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
     error = "native remesh CUDA Driver/NVRTC runtime is unavailable"; return false;
   }
   std::vector<unsigned char> rebuiltPatches;
+  // Explicitly include every patch interface and open boundary, even if it
+  // was not classified as a sharp feature by the partition constraint set.
+  // The global splitter inserts each shared vertex once for both owners.
+  for(const auto &edge:BuildEdges(result.Triangles)) {
+    if(edge.FaceCount!=2 || result.PatchIds[edge.Faces[0]]!=result.PatchIds[edge.Faces[1]])
+      constraints.insert(Key(edge.A,edge.B));
+  }
   // Sample every shared boundary before chart construction. Analytic charts
   // then consume the same global boundary ids on both incident patches.
   phaseStart=Clock::now();
@@ -1215,6 +1436,14 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
     std::clog << "[CadMesh] boundary split complete: " << boundarySplitSeconds
               << " s; starting analytic rebuild" << std::endl;
   phaseStart=Clock::now();
+  const char *planeSetting=std::getenv("CADMESH_REMESH_SIMPLE_PLANES_ONLY");
+  const bool simplePlanesOnly=planeSetting && std::string(planeSetting)=="1";
+  const char *cylinderSetting=std::getenv("CADMESH_REMESH_CYLINDERS_ONLY");
+  const bool cylindersOnly=cylinderSetting && std::string(cylinderSetting)=="1";
+  const char *coneSetting=std::getenv("CADMESH_REMESH_CONES_ONLY");
+  const bool conesOnly=coneSetting && std::string(coneSetting)=="1";
+  const char *otherSetting=std::getenv("CADMESH_REMESH_OTHER_FEATURES_ONLY");
+  const bool otherFeaturesOnly=otherSetting && std::string(otherSetting)=="1";
   const auto analyticBaseTriangles = result.Triangles;
   const auto analyticBasePatchIds = result.PatchIds;
   std::vector<unsigned char> excludedAnalyticPatches(
@@ -1229,19 +1458,25 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
                          analyticReport, config.Verbose);
   // Chart boundaries retain their original global vertex ids. Restore only
   // rejected patches using those ids; unrelated charts need no retriangulation.
+  double collisionIndexSeconds=0,collisionQuerySeconds=0,collisionRestoreSeconds=0;
   for (int collisionAttempt = 0; collisionAttempt < 4; ++collisionAttempt) {
     if (std::none_of(rebuiltPatches.begin(), rebuiltPatches.end(),
                      [](unsigned char rebuilt) { return rebuilt != 0; })) break;
     if (config.Verbose)
       std::clog << "[CadMesh] analytic rebuild complete; collision guard attempt "
                 << collisionAttempt + 1 << std::endl;
+    const auto collisionIndexStart=Clock::now();
     const SurfaceIndex analyticCollision(result.Vertices, result.Triangles,
                                          result.PatchIds);
+    collisionIndexSeconds+=std::chrono::duration<double>(Clock::now()-collisionIndexStart).count();
     std::vector<unsigned char> rejected;
+    const auto collisionQueryStart=Clock::now();
     const std::size_t collisionPatches =
         analyticCollision.collectIntersectingRebuiltPatches(
             rebuiltPatches, rejected, config.TargetEdgeLength * 1e-10);
+    collisionQuerySeconds+=std::chrono::duration<double>(Clock::now()-collisionQueryStart).count();
     if (!collisionPatches) break;
+    const auto collisionRestoreStart=Clock::now();
     if (config.Verbose)
       std::clog << "[CadMesh] analytic collision guard: rejecting "
                 << collisionPatches << " rebuilt patches (attempt "
@@ -1278,15 +1513,88 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
     for (int patch = 0; patch < int(rebuiltPatches.size()); ++patch) {
       if (!restorePatch(patch)) continue;
       rebuiltPatches[patch] = 0;
+      analyticReport.PatchReasons[patch]=collisionAttempt>=2?
+          PatchRemeshReason::CollisionGuardRestore:PatchRemeshReason::Collision;
       --analyticReport.Rebuilt;
       ++analyticReport.Fallback;
       ++analyticReport.CollisionFallback;
     }
+    collisionRestoreSeconds+=std::chrono::duration<double>(Clock::now()-collisionRestoreStart).count();
   }
+  if(config.Verbose)std::clog << "[CadMesh] analytic collision timing: index_s=" << collisionIndexSeconds
+      << ", query_s=" << collisionQuerySeconds << ", restore_s=" << collisionRestoreSeconds << std::endl;
   analyticSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
   stats.AnalyticPatchesAttempted = analyticReport.Attempted;
   stats.AnalyticPatchesRebuilt = analyticReport.Rebuilt;
   stats.AnalyticPatchesFallback = analyticReport.Fallback;
+  result.RemeshedPatches = rebuiltPatches;
+  result.PatchReasons = analyticReport.PatchReasons;
+  if(config.Verbose){
+    // Measure the input partition, not the output tessellation: changing point
+    // density or rolling a patch back must not change the area denominator.
+    std::vector<double> patchAreas(segmenter.getPatches().size(),0);
+    double totalArea=0;
+    for(const auto &triangle:mesh.getTriangles()){
+      const auto &ids=triangle.VertexIds;
+      const Vec3 a=ToVec(mesh.getVertices()[ids[0]].Position);
+      const Vec3 b=ToVec(mesh.getVertices()[ids[1]].Position);
+      const Vec3 c=ToVec(mesh.getVertices()[ids[2]].Position);
+      const double area=.5*Norm(Cross(Sub(b,a),Sub(c,a)));
+      if(triangle.PatchId>=0 && std::size_t(triangle.PatchId)<patchAreas.size()){
+        patchAreas[triangle.PatchId]+=area;totalArea+=area;
+      }
+    }
+    std::array<double,256> areas{};
+    std::array<std::size_t,256> counts{};
+    std::vector<std::size_t> retained;
+    for(std::size_t id=0;id<patchAreas.size();++id){
+      const auto reason=result.PatchReasons[id];const auto code=static_cast<unsigned char>(reason);
+      areas[code]+=patchAreas[id];++counts[code];
+      if(reason!=PatchRemeshReason::Rebuilt)retained.push_back(id);
+    }
+    for(std::size_t code=0;code<counts.size();++code)if(counts[code])
+      std::clog << "[CadMesh] remesh reason area: reason="
+          << PatchRemeshReasonName(static_cast<PatchRemeshReason>(code))
+          << ", code=" << code << ", patches=" << counts[code]
+          << ", input_area=" << areas[code]
+          << ", input_area_percent=" << (totalArea>0?100*areas[code]/totalArea:0) << '\n';
+    std::sort(retained.begin(),retained.end(),[&](std::size_t a,std::size_t b){
+      return patchAreas[a]!=patchAreas[b]?patchAreas[a]>patchAreas[b]:a<b;
+    });
+    for(std::size_t rank=0;rank<std::min<std::size_t>(20,retained.size());++rank){
+      const auto id=retained[rank];const auto &patch=segmenter.getPatches()[id];
+      std::clog << "[CadMesh] largest retained patch: ply_patch_id=" << id
+          << ", progress_patch=" << id+1 << ", type=" << SurfaceTypeName(patch.SurfaceType)
+          << ", reason=" << PatchRemeshReasonName(result.PatchReasons[id])
+          << ", input_area=" << patchAreas[id]
+          << ", input_area_percent=" << (totalArea>0?100*patchAreas[id]/totalArea:0)
+          << ", fitted_deviation=" << patch.MaxSampledSurfaceDeviation << '\n';
+    }
+  }
+  if(config.Verbose){
+    const auto &patches=segmenter.getPatches();
+    for(const auto type:{PatchSurfaceType::Plane,PatchSurfaceType::Cylinder,PatchSurfaceType::Cone,PatchSurfaceType::Sphere,
+                        PatchSurfaceType::Torus,PatchSurfaceType::Freeform,PatchSurfaceType::Unknown}){
+      std::size_t total=0,selected=0,eligible=0,accepted=0;
+      for(std::size_t id=0;id<patches.size();++id){
+        const auto &patch=patches[id];if(patch.SurfaceType!=type)continue;
+        ++total;
+        if((simplePlanesOnly && type!=PatchSurfaceType::Plane) ||
+           (cylindersOnly && type!=PatchSurfaceType::Cylinder) ||
+           (conesOnly && type!=PatchSurfaceType::Cone) ||
+           (otherFeaturesOnly && (type==PatchSurfaceType::Plane || type==PatchSurfaceType::Cylinder)))continue;
+        ++selected;
+        if(type!=PatchSurfaceType::Freeform && type!=PatchSurfaceType::Unknown &&
+           patch.ProjectionTarget==PatchProjectionTarget::AnalyticSurface)++eligible;
+        if(id<rebuiltPatches.size() && rebuiltPatches[id])++accepted;
+      }
+      std::clog << "[CadMesh] patch remesh result: type=" << SurfaceTypeName(type)
+          << ", total=" << total << ", selected=" << selected << ", analytic_eligible=" << eligible
+          << ", accepted=" << accepted << ", fallback=" << eligible-accepted
+          << ", unsupported_or_nonanalytic=" << selected-eligible
+          << ", unselected=" << total-selected << std::endl;
+    }
+  }
   if (config.Verbose)
     std::clog << "[CadMesh] analytic parameter-domain rebuild: "
               << analyticReport.Rebuilt << " / " << analyticReport.Attempted
@@ -1302,130 +1610,24 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
               << "s, commit=" << analyticReport.CommitSeconds << "s)\n";
   // Drop superseded analytic interior vertices before any CUDA transfer or
   // fallback adjacency allocation. Boundary constraints are remapped here.
+  const auto compactStart=Clock::now();
   Compact(result,constraints);
-  phaseStart=Clock::now();
-  stats.Splits += SplitLongEdges(result.Vertices, result.Triangles,
-                                 result.PatchIds, constraints,
-                                 segmenter.getPatches(), config, cuda,
-                                 stats.UsedCuda, rebuiltPatches, false, error);
-  if (!error.empty()) return false;
-  localSplitSeconds+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  phaseStart=Clock::now();
-  stats.Collapses = CollapseShortEdges(result.Vertices, result.Triangles, result.PatchIds,
-                                       constraints, segmenter.getPatches(),
-                                       reference, stats.CollisionRejections,
-                                       config, rebuiltPatches);
-  collapseSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  // A parallel collapse batch validates each candidate against the mesh at the
-  // start of the pass. Two disjoint accepted collapses can still become the
-  // endpoints of the same new edge, so restore the hard edge-length invariant
-  // before quality optimization.
-  phaseStart=Clock::now();
-  stats.Splits += SplitLongEdges(result.Vertices, result.Triangles,
-                                 result.PatchIds, constraints,
-                                 segmenter.getPatches(), config, cuda,
-                                 stats.UsedCuda, rebuiltPatches, false, error);
-  if (!error.empty()) return false;
-  localSplitSeconds+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  phaseStart=Clock::now();
-  stats.Flips = FlipEdges(result.Vertices, result.Triangles,
-                          result.PatchIds, constraints,
-                          stats.CollisionRejections, config, rebuiltPatches);
-  flipSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  phaseStart=Clock::now();
-  stats.AcceptedRelaxations = RelaxVertices(result.Vertices, result.Triangles, result.PatchIds,
-                                             constraints, segmenter.getPatches(),
-                                             reference,
-                                             stats.CollisionRejections, config,
-                                             rebuiltPatches);
-  relaxSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  // Keep the file-producing path self-contained: if a numerical edge case in
-  // an optimization pass creates an overlong edge, repair it here instead of
-  // rejecting an otherwise usable remesh at final validation.
-  phaseStart=Clock::now();
-  const std::size_t finalSplits = SplitLongEdges(
-      result.Vertices, result.Triangles, result.PatchIds, constraints,
-      segmenter.getPatches(), config, cuda, stats.UsedCuda, rebuiltPatches,
-      false, error);
-  localSplitSeconds+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  stats.Splits += finalSplits;
-  if (!error.empty()) return false;
-  if (finalSplits) {
-    phaseStart=Clock::now();
-    stats.Flips += FlipEdges(result.Vertices, result.Triangles,
-                             result.PatchIds, constraints,
-                             stats.CollisionRejections, config,
-                             rebuiltPatches);
-    flipSeconds+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-    phaseStart=Clock::now();
-    stats.AcceptedRelaxations += RelaxVertices(
-        result.Vertices, result.Triangles, result.PatchIds, constraints,
-        segmenter.getPatches(), reference, stats.CollisionRejections,
-        config, rebuiltPatches);
-    relaxSeconds+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  }
-  phaseStart=Clock::now();
-  Compact(result, constraints); Measure(result, config.TargetMeanTriangleQuality);
-  const SurfaceIndex finalCollision(result.Vertices, result.Triangles,
-                                    result.PatchIds);
-  int intersection0 = -1, intersection1 = -1;
-  const bool hasSelfIntersection = finalCollision.firstSelfIntersection(
-      intersection0, intersection1, config.TargetEdgeLength * 1e-10);
-  stats.SelfIntersectionFree = !hasSelfIntersection;
-  if (hasSelfIntersection) {
-    std::clog << "[CadMesh] warning: output self-intersection between faces "
-              << intersection0 << " (patch " << result.PatchIds[intersection0]
-              << ") and " << intersection1 << " (patch "
-              << result.PatchIds[intersection1] << ")";
-    int sourceIntersection0 = -1, sourceIntersection1 = -1;
-    if (reference.firstSelfIntersection(
-            sourceIntersection0, sourceIntersection1,
-            config.TargetEdgeLength * 1e-10)) {
-      std::clog << "; input mesh already self-intersects between source faces "
-                << sourceIntersection0 << " (patch "
-                << mesh.getTriangles()[sourceIntersection0].PatchId << ") and "
-                << sourceIntersection1 << " (patch "
-                << mesh.getTriangles()[sourceIntersection1].PatchId << ")";
-    } else {
-      std::clog << "; input mesh is intersection-free, so this intersection "
-                   "was introduced during remesh";
-    }
-    std::clog << "; continuing because self-intersection is diagnostic only\n";
-  }
-  validationSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  if (stats.MaximumEdgeLength > config.TargetEdgeLength * (1 + 1e-6)) {
-    std::ostringstream message;
-    message << std::setprecision(17)
-            << "native remesh maximum edge " << stats.MaximumEdgeLength
-            << " exceeds target " << config.TargetEdgeLength;
-    error = message.str();
-    return false;
-  }
-  if (config.Verbose) {
-    std::clog << "[CadMesh] native remesh: " << stats.InputTriangles << " -> "
-              << stats.OutputTriangles << " triangles; splits=" << stats.Splits
-              << ", collapses=" << stats.Collapses << ", flips=" << stats.Flips
-              << ", relax=" << stats.AcceptedRelaxations
-              << ", collision_rejections=" << stats.CollisionRejections
-              << ", analytic=" << stats.AnalyticPatchesRebuilt << "/"
-              << stats.AnalyticPatchesAttempted
-              << ", analytic_fallback=" << stats.AnalyticPatchesFallback
-              << ", CUDA=" << (stats.UsedCuda ? "yes" : "no")
-              << ", mean quality=" << stats.MeanTriangleQuality
-              << " (target " << config.TargetMeanTriangleQuality << ")"
-              << ", q05=" << stats.Percentile05TriangleQuality
-              << ", below_q0.2="
-              << 100.0 * stats.FractionBelow02TriangleQuality << "%\n";
-    std::clog << "[CadMesh] native remesh timing: boundary_split="
-              << boundarySplitSeconds << "s, analytic=" << analyticSeconds
-              << "s, local_split=" << localSplitSeconds
-              << "s, collapse=" << collapseSeconds
-              << "s, flip=" << flipSeconds << "s, relax=" << relaxSeconds
-              << "s, validation=" << validationSeconds << "s\n";
-  }
+  if(config.Verbose)std::clog << "[CadMesh] post-analytic compact: "
+      << std::chrono::duration<double>(Clock::now()-compactStart).count() << " s" << std::endl;
+  stats.OutputVertices=result.Vertices.size();stats.OutputTriangles=result.Triangles.size();
+  if(config.Verbose)std::clog << "[CadMesh] patch remesh complete: boundary_sampling_s="
+      << boundarySplitSeconds << ", patch_index_s=" << analyticReport.IndexSeconds
+      << ", chart_compute_and_commit_s=" << analyticReport.ChartSeconds
+      << ", face_assembly_s=" << analyticReport.CommitSeconds
+      << ", analytic_including_collision_guard_s=" << analyticSeconds
+      << ", accepted=" << analyticReport.Rebuilt << '/' << analyticReport.Attempted
+      << ", retained_patches=" << segmenter.getPatches().size()-analyticReport.Rebuilt
+      << "; local split/collapse/flip/relax skipped; exporting patch remesh" << std::endl;
+  // Failed, unsupported and unselected patches retain their interiors. Their
+  // edges are not required to meet the rebuilt patches' target length.
+  // Topology validation and analytic collision rollback have already run.
   return true;
 }
-
 bool NativeRemesher::writePly(const NativeRemeshResult &result,
                               const std::vector<MeshPatch> &patches,
                               const std::filesystem::path &path,
@@ -1436,6 +1638,8 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
   std::ofstream out(path);
   if (!out) { error = "cannot open output PLY"; return false; }
   out << "ply\nformat ascii 1.0\ncomment color_by surface_instance"
+         "\ncomment remeshed 1=accepted_patch_reconstruction 0=not_reconstructed_or_rolled_back"
+         "\ncomment remesh_reason 0=rebuilt 1=unselected 2=unsupported 3=nonanalytic 4=deviation 5=parameterization_or_construction 6=topology 7=collision 8=collision_guard_restore 255=unknown"
          "\ncomment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform"
          "\ncomment feature_role_ids 0=Ordinary 1=Fillet\nelement vertex "
       << result.Vertices.size()
@@ -1443,7 +1647,7 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
       << result.Triangles.size()
       << "\nproperty list uchar int vertex_indices\nproperty int patch_id"
          "\nproperty int primitive_type\nproperty uchar red\nproperty uchar green"
-         "\nproperty uchar blue\nproperty int feature_role\nend_header\n"
+         "\nproperty uchar blue\nproperty int feature_role\nproperty uchar remeshed\nproperty uchar remesh_reason\nend_header\n"
       << std::setprecision(17);
   for (const auto &vertex : result.Vertices)
     out << vertex.X() << ' ' << vertex.Y() << ' ' << vertex.Z() << '\n';
@@ -1455,7 +1659,11 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
     out << "3 " << face[0] << ' ' << face[1] << ' ' << face[2] << ' ' << patchId << ' '
         << SurfaceTypeId(patch ? patch->SurfaceType : PatchSurfaceType::Unknown) << ' '
         << color[0] << ' ' << color[1] << ' ' << color[2] << ' '
-        << (patch && patch->FeatureRole == PatchFeatureRole::Fillet ? 1 : 0) << '\n';
+        << (patch && patch->FeatureRole == PatchFeatureRole::Fillet ? 1 : 0) << ' '
+        << (patchId >= 0 && std::size_t(patchId) < result.RemeshedPatches.size()
+                && result.RemeshedPatches[patchId] ? 1 : 0) << ' '
+        << (patchId>=0 && std::size_t(patchId)<result.PatchReasons.size()
+                ? int(result.PatchReasons[patchId]) : int(PatchRemeshReason::Unknown)) << '\n';
   }
   out.flush();
   if (!out) { error = "writing output PLY failed"; return false; }
