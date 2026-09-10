@@ -7,8 +7,12 @@ param(
     [switch]$CylindersOnly,
     [switch]$ConesOnly,
     [switch]$OtherFeaturesOnly,
+    [switch]$PatchDetails,
     [ValidateRange(0.000001, 1000000000.0)][double]$TargetEdgeLength = 6.0,
     [ValidateRange(0.000001, 180.0)][double]$MaxNormalDeviationDegrees = 10.0,
+    [ValidateRange(0.0, 180.0)][double]$GenericFeatureAngleDegrees = 10.0,
+    [ValidateRange(1, 100)][int]$GenericRemeshIterations = 5,
+    [ValidateRange(1, 128)][int]$GenericRemeshWorkers = 20,
     [ValidateRange(0.000001, 1.0)][double]$TargetMeanQuality = 0.8,
     [ValidateRange(0.0, 1000000000.0)][double]$MaxDeviation = 0.1,
     [ValidateRange(1, 10000)][int]$SplitPasses = 128,
@@ -46,16 +50,20 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $snapshot = Join-Path $OutputDirectory 'partition_input.bin'
 Write-Host "[remesh] Saved partition: $PartitionDirectory"
 Write-Host "[remesh] Output directory: $OutputDirectory"
-Write-Host '[remesh] Pipeline: shared boundary sampling -> patch reconstruction -> collision rollback -> compact and export.'
+Write-Host '[remesh] Pipeline: shared boundary sampling -> preserve/repartition Others -> global patch remesh -> compact and export.'
+if (-not ($PlanesOnly -or $CylindersOnly -or $ConesOnly -or $OtherFeaturesOnly)) {
+    Write-Host '[remesh] Selection: all surface types; original Plane/Cylinder reconstruction enabled.'
+}
 if ($CollapsePasses -ne 0 -or $FlipPasses -ne 0 -or $RelaxIterations -ne 0) {
     Write-Host '[remesh] CollapsePasses, FlipPasses and RelaxIterations are ignored by the patch-only pipeline.'
 }
 & $pythonExecutable (Join-Path $PSScriptRoot 'prepare_partition_snapshot.py') $PartitionDirectory $snapshot
 if ($LASTEXITCODE -ne 0) { throw "Partition packaging failed (exit $LASTEXITCODE)." }
 
-# Surface fitting is skipped entirely in this entry point.
+# Initial whole-model fitting is skipped; selected Others are locally repartitioned.
 $env:CADMESH_CUDA_PROFILE_BY_TYPE = '0'
 $env:CADMESH_REMESH_THREADS = "$AnalyticWorkers"
+$env:CADMESH_REMESH_PATCH_DETAILS = if ($PatchDetails) { '1' } else { '0' }
 $env:CADMESH_REMESH_CHART_CUDA = if ($CpuAnalytic) { '0' } else { '1' }
 $env:CADMESH_REMESH_SIMPLE_PLANES_ONLY = if ($PlanesOnly) { '1' } else { '0' }
 $env:CADMESH_REMESH_CYLINDERS_ONLY = if ($CylindersOnly) { '1' } else { '0' }
@@ -66,6 +74,9 @@ $nativeArguments = @(
     $snapshot, (Join-Path $OutputDirectory 'remesh_result.ply'), '--partition-snapshot', '--require-remesh-cuda',
     '--target-edge-length', $TargetEdgeLength.ToString('R', $culture),
     '--max-normal-deviation-degrees', $MaxNormalDeviationDegrees.ToString('R', $culture),
+    '--generic-feature-angle-deg', $GenericFeatureAngleDegrees.ToString('R', $culture),
+    '--generic-remesh-iterations', $GenericRemeshIterations.ToString($culture),
+    '--generic-remesh-workers', $GenericRemeshWorkers.ToString($culture),
     '--target-mean-quality', $TargetMeanQuality.ToString('R', $culture),
     '--split-passes', "$SplitPasses", '--collapse-passes', "$CollapsePasses",
     '--flip-passes', "$FlipPasses", '--relax-iterations', "$RelaxIterations"

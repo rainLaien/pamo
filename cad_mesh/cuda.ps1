@@ -4,13 +4,14 @@ param(
     [ValidateRange(0.000001, 1000000000.0)][double]$TargetEdgeLength = 6.0,
     [ValidateRange(0.0, 1000000000.0)][double]$MaxDeviation = 0.1,
     [ValidateRange(0.000001, 180.0)][double]$MaxNormalDeviationDegrees = 10.0,
-    [ValidateRange(1, 16)][int]$AnalyticWorkers = 4
+    [ValidateRange(1, 16)][int]$AnalyticWorkers = 4,
+    [switch]$PatchDetails
 )
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($InputStl)) {
-    $InputStl = Join-Path $projectRoot 'examples/111.stl'
+    $InputStl = Join-Path $projectRoot 'examples/222_li.stl'
 }
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
@@ -29,6 +30,7 @@ foreach ($requiredFile in @($InputStl, $executable)) {
 $env:CADMESH_CUDA_PROFILE = '1'
 $env:CADMESH_CUDA_PROFILE_BY_TYPE = '0'
 $env:CADMESH_REMESH_THREADS = "$AnalyticWorkers"
+$env:CADMESH_REMESH_PATCH_DETAILS = if ($PatchDetails) { '1' } else { '0' }
 $env:CADMESH_REMESH_CHART_CUDA = '1'
 # Reset filters left by earlier surface-only runs in this PowerShell session.
 $env:CADMESH_REMESH_SIMPLE_PLANES_ONLY = '0'

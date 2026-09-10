@@ -11,7 +11,7 @@ namespace CadMesh {
 enum class PatchRemeshReason : unsigned char {
   Rebuilt=0, Unselected=1, Unsupported=2, Nonanalytic=3,
   Deviation=4, Parameterization=5, Topology=6, Collision=7,
-  CollisionGuardRestore=8, Unknown=255
+  CollisionGuardRestore=8, Preserved=9, Unknown=255
 };
 inline const char *PatchRemeshReasonName(PatchRemeshReason reason) {
   switch(reason) {
@@ -24,6 +24,7 @@ inline const char *PatchRemeshReasonName(PatchRemeshReason reason) {
   case PatchRemeshReason::Topology:return "topology";
   case PatchRemeshReason::Collision:return "collision";
   case PatchRemeshReason::CollisionGuardRestore:return "collision_guard_restore";
+  case PatchRemeshReason::Preserved:return "preserved_good_input";
   default:return "unknown";
   }
 }

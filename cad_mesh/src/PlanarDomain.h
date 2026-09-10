@@ -458,7 +458,89 @@ bool MakeDirectCylinderRing(const Frame &frame,
   return finished;
 }
 
-bool MakeSeededCylinderChart(const Frame &frame,
+// Recover the trimmed domain from the input connectivity. In particular, a
+// second loop can be a hole in a trimmed wall, rather than a periodic ring.
+// Unwrap along ALL source edges so crossing atan2's branch cut is harmless.
+bool MakeSourceCylinderChart(const Frame &frame,
+                            const std::vector<std::array<int,3>> &sourceFaces,
+                            const std::vector<Point3> &vertices,double target,
+                            double axialScale,Chart &chart,ChartBuildDiagnostics &diagnostics){
+  diagnostics.Stage="source_cylinder_unwrap";
+  const auto fail=[&](const char *reason){diagnostics.Failure=reason;return false;};
+  if(sourceFaces.empty())return fail("empty_source_mesh");
+  if(sourceFaces.size()>200000)return fail("source_mesh_size_budget");
+  Chart seed;seed.Surface=frame;
+  std::unordered_map<int,int> local;
+  std::vector<int> globals;
+  std::unordered_map<EdgeKey,int> counts;
+  std::vector<std::vector<int>> neighbors;
+  for(const auto &source:sourceFaces){
+    std::array<int,3> face;
+    for(int k=0;k<3;++k){
+      const int id=source[k];
+      if(id<0||std::size_t(id)>=vertices.size())return fail("source_vertex_index");
+      auto found=local.find(id);
+      if(found==local.end()){
+        UV uv;if(!frame.parameter(vertices[id],uv)||!std::isfinite(uv.X)||!std::isfinite(uv.Y))
+          return fail("source_parameterization");
+        const int index=int(seed.Points.size());local.emplace(id,index);globals.push_back(id);
+        uv.Y*=axialScale;seed.Points.push_back(uv);neighbors.emplace_back();
+        seed.Aliases.push_back(-1);seed.Fixed.push_back(0);face[k]=index;
+      }else face[k]=found->second;
+    }
+    if(face[0]==face[1]||face[1]==face[2]||face[2]==face[0])return fail("source_degenerate_face");
+    seed.Faces.push_back(face);
+    for(int k=0;k<3;++k){
+      const int a=face[k],b=face[(k+1)%3];
+      int &count=counts[Key(a,b)];
+      if(++count>2)return fail("source_nonmanifold_edge");
+      if(count==1){neighbors[a].push_back(b);neighbors[b].push_back(a);}
+    }
+  }
+  if(seed.Points.size()>100000)return fail("source_mesh_size_budget");
+  const std::vector<UV> wrapped=seed.Points;
+  std::vector<unsigned char> visited(seed.Points.size(),0);
+  std::vector<int> queue;
+  const double angularTolerance=frame.UPeriod*1e-8;
+  for(int root=0;root<int(seed.Points.size());++root){
+    if(visited[root])continue;
+    queue.clear();queue.push_back(root);visited[root]=1;
+    for(std::size_t head=0;head<queue.size();++head){
+      const int a=queue[head];
+      for(int b:neighbors[a]){
+        const double x=seed.Points[a].X+std::remainder(wrapped[b].X-wrapped[a].X,frame.UPeriod);
+        if(visited[b]){
+          // A nonzero cycle winding needs a cut, not an overlapping disk.
+          if(std::abs(seed.Points[b].X-x)>angularTolerance)return fail("source_periodic_cut_required");
+        }else{seed.Points[b].X=x;visited[b]=1;queue.push_back(b);}
+      }
+    }
+  }
+  diagnostics.Stage="source_cylinder_seed";
+  int orientation=0;
+  for(auto &face:seed.Faces){
+    const double area=Cross2(seed.Points[face[0]],seed.Points[face[1]],seed.Points[face[2]]);
+    if(!std::isfinite(area)||area==0)return fail("source_uv_degenerate_face");
+    const int sign=area>0?1:-1;
+    if(orientation && orientation!=sign)return fail("source_uv_fold_or_inconsistent_orientation");
+    orientation=sign;
+  }
+  if(orientation<0)for(auto &face:seed.Faces)std::swap(face[1],face[2]);
+  std::vector<std::array<int,2>> segments;
+  for(const auto &entry:counts)if(entry.second==1){
+    const int a=int(entry.first>>32),b=int(std::uint32_t(entry.first));
+    segments.push_back({a,b});
+    seed.Fixed[a]=seed.Fixed[b]=1;seed.Aliases[a]=globals[a];seed.Aliases[b]=globals[b];
+  }
+  if(segments.empty())return fail("source_periodic_cut_required");
+  std::sort(segments.begin(),segments.end());
+  // Even-odd filling uses the real boundary edges, including every hole.
+  // Internal source diagonals are free to flip and split.
+  chart=std::move(seed);
+  return PopulateSeededDomain(chart,segments,target,true,&diagnostics);
+}
+
+bool MakeBoundaryCylinderChart(const Frame &frame,
                              const std::vector<std::vector<int>> &loops,
                              const std::vector<Point3> &vertices,double target,Chart &chart,
                              double axialTarget,ChartBuildDiagnostics &diagnostics){
@@ -517,4 +599,32 @@ bool MakeSeededCylinderChart(const Frame &frame,
   // u=radius*angle and v=axial height preserve the cylinder surface metric.
   // No iterative 3D projection or quality-threshold loop is required.
   return PopulateSeededDomain(chart,segments,target,false,&diagnostics);
+}
+
+#include "PeriodicCylinderDomain.h"
+
+bool MakeSeededCylinderChart(const Frame &frame,
+                             const std::vector<std::vector<int>> &loops,
+                             const std::vector<std::array<int,3>> &sourceFaces,
+                             const std::vector<Point3> &vertices,double target,Chart &chart,
+                             double axialTarget,ChartBuildDiagnostics &diagnostics){
+  // Preserve the inexpensive boundary-only path when it succeeds. Retry from
+  // source topology when a trimmed cylinder violates the ring/ear-clip assumptions.
+  if(MakeBoundaryCylinderChart(frame,loops,vertices,target,chart,axialTarget,diagnostics))return true;
+  const std::string boundaryFailure=diagnostics.Failure.empty()?diagnostics.Stage+"_failed":diagnostics.Failure;
+  chart={};diagnostics={};
+  if(!(target>0)||!(axialTarget>0)||!std::isfinite(target)||!std::isfinite(axialTarget)||
+     !(frame.UPeriod>0)||!std::isfinite(frame.UPeriod)){
+    diagnostics.Stage="source_cylinder_input";diagnostics.Failure="invalid_cylinder_metric";return false;
+  }
+  const double scale=target/axialTarget;
+  bool made=MakeSourceCylinderChart(frame,sourceFaces,vertices,target,scale,chart,diagnostics);
+  if(!made && diagnostics.Failure=="source_periodic_cut_required")
+    made=MakePeriodicCylinderChart(frame,sourceFaces,vertices,target,scale,chart,diagnostics);
+  for(UV &point:chart.Points)point.Y/=scale;
+  if(!made){
+    if(diagnostics.Failure.empty())diagnostics.Failure=diagnostics.Stage+"_failed";
+    diagnostics.Failure+="; boundary_attempt="+boundaryFailure;
+  }
+  return made;
 }

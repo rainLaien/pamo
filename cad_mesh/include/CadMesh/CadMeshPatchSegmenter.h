@@ -21,6 +21,7 @@ public:
   bool hasComputedDifferentialGeometry() const { return mComputedDiagnostics; }
   bool hasComputedBoundaryScores() const { return mComputedDiagnostics; }
   bool usesModelFirstPartitioning() const { return mConfig.EnableModelFirst; }
+  const SegmentationConfig &getConfig() const { return mConfig; }
 
 private:
   void GenerateInitialRegions();

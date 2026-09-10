@@ -9,6 +9,7 @@ namespace CadMesh {
 
 struct AnalyticPatchRemeshReport {
   std::vector<PatchRemeshReason> PatchReasons;
+  std::vector<std::string> FailureDetails;
   std::size_t Attempted = 0;
   std::size_t Rebuilt = 0;
   std::size_t Fallback = 0;
@@ -37,6 +38,7 @@ bool RebuildAnalyticPatches(
     double targetMeanQuality,
     const std::vector<unsigned char> &excludedPatches,
     std::vector<unsigned char> &successfullyRebuilt,
-    AnalyticPatchRemeshReport &report, bool verbose = false);
+    AnalyticPatchRemeshReport &report, bool verbose = false,
+    bool respectSurfaceFilter = true, bool validateResult = true);
 
 } // namespace CadMesh

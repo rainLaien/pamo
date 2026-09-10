@@ -104,6 +104,12 @@ int Run(int argc, char **argv) {
       config.CurvatureRingCount = int(value);
     else if (option == "--target-edge-length" && value > 0)
       remeshConfig.TargetEdgeLength = value;
+    else if (option == "--generic-feature-angle-deg" && value >= 0 && value <= 180)
+      remeshConfig.GenericFeatureAngleDegrees = value;
+    else if (option == "--generic-remesh-iterations" && value >= 1 && value <= 100 && std::floor(value)==value)
+      remeshConfig.GenericRemeshIterations = int(value);
+    else if (option == "--generic-remesh-workers" && value >= 1 && value <= 128 && std::floor(value)==value)
+      remeshConfig.GenericRemeshWorkers = int(value);
     else if (option == "--max-deviation") {
       remeshConfig.MaximumDeviation = value;
       maximumDeviationSpecified = true;

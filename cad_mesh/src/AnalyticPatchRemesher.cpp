@@ -726,10 +726,11 @@ bool RebuildAnalyticPatches(
     double maximumNormalDeviationDegrees, double targetMeanQuality,
     const std::vector<unsigned char> &excludedPatches,
     std::vector<unsigned char> &successfullyRebuilt,
-    AnalyticPatchRemeshReport &report, bool verbose) {
+    AnalyticPatchRemeshReport &report, bool verbose,bool respectSurfaceFilter,bool validateResult) {
   using Clock=std::chrono::steady_clock;
   successfullyRebuilt.assign(patches.size(), 0); report = {};
   report.PatchReasons.assign(patches.size(),PatchRemeshReason::Unknown);
+  report.FailureDetails.resize(patches.size());
   (void)targetMeanQuality; // Patch acceptance no longer uses quality thresholds.
   std::vector<std::vector<std::array<int,3>>> patchFaces;
   std::vector<BoundaryData> boundaries;
@@ -744,13 +745,13 @@ bool RebuildAnalyticPatches(
   // that vector concurrently, even though existing coordinates stay unchanged.
   const auto sourceVertices = vertices;
   const char *planeSetting=std::getenv("CADMESH_REMESH_SIMPLE_PLANES_ONLY");
-  const bool simplePlanesOnly=planeSetting && std::string(planeSetting)=="1";
+  const bool simplePlanesOnly=respectSurfaceFilter && planeSetting && std::string(planeSetting)=="1";
   const char *cylinderSetting=std::getenv("CADMESH_REMESH_CYLINDERS_ONLY");
-  const bool cylindersOnly=cylinderSetting && std::string(cylinderSetting)=="1";
+  const bool cylindersOnly=respectSurfaceFilter && cylinderSetting && std::string(cylinderSetting)=="1";
   const char *coneSetting=std::getenv("CADMESH_REMESH_CONES_ONLY");
-  const bool conesOnly=coneSetting && std::string(coneSetting)=="1";
+  const bool conesOnly=respectSurfaceFilter && coneSetting && std::string(coneSetting)=="1";
   const char *otherSetting=std::getenv("CADMESH_REMESH_OTHER_FEATURES_ONLY");
-  const bool otherFeaturesOnly=otherSetting && std::string(otherSetting)=="1";
+  const bool otherFeaturesOnly=respectSurfaceFilter && otherSetting && std::string(otherSetting)=="1";
   if(int(simplePlanesOnly)+int(cylindersOnly)+int(conesOnly)+int(otherFeaturesOnly)>1)throw std::invalid_argument("select only one surface-only mode");
   const auto selectedSurface=[&](int id){
     if(otherFeaturesOnly)return patches[id].SurfaceType!=PatchSurfaceType::Plane && patches[id].SurfaceType!=PatchSurfaceType::Cylinder;
@@ -769,11 +770,13 @@ bool RebuildAnalyticPatches(
       result.State = PreparedChart::Collision; return result;
     }
     const double tolerance = std::max(1.0, targetEdgeLength) * 1e-12;
-    if (patch.MaxSampledSurfaceDeviation > maximumDeviation + tolerance) {
+    if (validateResult && patch.MaxSampledSurfaceDeviation > maximumDeviation + tolerance) {
       result.State = PreparedChart::Deviation; return result;
     }
     const BoundaryData &boundary=boundaries[patchId];
-    if (!validBoundaries[patchId]) {
+    // Cylinder source charts recover boundary edges from triangle incidence;
+    // failure to trace disjoint loops alone is not a construction failure.
+    if (!validBoundaries[patchId] && patch.SurfaceType != PatchSurfaceType::Cylinder) {
       result.State = PreparedChart::Topology; return result;
     }
     std::vector<int> allBoundary;
@@ -804,7 +807,7 @@ bool RebuildAnalyticPatches(
     }
     if(frame.Type==PatchSurfaceType::Cylinder){
       result.SeededCylinder=true;
-      const bool made=MakeSeededCylinderChart(frame,boundary.Loops,sourceVertices,chartTarget,chart,
+      const bool made=MakeSeededCylinderChart(frame,boundary.Loops,patchFaces[patchId],sourceVertices,chartTarget,chart,
                                              targetEdgeLength,result.CylinderBuild);
       result.CylinderBuild.Points=chart.Points.size();result.CylinderBuild.Faces=chart.Faces.size();
       if(!made && result.CylinderBuild.Failure.empty())result.CylinderBuild.Failure=result.CylinderBuild.Stage+"_failed";
@@ -931,6 +934,10 @@ bool RebuildAnalyticPatches(
     });
   }
   double makeSeconds = 0, refineSeconds = 0, improveSeconds = 0;
+  const char *detailSetting=std::getenv("CADMESH_REMESH_PATCH_DETAILS");
+  const bool patchDetails=detailSetting && std::string(detailSetting)=="1";
+  struct TypeTiming {std::size_t Tasks=0,Ready=0;double Make=0,Refine=0,Improve=0;};
+  std::array<TypeTiming,7> typeTimings{};
   double waitSeconds=0,detailLogSeconds=0,liftSeconds=0,validationSeconds=0;
   double cudaMilliseconds=0;
   std::size_t cudaBatches=0,cudaSubmitted=0,cudaCompleted=0,cudaAccepted=0,cudaFallback=0;
@@ -1034,14 +1041,23 @@ bool RebuildAnalyticPatches(
       }
     }
     auto prepared=std::move(ready.front());ready.pop_front();
+    const int typeIndex=int(patches[patchId].SurfaceType);
+    if(prepared.State!=PreparedChart::Skip && typeIndex>=0 && typeIndex<int(typeTimings.size())){
+      auto &timing=typeTimings[typeIndex];++timing.Tasks;
+      if(prepared.State==PreparedChart::Ready)++timing.Ready;
+      timing.Make+=prepared.MakeSeconds;timing.Refine+=prepared.RefineSeconds;
+      timing.Improve+=prepared.ImproveSeconds;
+    }
     const auto detailLogStart=Clock::now();
+    const bool logPatch=verbose && (patchDetails || prepared.State!=PreparedChart::Ready ||
+        prepared.MakeSeconds+prepared.RefineSeconds+prepared.ImproveSeconds>=.5);
     if(prepared.SeededCylinder){
       ++seededCylinder;if(prepared.State!=PreparedChart::Ready)++seededCylinderFailed;
       const auto &detail=prepared.CylinderBuild;
       if(!detail.Failure.empty()){
         auto &group=cylinderFailures[detail.Failure];++group.first;group.second+=prepared.MakeSeconds;
       }
-      if(verbose)std::clog << "[CadMesh] cylinder constrained mesh: patch=" << patchId+1
+      if(logPatch)std::clog << "[CadMesh] cylinder constrained mesh: patch=" << patchId+1
           << ", method=" << (boundaries[patchId].Loops.size()==2?"direct_periodic_strip":"unwrapped_cdt")
           << ", boundary_loops=" << boundaries[patchId].Loops.size()
           << ", points=" << prepared.Value.Points.size() << ", faces=" << prepared.Value.Faces.size()
@@ -1061,7 +1077,7 @@ bool RebuildAnalyticPatches(
     if(prepared.SeededPlanar){
       ++seededPlanar;
       if(prepared.State!=PreparedChart::Ready)++seededPlanarFailed;
-      if(verbose)std::clog << "[CadMesh] planar constrained mesh: patch=" << patchId+1
+      if(logPatch)std::clog << "[CadMesh] planar constrained mesh: patch=" << patchId+1
           << ", boundary_loops=" << boundaries[patchId].Loops.size()
           << ", points=" << prepared.Value.Points.size() << ", faces=" << prepared.Value.Faces.size()
           << ", constructed=" << (prepared.State==PreparedChart::Ready?"yes":"no")
@@ -1083,6 +1099,15 @@ bool RebuildAnalyticPatches(
     }
     ++report.Attempted;
     if (prepared.State != PreparedChart::Ready) {
+      auto &detail=report.FailureDetails[patchId];
+      detail="boundary_loops="+std::to_string(boundaries[patchId].Loops.size());
+      if(prepared.State==PreparedChart::Topology)detail+="; failure=invalid_boundary_topology";
+      else if(prepared.State==PreparedChart::Deviation)detail+="; failure=model_deviation";
+      else if(prepared.SeededCylinder){const auto &d=prepared.CylinderBuild;
+        detail+="; stage="+d.Stage+"; failure="+d.Failure;
+        if(d.Failure=="fixed_boundary_requires_sampling")detail+="; edge="+std::to_string(d.GlobalEdgeA)+":"+
+            std::to_string(d.GlobalEdgeB)+"; length="+std::to_string(d.EdgeLength)+"; target="+std::to_string(d.EdgeTarget);
+      }else detail+="; failure=chart_construction";
       reason=prepared.State==PreparedChart::Collision?PatchRemeshReason::Collision:
           prepared.State==PreparedChart::Deviation?PatchRemeshReason::Deviation:
           prepared.State==PreparedChart::Topology?PatchRemeshReason::Topology:
@@ -1122,9 +1147,9 @@ bool RebuildAnalyticPatches(
     for(auto f:chart.Faces){for(int&i:f)i=mapping[i];Vec3 n=Cross(Sub(ToVec(vertices[f[1]]),ToVec(vertices[f[0]])),Sub(ToVec(vertices[f[2]]),ToVec(vertices[f[0]])));const Point3 center=ToPoint(Mul(Add(Add(ToVec(vertices[f[0]]),ToVec(vertices[f[1]])),ToVec(vertices[f[2]])),1.0/3));if(orientation*Dot(n,frame.normalAt(center))<0)std::swap(f[1],f[2]);if(f[0]!=f[1]&&f[1]!=f[2]&&f[2]!=f[0])candidateFaces.push_back(f);}
     liftSeconds+=std::chrono::duration<double>(Clock::now()-liftStart).count();
     const auto validationStart=Clock::now();
-    const bool valid=ValidatePatch(vertices,candidateFaces,boundary.Edges,targetEdgeLength);
+    const bool valid=!validateResult || ValidatePatch(vertices,candidateFaces,boundary.Edges,targetEdgeLength);
     validationSeconds+=std::chrono::duration<double>(Clock::now()-validationStart).count();
-    if(!valid){reason=PatchRemeshReason::Topology;vertices.resize(originalVertexCount);++report.Fallback;++report.TopologyFallback;continue;}
+    if(!valid){report.FailureDetails[patchId]="failure=output_topology";reason=PatchRemeshReason::Topology;vertices.resize(originalVertexCount);++report.Fallback;++report.TopologyFallback;continue;}
     report.RebuiltFaces+=candidateFaces.size();
     replacements[patchId]=std::move(candidateFaces);
     successfullyRebuilt[patchId]=1;++report.Rebuilt;
@@ -1160,6 +1185,14 @@ bool RebuildAnalyticPatches(
   if (verbose) std::clog << "[CadMesh] analytic charts complete: wall_s=" << report.ChartSeconds
                         << ", worker_time_sums(make=" << makeSeconds << ", refine=" << refineSeconds
                         << ", improve=" << improveSeconds << ")" << std::endl;
+  if(verbose)for(std::size_t type=0;type<typeTimings.size();++type){
+    const auto &timing=typeTimings[type];if(!timing.Tasks)continue;
+    std::clog << "[CadMesh] analytic type worker timing: type="
+        << SurfaceTypeName(static_cast<PatchSurfaceType>(type))
+        << ", tasks=" << timing.Tasks << ", constructed_before_validation=" << timing.Ready
+        << ", make_s=" << timing.Make << ", refine_s=" << timing.Refine
+        << ", improve_s=" << timing.Improve << std::endl;
+  }
   if(verbose)std::clog << "[CadMesh] analytic commit timing: future_wait_s=" << waitSeconds
       << ", patch_detail_logging_s=" << detailLogSeconds << ", lift_and_orientation_s=" << liftSeconds
       << ", topology_validation_s=" << validationSeconds << std::endl;

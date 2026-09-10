@@ -18,6 +18,17 @@ struct NativeRemeshConfig {
   int RelaxIterations = 3;
   bool RequireCuda = false;
   bool Verbose = true;
+  // Secondary Freeform partition only. Zero distance selects 0.0003 * target
+  // length, capped by MaximumDeviation; remesh acceptance is unchanged.
+  double SecondaryPlaneDistanceTolerance = 0;
+  double SecondaryPlaneNormalToleranceDegrees = 1;
+  double SecondaryPlaneMinimumAreaRatio = .25; // area / target length squared
+  double GenericFeatureAngleDegrees = 10;
+  int GenericRemeshIterations = 5;
+  int GenericRemeshWorkers = 20;
+  // Internal local-operation policy; configured by the isotropic driver.
+  double CollapseLengthRatio = .65;
+  bool IsotropicOperationRules = false;
 };
 
 struct NativeRemeshStatistics {
@@ -41,22 +52,44 @@ struct NativeRemeshStatistics {
   bool UsedCuda = false;
 };
 
+struct RemeshCollisionWitness {
+  int Attempt=0;
+  std::array<int,2> PatchIds{},FaceIds{},Rebuilt{};
+  std::array<std::array<int,3>,2> VertexIds{};
+  std::array<std::array<Point3,3>,2> Points;
+  std::array<std::array<Point3,3>,2> SourcePoints;
+  std::array<int,2> SourceFaceIds{{-1,-1}};
+  std::array<double,2> SourceDistances{};
+  std::array<unsigned char,2> UnchangedFromSource{};
+  int SourcePairContact=-1; // nearest-centroid source pair only, not proof of inheritance
+};
+
 struct NativeRemeshResult {
   std::vector<Point3> Vertices;
   std::vector<std::array<int, 3>> Triangles;
   std::vector<int> PatchIds;
-  // Indexed by patch ID; set only for accepted analytic reconstruction after
-  // collision rollback. Boundary splitting alone does not set this flag.
+  // Flat output registry; indices match PatchIds. Source IDs refer to input partition.
+  std::vector<MeshPatch> OutputPatches;
+  std::vector<int> SourcePatchIds;
+  // Legacy patch summary; FaceRemeshed is authoritative for mixed subregions.
+  // Boundary splitting alone does not set this flag.
   std::vector<unsigned char> RemeshedPatches;
+  // Selection is independent of construction eligibility and final rollback.
+  std::vector<unsigned char> RequestedPatches;
+  // Per output triangle: 0 unselected, 1 failed, 2 rebuilt, 3 preserved good input.
+  std::vector<unsigned char> FaceRemeshed;
+  std::vector<PatchRemeshReason> FaceReasons;
   std::vector<PatchRemeshReason> PatchReasons;
+  // Copies of pre-rollback geometry; IDs refer to that collision attempt.
+  std::vector<RemeshCollisionWitness> CollisionWitnesses;
   NativeRemeshStatistics Statistics;
 };
 
 class NativeRemesher {
 public:
-  // Samples shared boundaries, rebuilds supported patches, validates and rolls
-  // back collisions, then compacts the indexed mesh. Failed/unsupported patches
-  // retain their interiors; no global split/collapse/flip/relax follows.
+  // Samples shared boundaries, rebuilds analytic and Freeform subregions, then
+  // compacts the indexed mesh. No post-remesh deviation/collision rollback;
+  // failed construction regions retain input while successful regions survive.
   static bool remesh(const CadMeshPatchSegmenter &, const NativeRemeshConfig &,
                      NativeRemeshResult &, std::string &error);
   static bool writePly(const NativeRemeshResult &,

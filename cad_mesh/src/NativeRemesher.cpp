@@ -1,6 +1,8 @@
 #include "CadMesh/CudaAnalyticFitting.h"
 #include "CadMesh/AnalyticPatchRemesher.h"
 #include "CadMesh/NativeRemesher.h"
+#include "CadMesh/ModelFirstPartitioner.h"
+#include "RemeshWorkerPool.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,8 +13,11 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -256,6 +261,56 @@ public:
     return true;
   }
 
+  bool closestTriangle(const Point3 &query,int patch,SpatialTriangle &triangle,double &distance) const {
+    if(mNodes.empty())return false;
+    double best=std::numeric_limits<double>::infinity();Point3 point;int face=-1;
+    nearest(0,query,patch,best,point,&face);
+    if(face<0 || !std::isfinite(best))return false;
+    triangle=mTriangles[face];distance=std::sqrt(best);return true;
+  }
+  bool containsExactTriangle(const SpatialTriangle &candidate) const {
+    if(candidate.PatchId<0)return false;
+    const auto &p=candidate.Points;
+    const Point3 center=ToPoint(Mul(Add(Add(ToVec(p[0]),ToVec(p[1])),ToVec(p[2])),1.0/3));
+    SpatialTriangle source;double distance=0;
+    if(!closestTriangle(center,candidate.PatchId,source,distance))return false;
+    std::array<unsigned char,3> used{};
+    for(const auto &point:p){bool found=false;
+      for(int i=0;i<3;++i)if(!used[i] && point.X()==source.Points[i].X() &&
+          point.Y()==source.Points[i].Y() && point.Z()==source.Points[i].Z()){
+        used[i]=1;found=true;break;
+      }
+      if(!found)return false;
+    }
+    return true;
+  }
+
+  // A tolerance predicate need not find the exact nearest triangle. Any
+  // reference triangle inside the radius proves acceptance; failed searches
+  // still visit every BVH node whose box intersects that radius.
+  bool within(const Point3 &query,int patch,double radius,int &hint) const {
+    if(mNodes.empty() || !(radius>=0))return false;
+    const double limit=radius*radius;
+    const auto accepts=[&](int id){
+      const auto &t=mTriangles[id];
+      if(patch>=0 && t.PatchId!=patch)return false;
+      const auto p=ClosestPointOnTriangle(query,t.Points[0],t.Points[1],t.Points[2]);
+      const auto delta=Sub(ToVec(p),ToVec(query));return Dot(delta,delta)<=limit;
+    };
+    if(hint>=0 && hint<int(mTriangles.size()) && accepts(hint))return true;
+    const auto visit=[&](auto &&self,int id)->bool{
+      const auto &node=mNodes[id];if(BoxDistanceSquared(node.Box,query)>limit)return false;
+      if(node.Count){
+        for(int i=node.Begin;i<node.Begin+node.Count;++i)if(accepts(mOrder[i])){hint=mOrder[i];return true;}
+        return false;
+      }
+      int first=node.Left,second=node.Right;
+      if(BoxDistanceSquared(mNodes[first].Box,query)>BoxDistanceSquared(mNodes[second].Box,query))std::swap(first,second);
+      return self(self,first)||self(self,second);
+    };
+    return visit(visit,0);
+  }
+
   bool intersects(const std::array<Point3, 3> &candidate,
                   const std::array<int, 3> &vertexIds,
                   const std::unordered_set<int> &excludedFaces,
@@ -284,15 +339,44 @@ public:
 
   std::size_t collectIntersectingRebuiltPatches(
       const std::vector<unsigned char> &rebuilt,
-      std::vector<unsigned char> &rejected, double epsilon) const {
+      std::vector<unsigned char> &rejected, double epsilon,
+      std::vector<RemeshCollisionWitness> &witnesses,int attempt,
+      const SurfaceIndex &baseline,std::size_t &inheritedPairs) const {
     rejected.assign(rebuilt.size(), 0);
+    inheritedPairs=0;
+    std::vector<signed char> unchanged(mTriangles.size(),-1);
+    const auto original=[&](int face){
+      if(unchanged[face]<0)unchanged[face]=baseline.containsExactTriangle(mTriangles[face])?1:0;
+      return unchanged[face]==1;
+    };
     for (const auto &triangle : mTriangles) {
-      const std::unordered_set<int> excluded{triangle.FaceId};
+      std::unordered_set<int> excluded{triangle.FaceId};
       int hit = -1;
-      if (!intersects(triangle.Points, triangle.VertexIds, excluded,
-                      epsilon, &hit) || hit < 0 || hit >= int(mTriangles.size()))
-        continue;
+      // An inherited hit must not hide a second, newly introduced intersection.
+      while(intersects(triangle.Points,triangle.VertexIds,excluded,epsilon,&hit)){
+        if(hit<0 || hit>=int(mTriangles.size())){hit=-1;break;}
+        if(original(triangle.FaceId) && original(hit)){
+          if(triangle.FaceId<hit)++inheritedPairs;
+          excluded.insert(hit);hit=-1;continue;
+        }
+        break;
+      }
+      if(hit<0)continue;
       const int patches[2] = {triangle.PatchId, mTriangles[hit].PatchId};
+      bool newRejection=false;
+      for(int patch:patches)
+        if(patch>=0 && patch<int(rebuilt.size()) && rebuilt[patch] && !rejected[patch])newRejection=true;
+      if(newRejection){
+        RemeshCollisionWitness witness;witness.Attempt=attempt;
+        const SpatialTriangle *pair[2]={&triangle,&mTriangles[hit]};
+        for(int side=0;side<2;++side){
+          witness.PatchIds[side]=pair[side]->PatchId;witness.FaceIds[side]=pair[side]->FaceId;
+          witness.VertexIds[side]=pair[side]->VertexIds;witness.Points[side]=pair[side]->Points;
+          const int patch=pair[side]->PatchId;
+          witness.Rebuilt[side]=patch>=0 && patch<int(rebuilt.size()) && rebuilt[patch];
+        }
+        witnesses.push_back(witness);
+      }
       for (int patch : patches)
         if (patch >= 0 && patch < int(rebuilt.size()) && rebuilt[patch])
           rejected[patch] = 1;
@@ -338,7 +422,7 @@ private:
   }
 
   void nearest(int nodeId, const Point3 &query, int patch, double &best,
-               Point3 &point) const {
+               Point3 &point,int *faceId=nullptr) const {
     const BvhNode &node = mNodes[nodeId];
     if (BoxDistanceSquared(node.Box, query) > best) return;
     if (node.Count) {
@@ -353,6 +437,7 @@ private:
         if (squared < best) {
           best = squared;
           point = candidate;
+          if(faceId)*faceId=triangle.FaceId;
         }
       }
       return;
@@ -360,11 +445,11 @@ private:
     const double leftDistance = BoxDistanceSquared(mNodes[node.Left].Box, query);
     const double rightDistance = BoxDistanceSquared(mNodes[node.Right].Box, query);
     if (leftDistance < rightDistance) {
-      nearest(node.Left, query, patch, best, point);
-      nearest(node.Right, query, patch, best, point);
+      nearest(node.Left, query, patch, best, point,faceId);
+      nearest(node.Right, query, patch, best, point,faceId);
     } else {
-      nearest(node.Right, query, patch, best, point);
-      nearest(node.Left, query, patch, best, point);
+      nearest(node.Right, query, patch, best, point,faceId);
+      nearest(node.Left, query, patch, best, point,faceId);
     }
   }
 
@@ -593,13 +678,15 @@ std::size_t SplitLocalLongEdges(
     std::vector<Point3> &vertices, std::vector<std::array<int,3>> &faces,
     std::vector<int> &labels, std::unordered_set<EdgeKey> &constraints,
     const NativeRemeshConfig &config,
-    const std::vector<unsigned char> &rebuiltPatches, std::string &error) {
+    const std::vector<unsigned char> &rebuiltPatches, std::string &error,
+    bool preserveConstraints=false) {
   if(config.SplitPasses<=0 || faces.empty()) return 0;
   using Clock=std::chrono::steady_clock;
   const auto start=Clock::now();
   const auto elapsed=[&]{return std::chrono::duration<double>(Clock::now()-start).count();};
   struct Corner { int Previous=-1, Next=-1; };
   struct LocalEdge {
+    bool Protected=false;
     int Head=-1, Count=0, Frozen=0;
     double Length=0;
     std::size_t Queued=0;
@@ -619,6 +706,7 @@ std::size_t SplitLocalLongEdges(
       const int a=faces[face][side],b=faces[face][(side+1)%3];
       const EdgeKey key=Key(a,b);
       auto inserted=edges.try_emplace(key);
+      inserted.first->second.Protected=preserveConstraints && constraints.count(key);
       auto &edge=inserted.first->second;
       if(inserted.second)edge.Length=Distance(vertices[a],vertices[b]);
       const int corner=3*face+side;
@@ -642,7 +730,7 @@ std::size_t SplitLocalLongEdges(
   for(int face=0;face<int(faces.size());++face)attach(face);
   const double maximum=config.TargetEdgeLength*(1+1e-6);
   const auto eligible=[&](const LocalEdge &edge) {
-    return edge.Count>0 && edge.Count<=2 && edge.Frozen==0 && edge.Length>maximum;
+    return !edge.Protected && edge.Count>0 && edge.Count<=2 && edge.Frozen==0 && edge.Length>maximum;
   };
   std::vector<EdgeKey> active;
   std::size_t epoch=1;
@@ -941,6 +1029,38 @@ std::size_t SplitLongEdges(std::vector<Point3> &vertices,
   return total;
 }
 
+// Optional guard for isolated reference-mesh patches. Acceptance uses the same
+// seven samples as final validation, before any candidate geometry is committed.
+struct ReferenceDeviationGuard {
+  const SurfaceIndex &Reference;
+  double Limit;
+  std::size_t Triangles=0,Queries=0,Rejected=0;
+  double Seconds=0,LastDistance=0;
+  Point3 LastPoint{};
+  int LastPatch=-1;
+  int Hint=-1;
+  bool DeferCollisions=false;
+  bool Enabled=true;
+  bool accepts(const std::array<Point3,3> &points,int patch) {
+    if(!Enabled)return true;
+    const auto start=std::chrono::steady_clock::now();++Triangles;
+    const Vec3 a=ToVec(points[0]),b=ToVec(points[1]),c=ToVec(points[2]);
+    const std::array<Point3,7> samples{points[0],points[1],points[2],
+      ToPoint(Mul(Add(Add(a,b),c),1.0/3)),ToPoint(Mul(Add(a,b),.5)),
+      ToPoint(Mul(Add(b,c),.5)),ToPoint(Mul(Add(c,a),.5))};
+    bool valid=true;
+    for(const auto &sample:samples){
+      Point3 nearest;double distance=std::numeric_limits<double>::infinity();++Queries;
+      if(!Reference.within(sample,patch,Limit,Hint)){
+        Reference.closest(sample,patch,nearest,distance); // failure diagnostics only
+        ++Rejected;LastPoint=sample;LastDistance=distance;LastPatch=patch;valid=false;break;
+      }
+    }
+    Seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    return valid;
+  }
+};
+
 std::size_t CollapseShortEdges(std::vector<Point3> &vertices,
                                std::vector<std::array<int, 3>> &faces,
                                std::vector<int> &labels,
@@ -949,7 +1069,8 @@ std::size_t CollapseShortEdges(std::vector<Point3> &vertices,
                                const SurfaceIndex &reference,
                                std::size_t &collisionRejections,
                                const NativeRemeshConfig &config,
-                               const std::vector<unsigned char> &rebuiltPatches) {
+                               const std::vector<unsigned char> &rebuiltPatches,
+                               ReferenceDeviationGuard *deviationGuard=nullptr) {
   std::size_t total = 0;
   const double cosine = std::cos(config.MaximumNormalDeviationDegrees *
                                  std::acos(-1.0) / 180.0);
@@ -961,7 +1082,7 @@ std::size_t CollapseShortEdges(std::vector<Point3> &vertices,
     for(const auto&edge:edges)
       if(edge.FaceCount==2&&!edge.NonManifold&&!locked.count(edge.A)&&
          !locked.count(edge.B)&&!constraints.count(Key(edge.A,edge.B))&&
-         Distance(vertices[edge.A],vertices[edge.B])<config.TargetEdgeLength*.65&&
+         Distance(vertices[edge.A],vertices[edge.B])<config.TargetEdgeLength*config.CollapseLengthRatio&&
          labels[edge.Faces[0]]==labels[edge.Faces[1]]){hasCandidate=true;break;}
     if(!hasCandidate)break;
     std::vector<std::unordered_set<int>> neighbors(vertices.size());
@@ -973,7 +1094,9 @@ std::size_t CollapseShortEdges(std::vector<Point3> &vertices,
       for (int vertex : faces[faceId])
         incident[vertex].push_back(faceId);
     }
-    const SurfaceIndex collision(vertices, faces, labels);
+    std::unique_ptr<SurfaceIndex> collision;
+    if(!deviationGuard || !deviationGuard->DeferCollisions)
+      collision=std::make_unique<SurfaceIndex>(vertices,faces,labels);
     std::vector<int> replacement(vertices.size());
     for (int i = 0; i < int(vertices.size()); ++i) replacement[i] = i;
     std::vector<unsigned char> claimed(vertices.size(), 0);
@@ -983,7 +1106,7 @@ std::size_t CollapseShortEdges(std::vector<Point3> &vertices,
     for (const auto &edge : edges) {
       if (edge.FaceCount != 2 || edge.NonManifold || locked.count(edge.A) || locked.count(edge.B) ||
           claimed[edge.A] || claimed[edge.B] || constraints.count(Key(edge.A, edge.B)) ||
-          Distance(vertices[edge.A], vertices[edge.B]) >= config.TargetEdgeLength * .65)
+          Distance(vertices[edge.A], vertices[edge.B]) >= config.TargetEdgeLength * config.CollapseLengthRatio)
         continue;
       if (labels[edge.Faces[0]] != labels[edge.Faces[1]]) continue;
       const int patch = labels[edge.Faces[0]];
@@ -1053,10 +1176,12 @@ std::size_t CollapseShortEdges(std::vector<Point3> &vertices,
               config.TargetEdgeLength * (1 + 1e-6))
             valid = false;
       }
-      if (newMinimum + 1e-10 < oldMinimum || newSum + 1e-10 < oldSum)
+      if (newMinimum + 1e-10 < oldMinimum*(config.IsotropicOperationRules?.5:1.0) ||
+          newSum + 1e-10 < oldSum*(config.IsotropicOperationRules?.95:1.0))
         valid = false;
       if (valid) {
-        const std::unordered_set<int> excluded(affected.begin(), affected.end());
+        std::unordered_set<int> excluded;
+        if(collision)excluded.insert(affected.begin(),affected.end());
         std::vector<CandidateTriangle> localGeometry;
         for (int faceId : affected) {
           std::array<int, 3> candidate = faces[faceId];
@@ -1070,15 +1195,18 @@ std::size_t CollapseShortEdges(std::vector<Point3> &vertices,
                                        position(candidate[1]),
                                        position(candidate[2])};
           const CandidateTriangle geometry = MakeCandidate(points, candidate);
-          if (collision.intersects(points, candidate, excluded,
+          if(deviationGuard && !deviationGuard->accepts(points,patch)){
+            valid=false;break;
+          }
+          if (collision && (collision->intersects(points, candidate, excluded,
                                    config.TargetEdgeLength * 1e-10) ||
               acceptedGeometry.intersects(
-                  geometry, config.TargetEdgeLength * 1e-10)) {
+                  geometry, config.TargetEdgeLength * 1e-10))) {
             ++collisionRejections;
             valid = false;
             break;
           }
-          localGeometry.push_back(geometry);
+          if(collision)localGeometry.push_back(geometry);
         }
         if (valid)
           for (const auto &geometry : localGeometry)
@@ -1111,14 +1239,21 @@ std::size_t FlipEdges(std::vector<Point3> &vertices,
                       const std::unordered_set<EdgeKey> &constraints,
                       std::size_t &collisionRejections,
                       const NativeRemeshConfig &config,
-                      const std::vector<unsigned char> &rebuiltPatches) {
+                      const std::vector<unsigned char> &rebuiltPatches,
+                      ReferenceDeviationGuard *deviationGuard=nullptr) {
   std::size_t total = 0;
   const double cosine = std::cos(config.MaximumNormalDeviationDegrees *
                                  std::acos(-1.0) / 180.0);
   for (int pass = 0; pass < config.FlipPasses; ++pass) {
     const auto edges = BuildEdges(faces, &labels, &rebuiltPatches);
-    const SurfaceIndex collision(vertices, faces, labels);
+    std::unique_ptr<SurfaceIndex> collision;
+    if(!deviationGuard || !deviationGuard->DeferCollisions)
+      collision=std::make_unique<SurfaceIndex>(vertices,faces,labels);
     std::unordered_set<EdgeKey> existing;
+    std::vector<int> degree(vertices.size(),0);
+    std::vector<unsigned char> border(vertices.size(),0);
+    for(const auto &edge:edges){++degree[edge.A];++degree[edge.B];
+      if(edge.FaceCount!=2){border[edge.A]=1;border[edge.B]=1;}}
     for (const auto &edge : edges) existing.insert(Key(edge.A, edge.B));
     std::vector<unsigned char> usedFace(faces.size(), 0);
     std::vector<unsigned char> claimedVertex(vertices.size(), 0);
@@ -1151,11 +1286,17 @@ std::size_t FlipEdges(std::vector<Point3> &vertices,
       const double newMinimum = std::min(
           TriangleQuality(vertices[candidate0[0]], vertices[candidate0[1]], vertices[candidate0[2]]),
           TriangleQuality(vertices[candidate1[0]], vertices[candidate1[1]], vertices[candidate1[2]]));
-      if (newMinimum <= oldMinimum + 1e-8 ||
+      const auto valenceError=[&](int v,int delta){const int d=degree[v]+delta-(border[v]?4:6);return d*d;};
+      const int beforeValence=valenceError(edge.A,0)+valenceError(edge.B,0)+valenceError(c,0)+valenceError(d,0);
+      const int afterValence=valenceError(edge.A,-1)+valenceError(edge.B,-1)+valenceError(c,1)+valenceError(d,1);
+      const bool improves=newMinimum>oldMinimum+1e-8 ||
+          (config.IsotropicOperationRules && afterValence<beforeValence && newMinimum>=oldMinimum*.9);
+      if (!improves ||
           Dot(TriangleNormal(vertices, candidate0), reference) < cosine ||
           Dot(TriangleNormal(vertices, candidate1), reference) < cosine ||
           Distance(vertices[c], vertices[d]) > config.TargetEdgeLength * (1 + 1e-6)) continue;
-      const std::unordered_set<int> excluded{first, second};
+      std::unordered_set<int> excluded;
+      if(collision){excluded.insert(first);excluded.insert(second);}
       const std::array<Point3, 3> points0{vertices[candidate0[0]],
                                           vertices[candidate0[1]],
                                           vertices[candidate0[2]]};
@@ -1164,14 +1305,16 @@ std::size_t FlipEdges(std::vector<Point3> &vertices,
                                           vertices[candidate1[2]]};
       const CandidateTriangle geometry0 = MakeCandidate(points0, candidate0);
       const CandidateTriangle geometry1 = MakeCandidate(points1, candidate1);
-      if (collision.intersects(points0, candidate0, excluded,
+      if(deviationGuard && (!deviationGuard->accepts(points0,patch) ||
+                            !deviationGuard->accepts(points1,patch)))continue;
+      if (collision && (collision->intersects(points0, candidate0, excluded,
                                config.TargetEdgeLength * 1e-10) ||
-          collision.intersects(points1, candidate1, excluded,
+          collision->intersects(points1, candidate1, excluded,
                                config.TargetEdgeLength * 1e-10) ||
           acceptedGeometry.intersects(
               geometry0, config.TargetEdgeLength * 1e-10) ||
           acceptedGeometry.intersects(
-              geometry1, config.TargetEdgeLength * 1e-10))
+              geometry1, config.TargetEdgeLength * 1e-10)))
       {
         ++collisionRejections;
         continue;
@@ -1180,8 +1323,7 @@ std::size_t FlipEdges(std::vector<Point3> &vertices,
       usedFace[first] = usedFace[second] = 1; existing.insert(Key(c, d)); ++accepted;
       claimedVertex[edge.A] = claimedVertex[edge.B] = 1;
       claimedVertex[c] = claimedVertex[d] = 1;
-      acceptedGeometry.insert(geometry0);
-      acceptedGeometry.insert(geometry1);
+      if(collision){acceptedGeometry.insert(geometry0);acceptedGeometry.insert(geometry1);}
     }
     total += accepted;
     if (!accepted) break;
@@ -1197,7 +1339,8 @@ int RelaxVertices(std::vector<Point3> &vertices,
                   const SurfaceIndex &reference,
                   std::size_t &collisionRejections,
                   const NativeRemeshConfig &config,
-                  const std::vector<unsigned char> &rebuiltPatches) {
+                  const std::vector<unsigned char> &rebuiltPatches,
+                  ReferenceDeviationGuard *deviationGuard=nullptr) {
   std::unordered_set<int> locked;
   const double cosine = std::cos(config.MaximumNormalDeviationDegrees *
                                  std::acos(-1.0) / 180.0);
@@ -1206,7 +1349,9 @@ int RelaxVertices(std::vector<Point3> &vertices,
   for (int iteration = 0; iteration < config.RelaxIterations; ++iteration) {
     auto edges = BuildEdges(faces, &labels, &rebuiltPatches);
     if(edges.empty())break;
-    const SurfaceIndex collision(vertices, faces, labels);
+    std::unique_ptr<SurfaceIndex> collision;
+    if(!deviationGuard || !deviationGuard->DeferCollisions)
+      collision=std::make_unique<SurfaceIndex>(vertices,faces,labels);
     std::vector<Vec3> sums(vertices.size(), {0, 0, 0});
     std::vector<int> counts(vertices.size(), 0), patch(vertices.size(), -2);
     std::vector<std::vector<int>> incident(vertices.size());
@@ -1284,23 +1429,26 @@ int RelaxVertices(std::vector<Point3> &vertices,
       }
       std::vector<CandidateTriangle> localGeometry;
       if (valid) {
-        const std::unordered_set<int> excluded(incident[vertex].begin(),
-                                                incident[vertex].end());
+        std::unordered_set<int> excluded;
+        if(collision)excluded.insert(incident[vertex].begin(),incident[vertex].end());
         for (int faceId : incident[vertex]) {
           const auto &face = faces[faceId];
           const std::array<Point3, 3> points{proposed[face[0]],
                                              proposed[face[1]],
                                              proposed[face[2]]};
           const CandidateTriangle geometry = MakeCandidate(points, face);
-          if (collision.intersects(points, face, excluded,
+          if(deviationGuard && !deviationGuard->accepts(points,patch[vertex])){
+            valid=false;break;
+          }
+          if (collision && (collision->intersects(points, face, excluded,
                                    config.TargetEdgeLength * 1e-10) ||
               acceptedGeometry.intersects(
-                  geometry, config.TargetEdgeLength * 1e-10)) {
+                  geometry, config.TargetEdgeLength * 1e-10))) {
             ++collisionRejections;
             valid = false;
             break;
           }
-          localGeometry.push_back(geometry);
+          if(collision)localGeometry.push_back(geometry);
         }
       }
       if (!valid || after + 1e-10 < before ||
@@ -1319,6 +1467,10 @@ int RelaxVertices(std::vector<Point3> &vertices,
   }
   return acceptedIterations;
 }
+
+#include "IsotropicPatchRemesher.h"
+#include "FreeformPatchRemesher.h"
+#include "GlobalPatchRemesher.h"
 
 void Compact(NativeRemeshResult &result, std::unordered_set<EdgeKey> &constraints) {
   std::vector<unsigned char> used(result.Vertices.size(), 0);
@@ -1426,9 +1578,10 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
   // Sample every shared boundary before chart construction. Analytic charts
   // then consume the same global boundary ids on both incident patches.
   phaseStart=Clock::now();
+  auto boundaryConfig=config;boundaryConfig.Verbose=false;
   stats.Splits = SplitLongEdges(result.Vertices, result.Triangles,
                                 result.PatchIds, constraints,
-                                segmenter.getPatches(), config, cuda,
+                                segmenter.getPatches(), boundaryConfig, cuda,
                                 stats.UsedCuda, rebuiltPatches, true, error);
   if (!error.empty()) return false;
   boundarySplitSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
@@ -1444,201 +1597,36 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
   const bool conesOnly=coneSetting && std::string(coneSetting)=="1";
   const char *otherSetting=std::getenv("CADMESH_REMESH_OTHER_FEATURES_ONLY");
   const bool otherFeaturesOnly=otherSetting && std::string(otherSetting)=="1";
-  const auto analyticBaseTriangles = result.Triangles;
-  const auto analyticBasePatchIds = result.PatchIds;
-  std::vector<unsigned char> excludedAnalyticPatches(
-      segmenter.getPatches().size(), 0);
-  AnalyticPatchRemeshReport analyticReport;
-  RebuildAnalyticPatches(result.Vertices, result.Triangles, result.PatchIds,
-                         segmenter.getPatches(), config.TargetEdgeLength,
-                         config.MaximumDeviation,
-                         config.MaximumNormalDeviationDegrees,
-                         config.TargetMeanTriangleQuality,
-                         excludedAnalyticPatches, rebuiltPatches,
-                         analyticReport, config.Verbose);
-  // Chart boundaries retain their original global vertex ids. Restore only
-  // rejected patches using those ids; unrelated charts need no retriangulation.
-  double collisionIndexSeconds=0,collisionQuerySeconds=0,collisionRestoreSeconds=0;
-  for (int collisionAttempt = 0; collisionAttempt < 4; ++collisionAttempt) {
-    if (std::none_of(rebuiltPatches.begin(), rebuiltPatches.end(),
-                     [](unsigned char rebuilt) { return rebuilt != 0; })) break;
-    if (config.Verbose)
-      std::clog << "[CadMesh] analytic rebuild complete; collision guard attempt "
-                << collisionAttempt + 1 << std::endl;
-    const auto collisionIndexStart=Clock::now();
-    const SurfaceIndex analyticCollision(result.Vertices, result.Triangles,
-                                         result.PatchIds);
-    collisionIndexSeconds+=std::chrono::duration<double>(Clock::now()-collisionIndexStart).count();
-    std::vector<unsigned char> rejected;
-    const auto collisionQueryStart=Clock::now();
-    const std::size_t collisionPatches =
-        analyticCollision.collectIntersectingRebuiltPatches(
-            rebuiltPatches, rejected, config.TargetEdgeLength * 1e-10);
-    collisionQuerySeconds+=std::chrono::duration<double>(Clock::now()-collisionQueryStart).count();
-    if (!collisionPatches) break;
-    const auto collisionRestoreStart=Clock::now();
-    if (config.Verbose)
-      std::clog << "[CadMesh] analytic collision guard: rejecting "
-                << collisionPatches << " rebuilt patches (attempt "
-                << collisionAttempt + 1 << ")\n";
-    if (collisionAttempt >= 2) {
-      // A collision chain can hide later contacts behind the first BVH hit.
-      // The bounded final retry restores every remaining analytic patch to its
-      // original surface triangulation instead of allowing a late hard fail.
-      rejected = rebuiltPatches;
-    }
-    const auto restorePatch = [&](int patch) {
-      return patch >= 0 && patch < int(rejected.size()) && rejected[patch] &&
-             rebuiltPatches[patch];
-    };
-    std::vector<std::array<int, 3>> retainedFaces;
-    std::vector<int> retainedLabels;
-    retainedFaces.reserve(result.Triangles.size());
-    retainedLabels.reserve(result.PatchIds.size());
-    for (std::size_t face = 0; face < result.Triangles.size(); ++face) {
-      if (restorePatch(result.PatchIds[face])) {
-        --analyticReport.RebuiltFaces;
-        continue;
-      }
-      retainedFaces.push_back(result.Triangles[face]);
-      retainedLabels.push_back(result.PatchIds[face]);
-    }
-    for (std::size_t face = 0; face < analyticBaseTriangles.size(); ++face) {
-      if (!restorePatch(analyticBasePatchIds[face])) continue;
-      retainedFaces.push_back(analyticBaseTriangles[face]);
-      retainedLabels.push_back(analyticBasePatchIds[face]);
-    }
-    result.Triangles.swap(retainedFaces);
-    result.PatchIds.swap(retainedLabels);
-    for (int patch = 0; patch < int(rebuiltPatches.size()); ++patch) {
-      if (!restorePatch(patch)) continue;
-      rebuiltPatches[patch] = 0;
-      analyticReport.PatchReasons[patch]=collisionAttempt>=2?
-          PatchRemeshReason::CollisionGuardRestore:PatchRemeshReason::Collision;
-      --analyticReport.Rebuilt;
-      ++analyticReport.Fallback;
-      ++analyticReport.CollisionFallback;
-    }
-    collisionRestoreSeconds+=std::chrono::duration<double>(Clock::now()-collisionRestoreStart).count();
+  if(int(simplePlanesOnly)+int(cylindersOnly)+int(conesOnly)+int(otherFeaturesOnly)>1){
+    error="select only one surface-only mode";return false;
   }
-  if(config.Verbose)std::clog << "[CadMesh] analytic collision timing: index_s=" << collisionIndexSeconds
-      << ", query_s=" << collisionQuerySeconds << ", restore_s=" << collisionRestoreSeconds << std::endl;
+  if(!RemeshGlobalPatches(result,segmenter,config,constraints,simplePlanesOnly,cylindersOnly,
+                         conesOnly,otherFeaturesOnly,error))return false;
   analyticSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
-  stats.AnalyticPatchesAttempted = analyticReport.Attempted;
-  stats.AnalyticPatchesRebuilt = analyticReport.Rebuilt;
-  stats.AnalyticPatchesFallback = analyticReport.Fallback;
-  result.RemeshedPatches = rebuiltPatches;
-  result.PatchReasons = analyticReport.PatchReasons;
-  if(config.Verbose){
-    // Measure the input partition, not the output tessellation: changing point
-    // density or rolling a patch back must not change the area denominator.
-    std::vector<double> patchAreas(segmenter.getPatches().size(),0);
-    double totalArea=0;
-    for(const auto &triangle:mesh.getTriangles()){
-      const auto &ids=triangle.VertexIds;
-      const Vec3 a=ToVec(mesh.getVertices()[ids[0]].Position);
-      const Vec3 b=ToVec(mesh.getVertices()[ids[1]].Position);
-      const Vec3 c=ToVec(mesh.getVertices()[ids[2]].Position);
-      const double area=.5*Norm(Cross(Sub(b,a),Sub(c,a)));
-      if(triangle.PatchId>=0 && std::size_t(triangle.PatchId)<patchAreas.size()){
-        patchAreas[triangle.PatchId]+=area;totalArea+=area;
-      }
-    }
-    std::array<double,256> areas{};
-    std::array<std::size_t,256> counts{};
-    std::vector<std::size_t> retained;
-    for(std::size_t id=0;id<patchAreas.size();++id){
-      const auto reason=result.PatchReasons[id];const auto code=static_cast<unsigned char>(reason);
-      areas[code]+=patchAreas[id];++counts[code];
-      if(reason!=PatchRemeshReason::Rebuilt)retained.push_back(id);
-    }
-    for(std::size_t code=0;code<counts.size();++code)if(counts[code])
-      std::clog << "[CadMesh] remesh reason area: reason="
-          << PatchRemeshReasonName(static_cast<PatchRemeshReason>(code))
-          << ", code=" << code << ", patches=" << counts[code]
-          << ", input_area=" << areas[code]
-          << ", input_area_percent=" << (totalArea>0?100*areas[code]/totalArea:0) << '\n';
-    std::sort(retained.begin(),retained.end(),[&](std::size_t a,std::size_t b){
-      return patchAreas[a]!=patchAreas[b]?patchAreas[a]>patchAreas[b]:a<b;
-    });
-    for(std::size_t rank=0;rank<std::min<std::size_t>(20,retained.size());++rank){
-      const auto id=retained[rank];const auto &patch=segmenter.getPatches()[id];
-      std::clog << "[CadMesh] largest retained patch: ply_patch_id=" << id
-          << ", progress_patch=" << id+1 << ", type=" << SurfaceTypeName(patch.SurfaceType)
-          << ", reason=" << PatchRemeshReasonName(result.PatchReasons[id])
-          << ", input_area=" << patchAreas[id]
-          << ", input_area_percent=" << (totalArea>0?100*patchAreas[id]/totalArea:0)
-          << ", fitted_deviation=" << patch.MaxSampledSurfaceDeviation << '\n';
-    }
-  }
-  if(config.Verbose){
-    const auto &patches=segmenter.getPatches();
-    for(const auto type:{PatchSurfaceType::Plane,PatchSurfaceType::Cylinder,PatchSurfaceType::Cone,PatchSurfaceType::Sphere,
-                        PatchSurfaceType::Torus,PatchSurfaceType::Freeform,PatchSurfaceType::Unknown}){
-      std::size_t total=0,selected=0,eligible=0,accepted=0;
-      for(std::size_t id=0;id<patches.size();++id){
-        const auto &patch=patches[id];if(patch.SurfaceType!=type)continue;
-        ++total;
-        if((simplePlanesOnly && type!=PatchSurfaceType::Plane) ||
-           (cylindersOnly && type!=PatchSurfaceType::Cylinder) ||
-           (conesOnly && type!=PatchSurfaceType::Cone) ||
-           (otherFeaturesOnly && (type==PatchSurfaceType::Plane || type==PatchSurfaceType::Cylinder)))continue;
-        ++selected;
-        if(type!=PatchSurfaceType::Freeform && type!=PatchSurfaceType::Unknown &&
-           patch.ProjectionTarget==PatchProjectionTarget::AnalyticSurface)++eligible;
-        if(id<rebuiltPatches.size() && rebuiltPatches[id])++accepted;
-      }
-      std::clog << "[CadMesh] patch remesh result: type=" << SurfaceTypeName(type)
-          << ", total=" << total << ", selected=" << selected << ", analytic_eligible=" << eligible
-          << ", accepted=" << accepted << ", fallback=" << eligible-accepted
-          << ", unsupported_or_nonanalytic=" << selected-eligible
-          << ", unselected=" << total-selected << std::endl;
-    }
-  }
-  if (config.Verbose)
-    std::clog << "[CadMesh] analytic parameter-domain rebuild: "
-              << analyticReport.Rebuilt << " / " << analyticReport.Attempted
-              << " patches, fallback=" << analyticReport.Fallback
-              << " (deviation=" << analyticReport.DeviationFallback
-              << ", topology=" << analyticReport.TopologyFallback
-              << ", parameterization=" << analyticReport.ParameterizationFallback
-              << ", quality=" << analyticReport.QualityFallback
-              << ", collision=" << analyticReport.CollisionFallback << ")"
-              << ", rebuilt_faces=" << analyticReport.RebuiltFaces
-              << ", time(index=" << analyticReport.IndexSeconds
-              << "s, charts=" << analyticReport.ChartSeconds
-              << "s, commit=" << analyticReport.CommitSeconds << "s)\n";
-  // Drop superseded analytic interior vertices before any CUDA transfer or
-  // fallback adjacency allocation. Boundary constraints are remapped here.
-  const auto compactStart=Clock::now();
-  Compact(result,constraints);
-  if(config.Verbose)std::clog << "[CadMesh] post-analytic compact: "
-      << std::chrono::duration<double>(Clock::now()-compactStart).count() << " s" << std::endl;
+  const auto compactStart=Clock::now();Compact(result,constraints);
   stats.OutputVertices=result.Vertices.size();stats.OutputTriangles=result.Triangles.size();
-  if(config.Verbose)std::clog << "[CadMesh] patch remesh complete: boundary_sampling_s="
-      << boundarySplitSeconds << ", patch_index_s=" << analyticReport.IndexSeconds
-      << ", chart_compute_and_commit_s=" << analyticReport.ChartSeconds
-      << ", face_assembly_s=" << analyticReport.CommitSeconds
-      << ", analytic_including_collision_guard_s=" << analyticSeconds
-      << ", accepted=" << analyticReport.Rebuilt << '/' << analyticReport.Attempted
-      << ", retained_patches=" << segmenter.getPatches().size()-analyticReport.Rebuilt
-      << "; local split/collapse/flip/relax skipped; exporting patch remesh" << std::endl;
-  // Failed, unsupported and unselected patches retain their interiors. Their
-  // edges are not required to meet the rebuilt patches' target length.
-  // Topology validation and analytic collision rollback have already run.
+  if(config.Verbose)std::clog << "[CadMesh] global patch remesh complete: boundary_sampling_s=" << boundarySplitSeconds
+      << ", repartition_and_remesh_s=" << analyticSeconds
+      << ", compact_s=" << std::chrono::duration<double>(Clock::now()-compactStart).count()
+      << ", output_patches=" << result.OutputPatches.size()
+      << ", accepted=" << stats.AnalyticPatchesRebuilt << '/' << stats.AnalyticPatchesAttempted
+      << "; global postprocessing and rollback skipped" << std::endl;
   return true;
 }
+
 bool NativeRemesher::writePly(const NativeRemeshResult &result,
-                              const std::vector<MeshPatch> &patches,
+                              const std::vector<MeshPatch> &inputPatches,
                               const std::filesystem::path &path,
                               std::string &error) {
+  const auto &patches=result.OutputPatches.empty()?inputPatches:result.OutputPatches;
   std::error_code filesystemError;
   if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), filesystemError);
   if (filesystemError) { error = filesystemError.message(); return false; }
   std::ofstream out(path);
   if (!out) { error = "cannot open output PLY"; return false; }
   out << "ply\nformat ascii 1.0\ncomment color_by surface_instance"
-         "\ncomment remeshed 1=accepted_patch_reconstruction 0=not_reconstructed_or_rolled_back"
+         "\ncomment remeshed per_face 0=not_selected 1=selected_not_successful 2=rebuilt 3=preserved_good_input"
+         "\ncomment remesh_reason 9=preserved_good_input; post_remesh_collision_rollback_disabled"
          "\ncomment remesh_reason 0=rebuilt 1=unselected 2=unsupported 3=nonanalytic 4=deviation 5=parameterization_or_construction 6=topology 7=collision 8=collision_guard_restore 255=unknown"
          "\ncomment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform"
          "\ncomment feature_role_ids 0=Ordinary 1=Fillet\nelement vertex "
@@ -1646,7 +1634,7 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
       << "\nproperty double x\nproperty double y\nproperty double z\nelement face "
       << result.Triangles.size()
       << "\nproperty list uchar int vertex_indices\nproperty int patch_id"
-         "\nproperty int primitive_type\nproperty uchar red\nproperty uchar green"
+         "\nproperty int source_patch_id\nproperty int primitive_type\nproperty uchar red\nproperty uchar green"
          "\nproperty uchar blue\nproperty int feature_role\nproperty uchar remeshed\nproperty uchar remesh_reason\nend_header\n"
       << std::setprecision(17);
   for (const auto &vertex : result.Vertices)
@@ -1657,16 +1645,83 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
     const auto color = Color(patchId);
     const auto &face = result.Triangles[i];
     out << "3 " << face[0] << ' ' << face[1] << ' ' << face[2] << ' ' << patchId << ' '
+        << (patchId>=0 && std::size_t(patchId)<result.SourcePatchIds.size()?result.SourcePatchIds[patchId]:patchId) << ' '
         << SurfaceTypeId(patch ? patch->SurfaceType : PatchSurfaceType::Unknown) << ' '
         << color[0] << ' ' << color[1] << ' ' << color[2] << ' '
         << (patch && patch->FeatureRole == PatchFeatureRole::Fillet ? 1 : 0) << ' '
-        << (patchId >= 0 && std::size_t(patchId) < result.RemeshedPatches.size()
-                && result.RemeshedPatches[patchId] ? 1 : 0) << ' '
-        << (patchId>=0 && std::size_t(patchId)<result.PatchReasons.size()
-                ? int(result.PatchReasons[patchId]) : int(PatchRemeshReason::Unknown)) << '\n';
+        << (i<result.FaceRemeshed.size() ? int(result.FaceRemeshed[i]) :
+            (patchId >= 0 && std::size_t(patchId) < result.RemeshedPatches.size()
+                && result.RemeshedPatches[patchId] ? 2 :
+            (patchId>=0 && std::size_t(patchId)<result.RequestedPatches.size()
+                && result.RequestedPatches[patchId] ? 1 : 0))) << ' '
+        << (i<result.FaceReasons.size() ? int(result.FaceReasons[i]) :
+            (patchId>=0 && std::size_t(patchId)<result.PatchReasons.size()
+                ? int(result.PatchReasons[patchId]) : int(PatchRemeshReason::Unknown))) << '\n';
   }
   out.flush();
   if (!out) { error = "writing output PLY failed"; return false; }
+  if(!result.CollisionWitnesses.empty()){
+    auto diagnosticPath=path.parent_path()/(path.stem().string()+"_collision_pairs.ply");
+    std::ofstream diagnostic(diagnosticPath);
+    if(!diagnostic){error="cannot open collision diagnostic PLY";return false;}
+    const auto count=result.CollisionWitnesses.size();
+    diagnostic << "ply\nformat ascii 1.0\ncomment pre_rollback_collision_witnesses_not_final_mesh"
+        "\ncomment pair_id matches collision witness log; side 0=red 1=cyan"
+        "\ncomment source_face_id and source_vertex_ids refer to the numbered attempt"
+        "\ncomment sampled witness pairs only; no classification as penetration or touching"
+        "\nelement vertex " << count*6
+        << "\nproperty double x\nproperty double y\nproperty double z\nelement face " << count*2
+        << "\nproperty list uchar int vertex_indices\nproperty int pair_id\nproperty int side"
+        "\nproperty int attempt\nproperty int patch_id\nproperty int source_face_id"
+        "\nproperty list uchar int source_vertex_ids\nproperty uchar rebuilt"
+        "\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
+        << std::setprecision(17);
+    for(const auto &w:result.CollisionWitnesses)for(const auto &triangle:w.Points)for(const auto &p:triangle)
+      diagnostic << p.X() << ' ' << p.Y() << ' ' << p.Z() << '\n';
+    for(std::size_t pair=0;pair<count;++pair){
+      const auto &w=result.CollisionWitnesses[pair];
+      for(int side=0;side<2;++side){
+        const auto base=pair*6+side*3;
+        diagnostic << "3 " << base << ' ' << base+1 << ' ' << base+2
+            << ' ' << pair << ' ' << side << ' ' << w.Attempt << ' ' << w.PatchIds[side]
+            << ' ' << w.FaceIds[side] << " 3 " << w.VertexIds[side][0]
+            << ' ' << w.VertexIds[side][1] << ' ' << w.VertexIds[side][2]
+            << ' ' << w.Rebuilt[side] << (side==0?" 255 60 60\n":" 0 210 255\n");
+      }
+    }
+    diagnostic.flush();
+    if(!diagnostic){error="writing collision diagnostic PLY failed";return false;}
+    std::clog << "[CadMesh] collision diagnostic: " << diagnosticPath
+        << ", pairs=" << count << std::endl;
+    // Export the nearest original triangles separately at their original world
+    // coordinates. Pair IDs match the candidate file; no geometry is displaced.
+    const auto sourcePath=path.parent_path()/(path.stem().string()+"_collision_source_pairs.ply");
+    std::size_t sourceCount=0;
+    for(const auto &w:result.CollisionWitnesses)for(int side=0;side<2;++side)
+      if(w.SourceFaceIds[side]>=0)++sourceCount;
+    std::ofstream source(sourcePath);
+    if(!source){error="cannot open collision source PLY";return false;}
+    source << "ply\nformat ascii 1.0\ncomment nearest_centroid_source_correspondence_not_proof_of_inherited_contact"
+        "\nelement vertex " << sourceCount*3
+        << "\nproperty double x\nproperty double y\nproperty double z\nelement face " << sourceCount
+        << "\nproperty list uchar int vertex_indices\nproperty int pair_id\nproperty int side"
+        "\nproperty int patch_id\nproperty int source_face_id\nproperty int source_pair_contact"
+        "\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n" << std::setprecision(17);
+    for(const auto &w:result.CollisionWitnesses)for(int side=0;side<2;++side)if(w.SourceFaceIds[side]>=0)
+      for(const auto &p:w.SourcePoints[side])source << p.X() << ' ' << p.Y() << ' ' << p.Z() << '\n';
+    std::size_t vertex=0;
+    for(std::size_t pair=0;pair<result.CollisionWitnesses.size();++pair){
+      const auto &w=result.CollisionWitnesses[pair];
+      for(int side=0;side<2;++side)if(w.SourceFaceIds[side]>=0){
+        source << "3 " << vertex << ' ' << vertex+1 << ' ' << vertex+2
+            << ' ' << pair << ' ' << side << ' ' << w.PatchIds[side] << ' ' << w.SourceFaceIds[side]
+            << ' ' << w.SourcePairContact << (side==0?" 255 170 0\n":" 100 255 100\n");
+        vertex+=3;
+      }
+    }
+    source.flush();if(!source){error="writing collision source PLY failed";return false;}
+    std::clog << "[CadMesh] collision source diagnostic: " << sourcePath << std::endl;
+  }
   return true;
 }
 
