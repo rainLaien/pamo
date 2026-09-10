@@ -21,6 +21,30 @@ bool MeshTopology::build(const TriangleSoup&soup){
     EstimateRawResolution();WeldVertices();BuildTriangles();BuildEdges();ComputeNormals();
     mCleanup.OutputTriangles=int(mTriangles.size());return !mTriangles.empty();
 }
+bool MeshTopology::buildIndexed(const TriangleSoup &soup, const MeshResolutionInfo &resolution) {
+    if (soup.Vertices.empty() || soup.Triangles.empty() ||
+        soup.Vertices.size() > size_t(std::numeric_limits<int>::max()) ||
+        soup.Triangles.size() > size_t(std::numeric_limits<int>::max())) return false;
+    mOriginalSoup = soup; mResolution = resolution; mCleanup = {};
+    mVertices.clear(); mTriangles.clear(); mEdges.clear();
+    mCleanup.InputTriangles = int(soup.Triangles.size());
+    mVertices.resize(soup.Vertices.size());
+    mOriginalToWelded.resize(soup.Vertices.size());
+    for (size_t i = 0; i < soup.Vertices.size(); ++i) {
+        for (int k = 0; k < 3; ++k) if (!std::isfinite(soup.Vertices[i][k])) return false;
+        mVertices[i].Position = soup.Vertices[i];
+        mVertices[i].OriginalVertexIds.push_back(int(i));
+        mOriginalToWelded[i] = int(i);
+    }
+    BuildTriangles();
+    // Reject damaged snapshots rather than silently changing face ids.
+    if (mTriangles.size() != soup.Triangles.size()) return false;
+    for (size_t i = 0; i < mOriginalToTriangle.size(); ++i)
+        if (mOriginalToTriangle[i] != int(i)) return false;
+    BuildEdges(); ComputeNormals();
+    mCleanup.OutputTriangles = int(mTriangles.size());
+    return true;
+}
 void MeshTopology::EstimateRawResolution(){
     Vec3 lo=ToVec(mOriginalSoup.Vertices.front()),hi=lo;std::vector<double> lengths;
     for(const auto&p:mOriginalSoup.Vertices)for(int k=0;k<3;++k){lo[k]=std::min(lo[k],p[k]);hi[k]=std::max(hi[k],p[k]);}

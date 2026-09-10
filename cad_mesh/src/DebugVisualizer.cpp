@@ -1,5 +1,8 @@
 #include "CadMesh/DebugVisualizer.h"
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <set>
@@ -24,6 +27,70 @@ std::array<int, 3> SurfaceColor(PatchSurfaceType type) {
   case PatchSurfaceType::Freeform: return {145, 153, 164};
   default: return {74, 79, 86};
   }
+}
+template <class T> void AppendLittleEndian(std::vector<char> &buffer, T value) {
+  const std::uint16_t one = 1;
+  char bytes[sizeof(T)];
+  std::memcpy(bytes, &value, sizeof(value));
+  if (*reinterpret_cast<const unsigned char *>(&one) != 1)
+    std::reverse(bytes, bytes + sizeof(T));
+  buffer.insert(buffer.end(), bytes, bytes + sizeof(T));
+}
+
+bool ExportBinaryHandoffPly(const CadMeshPatchSegmenter &s,
+                            const std::filesystem::path &path) {
+  static_assert(sizeof(double) == 8, "Handoff PLY requires float64 coordinates");
+  std::ofstream out(path, std::ios::binary);
+  if (!out)
+    return false;
+  const auto &mesh = s.getMesh();
+  out << "ply\nformat binary_little_endian 1.0\ncomment color_by surface_instance"
+         "\ncomment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform"
+         "\ncomment feature_role_ids 0=Ordinary 1=Fillet\nelement vertex "
+      << mesh.getVertices().size()
+      << "\nproperty double x\nproperty double y\nproperty double z\nelement face "
+      << mesh.getTriangles().size()
+      << "\nproperty list uchar int vertex_indices\nproperty int patch_id"
+         "\nproperty int primitive_type\nproperty uchar red\nproperty uchar green"
+         "\nproperty uchar blue\nproperty int feature_role\nend_header\n";
+  // Standard packed records: 24 bytes per vertex and 28 bytes per face.
+  // Buffer blocks explicitly; native struct padding must never enter the PLY.
+  constexpr std::size_t BlockRows = 16384;
+  std::vector<char> buffer;
+  buffer.reserve(BlockRows * 28);
+  const auto flush = [&]() {
+    out.write(buffer.data(), std::streamsize(buffer.size()));
+    buffer.clear();
+  };
+  for (const auto &vertex : mesh.getVertices()) {
+    for (int axis = 0; axis < 3; ++axis)
+      AppendLittleEndian(buffer, double(vertex.Position[axis]));
+    if (buffer.size() >= BlockRows * 24)
+      flush();
+  }
+  if (!buffer.empty())
+    flush();
+  for (const auto &triangle : mesh.getTriangles()) {
+    const auto *patch = triangle.PatchId >= 0 && triangle.PatchId < int(s.getPatches().size())
+                            ? &s.getPatches()[triangle.PatchId] : nullptr;
+    const auto type = patch ? patch->SurfaceType : PatchSurfaceType::Unknown;
+    const bool fillet = patch && patch->FeatureRole == PatchFeatureRole::Fillet;
+    const auto color = Color(triangle.PatchId);
+    AppendLittleEndian(buffer, std::uint8_t(3));
+    for (int vertex : triangle.VertexIds)
+      AppendLittleEndian(buffer, std::int32_t(vertex));
+    AppendLittleEndian(buffer, std::int32_t(triangle.PatchId));
+    AppendLittleEndian(buffer, std::int32_t(SurfaceTypeId(type)));
+    for (int channel : color)
+      AppendLittleEndian(buffer, std::uint8_t(channel));
+    AppendLittleEndian(buffer, std::int32_t(fillet ? 1 : 0));
+    if (buffer.size() >= BlockRows * 28)
+      flush();
+  }
+  if (!buffer.empty())
+    flush();
+  out.flush();
+  return bool(out);
 }
 const char *RoleName(PatchFeatureRole role) {
   return role == PatchFeatureRole::Fillet ? "Fillet" : "Ordinary";
@@ -143,6 +210,74 @@ void Parameters(std::ostream &out, const MeshPatch &patch) {
   }
   out << '}';
 }
+
+bool ExportHandoffReport(const CadMeshPatchSegmenter &s,
+                         const std::filesystem::path &path) {
+  std::ofstream out(path);
+  if (!out)
+    return false;
+  const auto &mesh = s.getMesh();
+  const auto &r = mesh.getResolution();
+  const auto &constraint = s.getRemeshConstraint();
+  out << std::setprecision(17) << std::boolalpha;
+  out << "{\"schema\":\"cadmesh.remesh_handoff\",\"schema_version\":1,"
+         "\"indexing\":{\"base\":0,\"vertices\":\"clean_mesh_ply_vertex_order\","
+         "\"triangles\":\"clean_mesh_ply_face_order\",\"edges\":\"explicit_constraint_edge_ids\"},"
+         "\"partition_valid\":" << s.validatePartition()
+      << ",\"mesh\":{\"vertex_count\":" << mesh.getVertices().size()
+      << ",\"triangle_count\":" << mesh.getTriangles().size()
+      << ",\"edge_count\":" << mesh.getEdges().size() << "},\"resolution\":{\"bbox_diagonal\":";
+  Number(out, r.BoundingBoxDiagonal);
+  out << ",\"median_edge\":"; Number(out, r.MedianEdgeLength);
+  out << ",\"weld_tolerance\":"; Number(out, r.WeldTolerance);
+  out << ",\"fitting_tolerance\":"; Number(out, r.FittingTolerance);
+  out << ",\"curvature_tolerance\":"; Number(out, r.CurvatureTolerance);
+  out << ",\"angular_tolerance\":"; Number(out, r.AngularTolerance);
+  out << "},\"patches\":[";
+  for (std::size_t i = 0; i < s.getPatches().size(); ++i) {
+    const auto &patch = s.getPatches()[i];
+    if (i) out << ',';
+    out << "{\"id\":" << patch.Id << ",\"type\":\"" << SurfaceTypeName(patch.SurfaceType)
+        << "\",\"feature_role\":\"" << RoleName(patch.FeatureRole) << "\",\"support_patch_ids\":";
+    Ids(out, patch.SupportPatchIds);
+    out << ",\"triangle_count\":" << patch.TriangleIds.size() << ",\"triangle_ids\":";
+    Ids(out, patch.TriangleIds);
+    out << ",\"parameters\":"; Parameters(out, patch);
+    out << ",\"max_sampled_surface_deviation\":";
+    // Legacy partitioning did not compute this measurement. Preserve that
+    // distinction so native snapshot loading can compute it instead of using 0.
+    Number(out, s.usesModelFirstPartitioning() ? patch.MaxSampledSurfaceDeviation : -1.0);
+    out << ",\"projection_target\":\""
+        << (patch.ProjectionTarget == PatchProjectionTarget::AnalyticSurface
+                ? "analytic_surface" : "reference_mesh") << "\"}";
+  }
+  out << "],\"constraints\":{\"edge_ids\":";
+  Ids(out, constraint.ConstraintEdgeIds);
+  out << ",\"hard_feature_edge_ids\":"; Ids(out, constraint.HardFeatureEdgeIds);
+  out << ",\"smooth_surface_transition_edge_ids\":"; Ids(out, constraint.SurfaceTransitionEdgeIds);
+  out << ",\"corner_vertex_ids\":"; Ids(out, constraint.CornerVertexIds);
+  out << "},\"constraint_edges\":[";
+  for (std::size_t i = 0; i < constraint.ConstraintEdgeIds.size(); ++i) {
+    const int id = constraint.ConstraintEdgeIds[i];
+    const auto &edge = mesh.getEdges()[id];
+    std::set<int> patches;
+    for (int face : edge.IncidentTriangleIds)
+      patches.insert(mesh.getTriangles()[face].PatchId);
+    if (i) out << ',';
+    out << "{\"id\":" << id << ",\"vertex_ids\":[" << edge.Vertex0 << ',' << edge.Vertex1
+        << "],\"incident_triangle_ids\":";
+    Ids(out, edge.IncidentTriangleIds);
+    out << ",\"incident_patch_ids\":"; Ids(out, patches);
+    out << ",\"open_boundary\":" << edge.IsBoundary
+        << ",\"non_manifold\":" << edge.IsNonManifold
+        << ",\"constrained_feature\":" << edge.IsConstrainedFeature
+        << ",\"hard_feature\":" << (edge.IsBoundary || edge.IsNonManifold || edge.IsConstrainedFeature)
+        << '}';
+  }
+  out << "]}\n";
+  out.flush();
+  return bool(out);
+}
 void VtkPoints(std::ostream &out, const MeshTopology &mesh) {
   out << std::setprecision(17) << "POINTS " << mesh.getVertices().size()
       << " double\n";
@@ -160,6 +295,16 @@ void VtkMeshHeader(std::ofstream &out, const MeshTopology &mesh) {
         << t.VertexIds[2] << '\n';
 }
 } // namespace
+
+bool DebugVisualizer::exportRemeshHandoff(const CadMeshPatchSegmenter &s,
+                                         const std::filesystem::path &directory) {
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error)
+    return false;
+  return ExportBinaryHandoffPly(s, directory / "patch_result.ply") &&
+         ExportHandoffReport(s, directory / "patch_report.json");
+}
 
 bool DebugVisualizer::exportAll(const CadMeshPatchSegmenter &s,
                                 const std::filesystem::path &directory) {

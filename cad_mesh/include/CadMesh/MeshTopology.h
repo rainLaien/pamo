@@ -14,6 +14,8 @@ struct CleanupReport { int InputTriangles=0,OutputTriangles=0,DegenerateTriangle
 class MeshTopology {
 public:
     bool build(const TriangleSoup& soup);
+    // Restore an already-clean indexed mesh without welding or renumbering.
+    bool buildIndexed(const TriangleSoup&, const MeshResolutionInfo&);
     const std::vector<MeshVertex>& getVertices() const{return mVertices;}
     std::vector<MeshVertex>& getVertices(){return mVertices;}
     const std::vector<MeshEdge>& getEdges() const{return mEdges;}

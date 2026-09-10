@@ -4,11 +4,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <set>
+#include <sstream>
 
 namespace {
 using namespace CadMesh;
@@ -383,6 +386,97 @@ void TestComputedDiagnosticsAndMeshDeviation() {
     std::filesystem::remove(path / file, error);
   std::filesystem::remove(path, error);
 }
+
+template <class T> T ReadLittleEndian(const std::string &bytes, size_t &offset) {
+  Require(offset + sizeof(T) <= bytes.size(), "short binary handoff record");
+  char storage[sizeof(T)];
+  std::memcpy(storage, bytes.data() + offset, sizeof(T));
+  const std::uint16_t one = 1;
+  if (*reinterpret_cast<const unsigned char *>(&one) != 1)
+    std::reverse(storage, storage + sizeof(T));
+  T value;
+  std::memcpy(&value, storage, sizeof(T));
+  offset += sizeof(T);
+  return value;
+}
+
+void TestCompactRemeshHandoff() {
+  auto soup = CadMeshTests::Cube();
+  for (auto &point : soup.Vertices)
+    for (int axis = 0; axis < 3; ++axis)
+      point[axis] = point[axis] * .312345678901234 + (axis + 1) * 1.000000000001;
+  SegmentationConfig config;
+  config.ModelAnalyticSeedBackend = AnalyticSeedBackend::Cpu;
+  CadMeshPatchSegmenter segmenter(config);
+  Require(segmenter.segment(soup), "binary handoff fixture failed");
+  const auto path = std::filesystem::temp_directory_path() /
+      ("cadmesh_binary_handoff_" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  Require(DebugVisualizer::exportAll(segmenter, path / "full") &&
+              DebugVisualizer::exportRemeshHandoff(segmenter, path / "compact"),
+          "full/compact handoff export failed");
+  size_t fileCount = 0;
+  for (const auto &file : std::filesystem::directory_iterator(path / "compact")) {
+    Require(file.is_regular_file(), "compact handoff contains an unexpected entry");
+    ++fileCount;
+  }
+  Require(fileCount == 2, "compact handoff must produce only its PLY/JSON pair");
+  const auto ascii = Read(path / "full" / "patch_result.ply");
+  Require(ascii.find("format ascii 1.0") != std::string::npos,
+          "default diagnostic handoff must remain ASCII");
+  std::ifstream stream(path / "compact" / "patch_result.ply", std::ios::binary);
+  const std::string binary((std::istreambuf_iterator<char>(stream)), {});
+  const std::string end = "end_header\n";
+  auto offset = binary.find(end);
+  Require(offset != std::string::npos &&
+              binary.find("format binary_little_endian 1.0") != std::string::npos,
+          "compact handoff must declare standard little-endian PLY");
+  offset += end.size();
+  const auto &mesh = segmenter.getMesh();
+  Require(binary.size() - offset == 24 * mesh.getVertices().size() + 28 * mesh.getTriangles().size(),
+          "binary handoff records contain padding or omitted fields");
+  std::istringstream reference(ascii.substr(ascii.find(end) + end.size()));
+  for (const auto &vertex : mesh.getVertices())
+    for (int axis = 0; axis < 3; ++axis) {
+      double expected;
+      reference >> expected;
+      const double value = ReadLittleEndian<double>(binary, offset);
+      Require(value == expected && value == vertex.Position[axis],
+              "binary handoff lost float64 coordinate precision or vertex order");
+    }
+  for (size_t face = 0; face < mesh.getTriangles().size(); ++face) {
+    for (int column = 0; column < 10; ++column) {
+      int expected;
+      reference >> expected;
+      const int value = column == 0 || (column >= 6 && column <= 8)
+          ? int(ReadLittleEndian<std::uint8_t>(binary, offset))
+          : int(ReadLittleEndian<std::int32_t>(binary, offset));
+      Require(reference.good() && value == expected,
+              "binary handoff changed face indices, ownership, category, role or colors");
+    }
+  }
+  Require(offset == binary.size(), "binary handoff has trailing records");
+  const auto compact = Read(path / "compact" / "patch_report.json");
+  for (const char *key : {"\"schema\":\"cadmesh.remesh_handoff\"", "\"partition_valid\":true",
+                          "\"triangle_ids\"", "\"parameters\"", "\"projection_target\"",
+                          "\"support_patch_ids\"", "\"feature_role\"", "\"constraint_edges\"",
+                          "\"corner_vertex_ids\"", "\"hard_feature_edge_ids\"",
+                          "\"smooth_surface_transition_edge_ids\""})
+    Require(compact.find(key) != std::string::npos, std::string("compact report omitted ") + key);
+  for (const char *key : {"\"boundary_chains\"", "\"boundary_chain_refs\"", "\"adjacency\"",
+                          "\"sampled_mesh_deviation\"", "\"corners\""})
+    Require(compact.find(key) == std::string::npos,
+            std::string("compact report retained unused diagnostics ") + key);
+  std::error_code error;
+  for (const char *file : {"patch_result.ply", "surface_types.ply", "feature_roles.ply",
+                           "boundary_score.vtk", "patch_report.json"})
+    std::filesystem::remove(path / "full" / file, error);
+  for (const char *file : {"patch_result.ply", "patch_report.json"})
+    std::filesystem::remove(path / "compact" / file, error);
+  std::filesystem::remove(path / "full", error);
+  std::filesystem::remove(path / "compact", error);
+  std::filesystem::remove(path, error);
+}
 } // namespace
 
 void RunSurfaceRoleTests() {
@@ -390,4 +484,5 @@ void RunSurfaceRoleTests() {
   TestFragmentedMotherPlanesDoNotSplitFilletEvidence();
   TestRoleAndSurfaceExports();
   TestComputedDiagnosticsAndMeshDeviation();
+  TestCompactRemeshHandoff();
 }

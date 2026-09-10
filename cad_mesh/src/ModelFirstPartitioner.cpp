@@ -1,7 +1,10 @@
 #include "CadMesh/ModelFirstPartitioner.h"
+#include "CadMesh/CudaAnalyticFitting.h"
+#include "CadMesh/CudaAnalyticPrefetch.h"
 #include "CadMesh/SegmentationGuards.h"
 #include "CadMesh/SurfaceFitting.h"
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -25,6 +28,85 @@ class ModelPartition {
   std::vector<unsigned char> Seeded;
   std::vector<MeshPatch> Patches;
   int Stamp = 0;
+  // Larger windows speculate on more neighborhoods that subsequent commits
+  // or suppression may invalidate; keep enough work to fill the GPU without
+  // changing the sequential proposal schedule.
+  static constexpr size_t AnalyticLookahead = 8;
+  static constexpr size_t MaximumPrefetchSeeds = 256;
+
+  struct RemainingProbe {
+    std::vector<int> OrderedFaces;
+  };
+  // Negative results only: successful probes immediately acquire ownership.
+  // The sorted key identifies the full component, while OrderedFaces preserves
+  // the fitter's accumulation order and ResolvedCurvedSupport's sample order.
+  std::map<std::vector<int>, RemainingProbe> RemainingFailures;
+  size_t RemainingCachedFaces = 0;
+  size_t RemainingProbeCalls = 0, RemainingOversized = 0;
+  size_t RemainingRepeatedSets = 0, RemainingOrderChanges = 0;
+  size_t RemainingExactHits = 0, RemainingFits = 0;
+  double RemainingFitSeconds = 0;
+  std::vector<size_t> RemainingOversizedAt;
+  size_t RemainingProbeEpoch = 1, RemainingProbeBudget = 0;
+  size_t RemainingOversizedReuses = 0, RemainingTraversedFaces = 0;
+  double RemainingTraversalSeconds = 0;
+
+  void InvalidateRemainingSizeEvidence() {
+    if (RemainingProbeEpoch == std::numeric_limits<size_t>::max()) {
+      std::fill(RemainingOversizedAt.begin(), RemainingOversizedAt.end(), 0);
+      RemainingProbeEpoch = 1;
+    } else {
+      ++RemainingProbeEpoch;
+    }
+  }
+
+  void LogRemainingProbes(const char *stage) const {
+    if (!Config.Verbose) return;
+    std::clog << "[CadMesh] exposed component probes cumulative after " << stage
+              << ": probes=" << RemainingProbeCalls
+              << ", over_budget=" << RemainingOversized
+              << ", over_budget_reuses=" << RemainingOversizedReuses
+              << ", traversed_faces=" << RemainingTraversedFaces
+              << ", traversal_seconds=" << RemainingTraversalSeconds
+              << ", repeated_face_sets=" << RemainingRepeatedSets
+              << ", different_order=" << RemainingOrderChanges
+              << ", exact_failure_reuses=" << RemainingExactHits
+              << ", selector_calls=" << RemainingFits
+              << ", selector_seconds=" << RemainingFitSeconds
+              << ", cached_components=" << RemainingFailures.size() << '\n';
+  }
+
+  // A cache belongs to one immutable surface snapshot and one candidate
+  // evaluation. Mesh geometry is unchanged during partitioning. Ownership and
+  // threshold decisions are deliberately never cached.
+  class CompatibilityCache {
+    const MeshTopology &Mesh;
+    const MeshPatch Surface;
+    std::unordered_map<int, SurfaceCompatibility> Values;
+  public:
+    CompatibilityCache(const MeshTopology &mesh, const MeshPatch &surface)
+        : Mesh(mesh), Surface(surface) {}
+    SurfaceCompatibility evaluate(int face) {
+      const auto found = Values.find(face);
+      if (found != Values.end()) return found->second;
+      auto value = EvaluateSurfaceCompatibility(Mesh, face, Surface);
+      if (Values.size() < 65536) Values.emplace(face, value);
+      return value;
+    }
+    SurfaceCompatibility evaluate(const std::vector<int> &faces) {
+      SurfaceCompatibility result;
+      for (int face : faces) {
+        const auto value = evaluate(face);
+        result.MaxNormalizedDistance = std::max(result.MaxNormalizedDistance,
+                                                value.MaxNormalizedDistance);
+        result.MaxNormalError = std::max(result.MaxNormalError, value.MaxNormalError);
+        result.ReliableNormalSamples += value.ReliableNormalSamples;
+        if (!value.Supported) return result;
+      }
+      result.Supported = !faces.empty();
+      return result;
+    }
+  };
 
   MeshPatch FromFit(const SurfaceFitResult &fit) const {
     MeshPatch p;
@@ -52,19 +134,21 @@ class ModelPartition {
       result.push_back(faces[(2 * i + 1) * faces.size() / (2 * maximum)]);
     return result;
   }
-  bool Compatible(int f, const MeshPatch &p, double distanceRatio = -1) const {
-    const auto check = EvaluateSurfaceCompatibility(Mesh, f, p);
+  bool Compatible(int f, const MeshPatch &p, double distanceRatio = -1,
+                  CompatibilityCache *cache = nullptr) const {
+    const auto check = cache ? cache->evaluate(f) : EvaluateSurfaceCompatibility(Mesh, f, p);
     return check.Supported && check.ReliableNormalSamples > 0 &&
            check.MaxNormalizedDistance <= (distanceRatio < 0
                                                ? Config.ModelFitToleranceRatio
                                                : distanceRatio) &&
            check.MaxNormalError <= Config.ModelNormalTolerance;
   }
-  bool Certify(const std::vector<int> &faces, MeshPatch &p) const {
+  bool Certify(const std::vector<int> &faces, MeshPatch &p,
+               CompatibilityCache *cache = nullptr) const {
     if (p.SurfaceType == PatchSurfaceType::Unknown ||
         p.SurfaceType == PatchSurfaceType::Freeform)
       return false;
-    const auto check = EvaluateSurfaceCompatibility(Mesh, faces, p);
+    const auto check = cache ? cache->evaluate(faces) : EvaluateSurfaceCompatibility(Mesh, faces, p);
     if (!check.Supported ||
         check.MaxNormalizedDistance > Config.ModelFitToleranceRatio ||
         check.MaxNormalError > Config.ModelNormalTolerance)
@@ -120,6 +204,9 @@ class ModelPartition {
     for (int f : patch.TriangleIds)
       Owner[f] = patch.Id;
     Patches.push_back(std::move(patch));
+    // Any new ownership can split/shrink a residual component. Its previous
+    // size lower bound must not suppress a now-small component.
+    InvalidateRemainingSizeEvidence();
   }
   double GrowthTolerance(const MeshPatch &p) const {
     // Exact CAD models must not absorb the first tangent transition strip just
@@ -129,18 +216,18 @@ class ModelPartition {
         std::max(Mesh.getResolution().FittingTolerance, 1e-30);
     return std::min(Config.ModelFitToleranceRatio, std::max(.2, 3 * measured));
   }
-  std::vector<int> Grow(int seed, const MeshPatch &p) {
+  std::vector<int> Grow(int seed, const MeshPatch &p, CompatibilityCache *cache = nullptr) {
     ++Stamp;
     std::vector<int> result;
     Visit[seed] = Stamp;
-    if (Owner[seed] >= 0 || !Compatible(seed, p, GrowthTolerance(p)))
+    if (Owner[seed] >= 0 || !Compatible(seed, p, GrowthTolerance(p), cache))
       return result;
     result.push_back(seed);
     for (size_t i = 0; i < result.size(); ++i)
       for (int next : Neighbors[result[i]])
         if (next >= 0 && Owner[next] < 0 && Visit[next] != Stamp) {
           Visit[next] = Stamp;
-          if (Compatible(next, p, GrowthTolerance(p)))
+          if (Compatible(next, p, GrowthTolerance(p), cache))
             result.push_back(next);
         }
     return result;
@@ -152,6 +239,7 @@ class ModelPartition {
   template <class Fitter>
   MeshPatch FitOnly(const std::vector<int> &faces,
                     bool proposal = false) const {
+    CudaAnalyticFitContext context(proposal ? "neighborhood proposal" : nullptr);
     Fitter fitter;
     if (!fitter.fit(Mesh, proposal ? Sample(faces, 128) : faces))
       return {};
@@ -349,24 +437,97 @@ class ModelPartition {
   // Small components exposed by removing a mother surface often are complete
   // fillets; they deserve one whole-model test before local primitives compete.
   bool TryRemainingComponent(int seed, size_t budget) {
+    CudaAnalyticFitContext context("exposed component selector");
     if (Owner[seed] >= 0)
       return false;
+    ++RemainingProbeCalls;
+    const auto traversalStart = std::chrono::steady_clock::now();
+    const auto finishTraversal = [&]() {
+      RemainingTraversalSeconds += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - traversalStart).count();
+    };
+    if (RemainingProbeBudget != budget) {
+      InvalidateRemainingSizeEvidence();
+      RemainingProbeBudget = budget;
+    }
+    if (RemainingOversizedAt.empty()) RemainingOversizedAt.resize(Owner.size(), 0);
+    if (RemainingOversizedAt[seed] == RemainingProbeEpoch) {
+      ++RemainingOversized;
+      ++RemainingOversizedReuses;
+      finishTraversal();
+      return false;
+    }
     ++Stamp;
     std::vector<int> faces{seed};
+    ++RemainingTraversedFaces;
     Visit[seed] = Stamp;
     for (size_t i = 0; i < faces.size(); ++i)
       for (int n : Neighbors[faces[i]])
         if (n >= 0 && Owner[n] < 0 && Visit[n] != Stamp) {
           Visit[n] = Stamp;
           faces.push_back(n);
-          if (faces.size() > budget)
+          ++RemainingTraversedFaces;
+          const bool knownOversized = RemainingOversizedAt[n] == RemainingProbeEpoch;
+          if (knownOversized || faces.size() > budget) {
+            // Every discovered face is connected to the seed through current
+            // unowned faces. Reaching a marked face proves the same size lower
+            // bound even when this traversal has not yet hit the budget.
+            for (int face : faces) RemainingOversizedAt[face] = RemainingProbeEpoch;
+            ++RemainingOversized;
+            RemainingOversizedReuses += knownOversized;
+            finishTraversal();
             return false;
+          }
         }
+    finishTraversal();
+    // Always rediscover the entire current component before consulting the
+    // cache. Acquiring any of its faces changes this key and forces a refit.
+    // An incomplete traversal stopped by the face budget is never cached.
+    auto key = faces;
+    std::sort(key.begin(), key.end());
+    auto previous = RemainingFailures.find(key);
+    if (previous != RemainingFailures.end()) {
+      ++RemainingRepeatedSets;
+      if (previous->second.OrderedFaces == faces) {
+        ++RemainingExactHits;
+        return false;
+      }
+      ++RemainingOrderChanges;
+    }
+    ++RemainingFits;
+    const auto fitStart = std::chrono::steady_clock::now();
     MeshPatch model = Fit(faces);
+    RemainingFitSeconds += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - fitStart).count();
     if ((model.SurfaceType != PatchSurfaceType::Plane &&
          !ResolvedCurvedSupport(faces)) ||
-        !Certify(faces, model))
+        !Certify(faces, model)) {
+      // Cache only the failed probe, never a patch id or ownership decision.
+      // Bound both component count and retained face ids (key + input order).
+      if (previous != RemainingFailures.end()) {
+        previous->second.OrderedFaces = faces;
+      } else {
+        constexpr size_t maximumComponents = 1024;
+        constexpr size_t maximumFaceIds = 1024 * 1024;
+        const size_t needed = 2 * faces.size();
+        if (needed <= maximumFaceIds) {
+          while (!RemainingFailures.empty() &&
+                 (RemainingFailures.size() >= maximumComponents ||
+                  RemainingCachedFaces + needed > maximumFaceIds)) {
+            const auto oldestKey = RemainingFailures.begin();
+            RemainingCachedFaces -= 2 * oldestKey->first.size();
+            RemainingFailures.erase(oldestKey);
+          }
+          RemainingFailures.emplace(std::move(key), RemainingProbe{faces});
+          RemainingCachedFaces += needed;
+        }
+      }
       return false;
+    }
+    if (previous != RemainingFailures.end()) {
+      RemainingCachedFaces -= 2 * previous->first.size();
+      RemainingFailures.erase(previous);
+    }
     Store(std::move(faces), model);
     return true;
   }
@@ -418,6 +579,41 @@ class ModelPartition {
     std::vector<int> Faces;
     double Area = 0;
   };
+  void CollectProposalModels(const Neighborhood &peers,
+                             const Neighborhood &broad) const {
+    for (const auto *neighborhood : {&peers, &broad}) {
+      const auto &support = neighborhood->Faces;
+      if (support.size() < 6)
+        continue;
+      auto plane = FitOnly<PlaneSurfaceFitter>(support, true);
+      if (Certify(support, plane))
+        continue;
+      // These fits are independent until Consider/CommitCandidate runs. Stop
+      // each fitter at its nonlinear solve and submit all initial guesses
+      // together. The ordinary path below still evaluates every candidate in
+      // its original order, reusing only byte-identical solver inputs.
+      const auto collect = [&](auto fitter) {
+        try {
+          fitter.fit(Mesh, Sample(support, 128));
+        } catch (const AnalyticSeedDeferred &) {
+        }
+      };
+      collect(CylinderSurfaceFitter{});
+      collect(ConeSurfaceFitter{});
+      collect(SphereSurfaceFitter{});
+      if (support.size() >= 20)
+        collect(TorusSurfaceFitter{});
+    }
+  }
+  void PrepareProposalModels(CudaAnalyticSeedPrefetch &prepared,
+                             const Neighborhood &peers,
+                             const Neighborhood &broad) const {
+    if (!prepared.enabled())
+      return;
+    prepared.begin();
+    CollectProposalModels(peers, broad);
+    prepared.flush();
+  }
   bool HasGeometricSupport(const std::vector<int> &faces) const {
     std::unordered_map<int, double> areas;
     double total = 0, largest = 0;
@@ -433,8 +629,9 @@ class ModelPartition {
   }
   void Consider(int seed, const std::vector<int> &support, MeshPatch model,
                 Candidate &best) {
+    CompatibilityCache cache(Mesh, model);
     if (model.SurfaceType == PatchSurfaceType::Unknown ||
-        !Compatible(seed, model))
+        !Compatible(seed, model, -1, &cache))
       return;
     // Reject primitives that interpolate just one thin band of the
     // neighborhood. Models compete on a physical support region, not the first
@@ -443,12 +640,12 @@ class ModelPartition {
     for (int f : support) {
       double area = Mesh.getTriangles()[f].Area;
       total += area;
-      if (Compatible(f, model))
+      if (Compatible(f, model, -1, &cache))
         supported += area;
     }
     if (supported < .8 * total)
       return;
-    auto faces = Grow(seed, model);
+    auto faces = Grow(seed, model, &cache);
     if (faces.size() < 6 || !HasGeometricSupport(faces))
       return;
     double area = 0;
@@ -458,6 +655,7 @@ class ModelPartition {
       best = {std::move(model), std::move(faces), area};
   }
   bool CommitCandidate(int seed, Candidate candidate) {
+    CudaAnalyticFitContext context("candidate full refit");
     if (candidate.Faces.empty())
       return false;
     MeshPatch refined;
@@ -477,10 +675,11 @@ class ModelPartition {
     default:
       return false;
     }
-    if (!Certify(candidate.Faces, refined))
+    CompatibilityCache cache(Mesh, refined);
+    if (!Certify(candidate.Faces, refined, &cache))
       return false;
-    auto expanded = Grow(seed, refined);
-    if (expanded.size() >= candidate.Faces.size() && Certify(expanded, refined))
+    auto expanded = Grow(seed, refined, &cache);
+    if (expanded.size() >= candidate.Faces.size() && Certify(expanded, refined, &cache))
       candidate.Faces = std::move(expanded);
     std::vector<int> exposed;
     for (int f : candidate.Faces)
@@ -488,6 +687,8 @@ class ModelPartition {
         if (n >= 0 && Owner[n] < 0)
           exposed.push_back(n);
     Store(std::move(candidate.Faces), refined);
+    // Store starts a fresh epoch. Share size evidence only among the following
+    // three probes; any successful probe calls Store and invalidates it again.
     // Avoid repeatedly scanning a huge residual component from every boundary
     // vertex. At most a few newly exposed components receive this early test.
     int probes = 0;
@@ -500,13 +701,17 @@ class ModelPartition {
     return true;
   }
   void ExtractCurves() {
+    CudaAnalyticSeedPrefetch prepared("analytic neighborhoods", Config.Verbose);
     CellVisit.assign(Cells.size(), 0);
     Seeded.assign(Cells.size(), 0);
     std::vector<unsigned char> attempted(Cells.size(), 0);
     const size_t maximumSeeds = size_t(std::max(0, Config.ModelMaximumSeeds));
     size_t proposals = 0;
     bool budgetReached = false;
-    for (int id : CellOrder()) {
+    const auto cellOrder = CellOrder();
+    size_t prefetchedThrough = 0;
+    for (size_t position = 0; position < cellOrder.size(); ++position) {
+      const int id = cellOrder[position];
       int seed = -1;
       for (int f : Cells[id].Faces)
         if (Owner[f] < 0) {
@@ -519,6 +724,25 @@ class ModelPartition {
         budgetReached = true;
         break;
       }
+      if (prepared.enabled() && position >= prefetchedThrough) {
+        // Only solver inputs are speculative. Ownership, suppression, proposal
+        // counts and candidate competition continue in their original order.
+        prepared.begin();
+        size_t collected = 0, cursor = position;
+        for (; cursor < cellOrder.size() && collected < AnalyticLookahead &&
+               collected < maximumSeeds - proposals &&
+               prepared.pendingSeeds() < MaximumPrefetchSeeds; ++cursor) {
+          const int next = cellOrder[cursor];
+          if (attempted[next] || Cells[next].Neighbors.empty() || !HasUnowned(next))
+            continue;
+          auto peers = SeedNeighborhood(next, 4, 48, true);
+          auto broad = SeedNeighborhood(next, 10, 256);
+          CollectProposalModels(peers, broad);
+          ++collected;
+        }
+        prefetchedThrough = cursor;
+        prepared.flush();
+      }
       ++proposals;
       Seeded[id] = 1;
       if (Config.Verbose && proposals % 1000 == 0)
@@ -529,6 +753,7 @@ class ModelPartition {
       // transition triangles. Broad neighborhoods then allow torus competition.
       auto peers = SeedNeighborhood(id, 4, 48, true);
       auto broad = SeedNeighborhood(id, 10, 256);
+      PrepareProposalModels(prepared, peers, broad);
       for (const auto *neighborhood : {&peers, &broad}) {
         const auto &support = neighborhood->Faces;
         if (support.size() < 6)
@@ -565,6 +790,7 @@ class ModelPartition {
                 << "); continuing with spatial residual reserve\n";
   }
   void DiscoverResidualModels() {
+    CudaAnalyticSeedPrefetch prepared("residual neighborhoods", Config.Verbose);
     const size_t budget = size_t(std::max(0, Config.ModelResidualSeedBudget));
     if (!budget)
       return;
@@ -596,17 +822,27 @@ class ModelPartition {
             component.Faces.push_back(next);
           }
       }
+      components.push_back(std::move(component));
+    }
+    std::vector<std::vector<int>> componentSamples;
+    componentSamples.reserve(components.size());
+    for (const auto &component : components)
+      componentSamples.push_back(Sample(component.Faces, 256));
+    const auto componentFits = SurfaceModelSelector::fitBestBatch(
+        Mesh, componentSamples, Mesh.getResolution(), Config.ModelComplexityPenalty);
+    for (size_t i = 0; i < components.size(); ++i) {
+      auto &component = components[i];
       // A complete exposed surface gets a cheap bounded proposal and then a
       // full refit/certificate before local searches spend their reserve.
-      auto model = Fit(Sample(component.Faces, 256));
+      auto model = FromFit(componentFits[i]);
       if ((model.SurfaceType == PatchSurfaceType::Plane ||
            ResolvedCurvedSupport(component.Faces)) &&
           Certify(component.Faces, model)) {
+        CudaAnalyticFitContext context("residual component full refit");
         model = RefitType(component.Faces, model.SurfaceType);
         if (Certify(component.Faces, model))
           Store(component.Faces, model);
       }
-      components.push_back(std::move(component));
     }
     using BucketKey = std::array<int, 3>;
     std::vector<std::map<BucketKey, std::vector<int>>> grids(components.size());
@@ -640,14 +876,15 @@ class ModelPartition {
       std::vector<std::vector<int>> Buckets;
       std::vector<size_t> Cursor;
       size_t Next = 0;
-      int Pop() {
+      int Pop(std::vector<size_t> &cursor, size_t &next) const {
         for (size_t trial = 0; trial < Buckets.size(); ++trial) {
-          const size_t bucket = Next++ % Buckets.size();
-          if (Cursor[bucket] < Buckets[bucket].size())
-            return Buckets[bucket][Cursor[bucket]++];
+          const size_t bucket = next++ % Buckets.size();
+          if (cursor[bucket] < Buckets[bucket].size())
+            return Buckets[bucket][cursor[bucket]++];
         }
         return -1;
       }
+      int Pop() { return Pop(Cursor, Next); }
     };
     std::vector<Schedule> schedules;
     for (auto &grid : grids) {
@@ -660,10 +897,42 @@ class ModelPartition {
       schedules.push_back(std::move(schedule));
     }
     size_t proposals = 0, committed = 0;
+    size_t prefetchedThrough = 0;
     bool available = true;
     while (proposals < budget && available) {
       available = false;
-      for (auto &schedule : schedules) {
+      for (size_t scheduleIndex = 0; scheduleIndex < schedules.size(); ++scheduleIndex) {
+        auto &schedule = schedules[scheduleIndex];
+        if (prepared.enabled() && proposals >= prefetchedThrough) {
+          // Copy only the cursors, not the large immutable cell buckets. The
+          // true schedule is advanced exclusively by the ordinary Pop below.
+          std::vector<std::vector<size_t>> cursors;
+          std::vector<size_t> next;
+          for (const auto &source : schedules) {
+            cursors.push_back(source.Cursor);
+            next.push_back(source.Next);
+          }
+          prepared.begin();
+          size_t collected = 0, empty = 0, scan = scheduleIndex;
+          while (collected < AnalyticLookahead && collected < budget - proposals &&
+                 prepared.pendingSeeds() < MaximumPrefetchSeeds && empty < schedules.size()) {
+            const size_t index = scan++ % schedules.size();
+            int candidate = schedules[index].Pop(cursors[index], next[index]);
+            while (candidate >= 0 && !HasUnowned(candidate))
+              candidate = schedules[index].Pop(cursors[index], next[index]);
+            if (candidate < 0) {
+              ++empty;
+              continue;
+            }
+            empty = 0;
+            auto peers = SeedNeighborhood(candidate, 4, 48, true);
+            auto broad = SeedNeighborhood(candidate, 10, 256);
+            CollectProposalModels(peers, broad);
+            ++collected;
+          }
+          prefetchedThrough = proposals + std::max<size_t>(1, collected);
+          prepared.flush();
+        }
         int id = schedule.Pop();
         while (id >= 0 && !HasUnowned(id))
           id = schedule.Pop();
@@ -681,6 +950,7 @@ class ModelPartition {
         Candidate best;
         auto peers = SeedNeighborhood(id, 4, 48, true);
         auto broad = SeedNeighborhood(id, 10, 256);
+        PrepareProposalModels(prepared, peers, broad);
         for (const auto *neighborhood : {&peers, &broad}) {
           const auto &support = neighborhood->Faces;
           if (support.size() < 6)
@@ -757,8 +1027,12 @@ class ModelPartition {
     return true;
   }
   void Residuals() {
+    // -1 means undiscovered; -2 means already collected by this traversal.
+    // Never use Owner < 0 here: deferred commits would collect visited faces
+    // again as singleton components and overwrite their previous ownership.
+    // Fit and commit each component before moving to the next seed.
     for (int seed = 0; seed < int(Owner.size()); ++seed)
-      if (Owner[seed] < 0) {
+      if (Owner[seed] == -1) {
         std::vector<int> faces{seed};
         Owner[seed] = -2;
         for (size_t k = 0; k < faces.size(); ++k)
@@ -1375,15 +1649,28 @@ public:
       : Mesh(mesh), Config(config), Owner(mesh.getTriangles().size(), -1),
         CellId(Owner.size(), -1), Visit(Owner.size(), 0) {}
   std::vector<MeshPatch> Run() {
-    BuildNeighbors();
-    WholeComponents();
-    BuildCells();
-    ExtractPlaneCores();
-    ExtractCurves();
-    DiscoverResidualModels();
-    Residuals();
-    MergeAnalyticFragments();
-    BridgeResidualSeams();
+    CudaAnalyticFitSession fitting(Config.ModelAnalyticSeedBackend, Config.Verbose);
+    auto stage = [&](const char *name, auto &&work) {
+      const auto begin = std::chrono::steady_clock::now();
+      work();
+      if (Config.Verbose)
+        std::clog << "[CadMesh] " << name << ": "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count()
+                  << " s\n";
+    };
+    stage("model neighbors", [&] { BuildNeighbors(); });
+    stage("whole component fits", [&] { WholeComponents(); });
+    stage("planar cells", [&] { BuildCells(); });
+    stage("mother planes", [&] { ExtractPlaneCores(); });
+    stage("analytic seed search", [&] { ExtractCurves(); });
+    LogRemainingProbes("analytic seed search");
+    stage("residual seed search", [&] { DiscoverResidualModels(); });
+    LogRemainingProbes("residual seed search");
+    RemainingFailures.clear();
+    RemainingCachedFaces = 0;
+    stage("residual classification", [&] { Residuals(); });
+    stage("analytic adjacency merge", [&] { MergeAnalyticFragments(); });
+    stage("residual seam bridging", [&] { BridgeResidualSeams(); });
     return std::move(Patches);
   }
   std::vector<MeshPatch> Consolidate(std::vector<MeshPatch> patches) {

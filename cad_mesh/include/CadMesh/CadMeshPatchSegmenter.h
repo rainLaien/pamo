@@ -1,5 +1,6 @@
 #pragma once
 #include "CadMesh/BoundaryScoreCalculator.h"
+#include <filesystem>
 namespace CadMesh {
 class PatchRefiner;
 class PatchGraphBuilder;
@@ -9,6 +10,7 @@ public:
   explicit CadMeshPatchSegmenter(SegmentationConfig config = {})
       : mConfig(config) {}
   bool segment(const TriangleSoup &soup);
+  bool loadRemeshSnapshot(const std::filesystem::path&, std::string &error);
   // Check complete, unique ownership and manifold-edge connectivity.
   bool validatePartition(std::string *error = nullptr) const;
   const MeshTopology &getMesh() const { return mMesh; }

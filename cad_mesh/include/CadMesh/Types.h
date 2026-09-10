@@ -18,6 +18,7 @@ enum class PatchSurfaceType {
 };
 enum class BoundaryConfidence { Weak, Probable, Certain };
 enum class PatchFeatureRole { Ordinary, Fillet };
+enum class AnalyticSeedBackend { Auto, Cpu, Cuda };
 
 struct MeshResolutionInfo {
   double BoundingBoxDiagonal = 0, MinEdgeLength = 0, MedianEdgeLength = 0,
@@ -126,6 +127,7 @@ struct RemeshConstraint {
 };
 struct SegmentationConfig {
   bool EnableModelFirst = true;
+  AnalyticSeedBackend ModelAnalyticSeedBackend = AnalyticSeedBackend::Auto;
   double ModelFitToleranceRatio = 3.0;
   double ModelNormalTolerance = 0.14;
   double ModelSeedRadiusFactor = 8.0;

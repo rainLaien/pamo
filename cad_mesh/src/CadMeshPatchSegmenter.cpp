@@ -326,6 +326,28 @@ bool CadMeshPatchSegmenter::segment(const TriangleSoup &soup) {
   PatchGraphBuilder::build(*this);
   IdentifySurfaceRoles(mMesh, mPatches, mAdjacency);
   log("patch graph");
+  if (mConfig.Verbose) {
+    std::size_t tiny = 0, tinyPlanes = 0, tinyFaces = 0;
+    double totalArea = 0, tinyArea = 0;
+    for (const auto &patch : mPatches) {
+      const bool isTiny = patch.TriangleIds.size() <= 2;
+      if (isTiny) {
+        ++tiny;
+        tinyPlanes += patch.SurfaceType == PatchSurfaceType::Plane;
+        tinyFaces += patch.TriangleIds.size();
+      }
+      for (int face : patch.TriangleIds) {
+        const double area = mMesh.getTriangles()[face].Area;
+        totalArea += area;
+        if (isTiny) tinyArea += area;
+      }
+    }
+    std::clog << "[CadMesh] small patches (<=2 input triangles): " << tiny
+              << '/' << mPatches.size() << ", planar=" << tinyPlanes
+              << ", triangles=" << tinyFaces
+              << ", surface_area_percent="
+              << (totalArea > 0 ? 100 * tinyArea / totalArea : 0) << '\n';
+  }
   return !mPatches.empty();
 }
 

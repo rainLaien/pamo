@@ -22,5 +22,14 @@ class TorusSurfaceFitter final:public ISurfaceFitter { public:bool fit(const Mes
 // not a fitted freeform surface. getParameters() intentionally stays empty.
 class FreeformSurfaceFitter final:public ISurfaceFitter { public:bool fit(const MeshTopology&,const std::vector<int>&)override;double computeRmsError()const override{return mRms;}double computeMaxError()const override{return mMax;}double computeNormalError()const override{return mNormal;}PatchSurfaceType getType()const override{return PatchSurfaceType::Freeform;}private:double mRms=0,mMax=0,mNormal=0;};
 struct SurfaceFitResult { PatchSurfaceType Type=PatchSurfaceType::Unknown;double Rms=0,Max=0,Normal=0,Score=1e100;SurfaceParameters Parameters; };
-class SurfaceModelSelector { public: static SurfaceFitResult fitBest(const MeshTopology&,const std::vector<int>&,const MeshResolutionInfo&,double complexityPenalty=0.025); };
+class SurfaceModelSelector {
+public:
+  static SurfaceFitResult fitBest(const MeshTopology&,const std::vector<int>&,
+                                 const MeshResolutionInfo&,double complexityPenalty=0.025);
+  // Independent supports only. Results retain input order; no mesh labels are
+  // modified. Each model stage batches only supports not already resolved.
+  static std::vector<SurfaceFitResult> fitBestBatch(
+      const MeshTopology&, const std::vector<std::vector<int>>&,
+      const MeshResolutionInfo&, double complexityPenalty=0.025);
+};
 }

@@ -1,4 +1,6 @@
 #include "CadMesh/SurfaceFitting.h"
+#include "CadMesh/CudaAnalyticFitting.h"
+#include "CadMesh/CudaAnalyticPrefetch.h"
 #include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
@@ -6,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <utility>
 
 namespace CadMesh {
 namespace {
@@ -196,6 +199,63 @@ bool Refine(const Cloud &cloud, Eigen::VectorXd &parameters,
   }
   return parameters.allFinite();
 }
+
+// Upload one normalized cloud and all of a model's initial guesses together.
+// Consume results in the original seed order: CPU fallback remains lazy, so a
+// torus's early success still avoids refining its unused seeds on the CPU.
+class RefineCandidates {
+public:
+  RefineCandidates(const Cloud &cloud, PatchSurfaceType type,
+                   const std::vector<Eigen::VectorXd> &initial, int iterations)
+      : mCloud(cloud), mInitial(initial), mIterations(iterations) {
+    if (initial.empty()) return;
+    mParameters.resize(initial.size());
+    for (size_t i = 0; i < initial.size(); ++i) {
+      if (initial[i].size() > 8) return;
+      mParameters[i].fill(0);
+      for (Eigen::Index j = 0; j < initial[i].size(); ++j)
+        mParameters[i][size_t(j)] = initial[i][j];
+    }
+    std::vector<std::array<double, 4>> samples;
+    samples.reserve(cloud.Samples.size());
+    for (const auto &sample : cloud.Samples)
+      samples.push_back({sample.Point.x(), sample.Point.y(), sample.Point.z(),
+                         sample.Weight});
+    mOnCuda = RefineAnalyticSeedsPrepared(type, samples, mParameters, mValid,
+                                     iterations) &&
+              mParameters.size() == initial.size() &&
+              mValid.size() == initial.size();
+  }
+
+  template <typename Residual, typename Valid>
+  bool refine(size_t index, Eigen::VectorXd &parameters,
+              Residual residual, Valid valid) const {
+    parameters = mInitial[index];
+    if (!valid(parameters)) return false;
+    if (mOnCuda && mValid[index]) {
+      Eigen::VectorXd proposal = parameters;
+      for (Eigen::Index j = 0; j < proposal.size(); ++j)
+        proposal[j] = mParameters[index][size_t(j)];
+      // Keep the fitter's original bounds as the authority even if a device
+      // solver reports success. Never start CPU fallback from a failed device
+      // iterate; it must receive the same initial guess as the old path.
+      if (valid(proposal)) {
+        parameters = std::move(proposal);
+        return true;
+      }
+    }
+    return Refine(mCloud, parameters, residual, valid, mIterations);
+  }
+
+private:
+  const Cloud &mCloud;
+  const std::vector<Eigen::VectorXd> &mInitial;
+  int mIterations;
+  bool mOnCuda = false;
+  std::vector<std::array<double, 8>> mParameters;
+  std::vector<unsigned char> mValid;
+};
+
 V Axis(const Eigen::VectorXd &p) { return p.segment<3>(3).normalized(); }
 bool AxisValid(const Eigen::VectorXd &p) {
   return p.allFinite() && p.segment<3>(3).norm() > .1 &&
@@ -233,18 +293,25 @@ bool CylinderSurfaceFitter::fit(const MeshTopology &mesh, const std::vector<int>
       curvatureAxis += mesh.getTriangles()[id].Area * geometry.Confidence * direction;
     }
   if (curvatureAxis.norm() > 1e-20) candidates.push_back(curvatureAxis.normalized());
-  double best = std::numeric_limits<double>::infinity();
+  std::vector<Eigen::VectorXd> seeds;
+  seeds.reserve(candidates.size());
   for (const V &axis : candidates) {
     V center; double radius;
     if (!Circle(c.Points, axis, center, radius)) continue;
     Eigen::VectorXd parameters(7);
     parameters << center, axis, radius;
-    auto residual = [](const V &p, const Eigen::VectorXd &x) {
-      const V d = p - x.head<3>(), a = Axis(x);
-      return (d - d.dot(a) * a).norm() - x[6];
-    };
-    auto valid = [](const Eigen::VectorXd &x) { return AxisValid(x) && x[6] > 1e-7 && x[6] < 1e4; };
-    if (!Refine(c, parameters, residual, valid, 18)) continue;
+    seeds.push_back(std::move(parameters));
+  }
+  auto residual = [](const V &p, const Eigen::VectorXd &x) {
+    const V d = p - x.head<3>(), a = Axis(x);
+    return (d - d.dot(a) * a).norm() - x[6];
+  };
+  auto valid = [](const Eigen::VectorXd &x) { return AxisValid(x) && x[6] > 1e-7 && x[6] < 1e4; };
+  RefineCandidates refinements(c, PatchSurfaceType::Cylinder, seeds, 18);
+  double best = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < seeds.size(); ++i) {
+    Eigen::VectorXd parameters;
+    if (!refinements.refine(i, parameters, residual, valid)) continue;
     const V a = Axis(parameters), o = parameters.head<3>();
     double rms, maximum, normal;
     Errors(c, [&](const V &p) { return residual(p, parameters); }, [&](const V &p) -> V {
@@ -279,7 +346,9 @@ bool SphereSurfaceFitter::fit(const MeshTopology &mesh, const std::vector<int> &
   for (const auto &p : c.Points) parameters[3] += p.Weight * (p.Point - parameters.head<3>()).norm();
   auto residual = [](const V &p, const Eigen::VectorXd &x) { return (p - x.head<3>()).norm() - x[3]; };
   auto valid = [](const Eigen::VectorXd &x) { return x.allFinite() && x.head<3>().norm() < 1e4 && x[3] > 1e-7 && x[3] < 1e4; };
-  if (!Refine(c, parameters, residual, valid, 20)) return false;
+  const std::vector<Eigen::VectorXd> seeds{parameters};
+  RefineCandidates refinements(c, PatchSurfaceType::Sphere, seeds, 20);
+  if (!refinements.refine(0, parameters, residual, valid)) return false;
   const V center = parameters.head<3>();
   Errors(c, [&](const V &p) { return residual(p, parameters); },
          [&](const V &p) -> V { return p - center; }, mRms, mMax, mNormal);
@@ -323,7 +392,9 @@ bool ConeSurfaceFitter::fit(const MeshTopology &mesh, const std::vector<int> &tr
   auto valid = [](const Eigen::VectorXd &x) {
     return AxisValid(x) && x[6] > .00872664626 && x[6] < Pi / 2 - .00872664626;
   };
-  if (!Refine(c, parameters, residual, valid, 32)) return false;
+  const std::vector<Eigen::VectorXd> seeds{parameters};
+  RefineCandidates refinements(c, PatchSurfaceType::Cone, seeds, 32);
+  if (!refinements.refine(0, parameters, residual, valid)) return false;
   const V a = Axis(parameters), o = parameters.head<3>();
   double minZ = 1e100, maxZ = -1e100;
   for (const auto &p : c.Points) {
@@ -417,9 +488,11 @@ bool TorusSurfaceFitter::fit(const MeshTopology &mesh, const std::vector<int> &t
   auto valid = [](const Eigen::VectorXd &x) {
     return AxisValid(x) && x[7] > 1e-4 && x[6] > 1.005 * x[7] && x[6] < 100;
   };
+  RefineCandidates refinements(c, PatchSurfaceType::Torus, seeds, 45);
   double best = 1e100;
-  for (auto parameters : seeds) {
-    if (!Refine(c, parameters, residual, valid, 45)) continue;
+  for (size_t i = 0; i < seeds.size(); ++i) {
+    Eigen::VectorXd parameters;
+    if (!refinements.refine(i, parameters, residual, valid)) continue;
     const V a = Axis(parameters), o = parameters.head<3>();
     double rms, maximum, normal;
     Errors(c, [&](const V &p) { return residual(p, parameters); }, [&](const V &p) -> V {
@@ -488,5 +561,74 @@ SurfaceFitResult SurfaceModelSelector::fitBest(const MeshTopology &mesh,
   return {PatchSurfaceType::Freeform, freeform.computeRmsError(), freeform.computeMaxError(),
           freeform.computeNormalError(),
           10.0 + freeform.computeRmsError() / std::max(r.FittingTolerance, 1e-30), {}};
+}
+std::vector<SurfaceFitResult> SurfaceModelSelector::fitBestBatch(
+    const MeshTopology &mesh, const std::vector<std::vector<int>> &supports,
+    const MeshResolutionInfo &r, double penalty) {
+  std::vector<SurfaceFitResult> results(supports.size());
+  if (!CudaAnalyticFitAvailable()) {
+    for (size_t i = 0; i < supports.size(); ++i)
+      results[i] = fitBest(mesh, supports[i], r, penalty);
+    return results;
+  }
+  const double rmsLimit = std::max(8 * r.FittingTolerance, .01 * r.MedianEdgeLength);
+  const double maxLimit = std::max(20 * r.FittingTolerance, .03 * r.MedianEdgeLength);
+  const double normalLimit = std::max(12 * r.AngularTolerance, .12);
+  const auto makeFitter = [](int stage) -> std::unique_ptr<ISurfaceFitter> {
+    switch (stage) {
+    case 0: return std::make_unique<PlaneSurfaceFitter>();
+    case 1: return std::make_unique<CylinderSurfaceFitter>();
+    case 2: return std::make_unique<ConeSurfaceFitter>();
+    case 3: return std::make_unique<SphereSurfaceFitter>();
+    default: return std::make_unique<TorusSurfaceFitter>();
+    }
+  };
+  std::vector<unsigned char> finished(supports.size(), 0);
+  // Model order, scoring, strict tie-breaking and early exit match fitBest.
+  // No speculative higher-complexity model is run after an exact fit.
+  CudaAnalyticSeedPrefetch prepared("independent component fits", false);
+  for (size_t begin = 0; begin < supports.size(); begin += 8) {
+    const size_t end = std::min(supports.size(), begin + 8);
+    for (int stage = 0; stage < 5; ++stage) {
+      std::vector<std::unique_ptr<ISurfaceFitter>> fitters(end - begin);
+      std::vector<unsigned char> deferred(end - begin, 0), fitted(end - begin, 0);
+      const bool collect = stage > 0 && prepared.enabled();
+      if (collect) prepared.begin();
+      for (size_t i = begin; i < end; ++i) {
+        if (finished[i]) continue;
+        auto &f = fitters[i - begin];
+        f = makeFitter(stage);
+        try { fitted[i - begin] = f->fit(mesh, supports[i]); }
+        catch (const AnalyticSeedDeferred &) { deferred[i - begin] = 1; }
+      }
+      if (collect) prepared.flush();
+      for (size_t i = begin; i < end; ++i) {
+        if (finished[i]) continue;
+        auto &f = fitters[i - begin];
+        if (deferred[i - begin]) fitted[i - begin] = f->fit(mesh, supports[i]);
+        if (!fitted[i - begin]) continue;
+        const double rms = f->computeRmsError(), maximum = f->computeMaxError();
+        const double normal = f->computeNormalError();
+        if (!std::isfinite(rms) || !std::isfinite(maximum) || !std::isfinite(normal) ||
+            rms > rmsLimit || maximum > maxLimit || normal > normalLimit) continue;
+        const double score = rms / std::max(r.FittingTolerance, 1e-30) +
+            .35 * maximum / std::max(r.FittingTolerance, 1e-30) +
+            .25 * normal / std::max(r.AngularTolerance, 1e-9) + penalty * (stage + 1);
+        if (score < results[i].Score)
+          results[i] = {f->getType(), rms, maximum, normal, score, f->getParameters()};
+        finished[i] = rms < .02 * r.FittingTolerance &&
+                      maximum < .05 * r.FittingTolerance && normal < .06;
+      }
+    }
+    for (size_t i = begin; i < end; ++i) {
+      if (results[i].Type != PatchSurfaceType::Unknown) continue;
+      FreeformSurfaceFitter freeform;
+      if (freeform.fit(mesh, supports[i]))
+        results[i] = {PatchSurfaceType::Freeform, freeform.computeRmsError(),
+            freeform.computeMaxError(), freeform.computeNormalError(),
+            10.0 + freeform.computeRmsError() / std::max(r.FittingTolerance, 1e-30), {}};
+    }
+  }
+  return results;
 }
 } // namespace CadMesh
