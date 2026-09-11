@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($InputStl)) {
-    $InputStl = Join-Path $projectRoot 'examples/222_li.stl'
+    $InputStl = Join-Path $projectRoot 'examples/3.stl'
 }
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
