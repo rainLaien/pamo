@@ -66,7 +66,7 @@ bool RemeshGlobalPatches(NativeRemeshResult &result,const CadMeshPatchSegmenter 
   AnalyticPatchRemeshReport report;
   RebuildAnalyticPatches(result.Vertices,result.Triangles,result.PatchIds,chartModels,config.TargetEdgeLength,
       config.MaximumDeviation,config.MaximumNormalDeviationDegrees,config.TargetMeanTriangleQuality,
-      excluded,rebuilt,report,false,false,false);
+      excluded,rebuilt,report,false,false,false,!config.DisableCuda);
   result.PatchReasons=report.PatchReasons;
   for(std::size_t id=0;id<chartModels.size();++id){
     if(!result.RequestedPatches[id])result.PatchReasons[id]=PatchRemeshReason::Unselected;

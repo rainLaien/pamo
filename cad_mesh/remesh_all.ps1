@@ -1,7 +1,7 @@
 param(
     [string]$PartitionDirectory = '',
     [string]$OutputDirectory = '',
-    [ValidateRange(1, 16)][int]$AnalyticWorkers = 4,
+    [ValidateRange(1, 128)][int]$AnalyticWorkers = 4,
     [ValidateRange(0.000001, 1000000000.0)][double]$TargetEdgeLength = 6.0,
     [ValidateRange(0.0, 1000000000.0)][double]$MaxDeviation = 0.1,
     [ValidateRange(0.000001, 180.0)][double]$MaxNormalDeviationDegrees = 10.0,

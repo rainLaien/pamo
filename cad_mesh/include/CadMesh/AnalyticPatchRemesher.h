@@ -39,6 +39,7 @@ bool RebuildAnalyticPatches(
     const std::vector<unsigned char> &excludedPatches,
     std::vector<unsigned char> &successfullyRebuilt,
     AnalyticPatchRemeshReport &report, bool verbose = false,
-    bool respectSurfaceFilter = true, bool validateResult = true);
+    bool respectSurfaceFilter = true, bool validateResult = true,
+    bool allowCuda = true);
 
 } // namespace CadMesh

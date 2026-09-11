@@ -1,7 +1,7 @@
 param(
     [string]$PartitionDirectory = '',
     [string]$OutputDirectory = '',
-    [ValidateRange(1, 16)][int]$AnalyticWorkers = 4,
+    [ValidateRange(1, 128)][int]$AnalyticWorkers = 4,
     [switch]$CpuAnalytic,
     [Alias('SimplePlanesOnly')][switch]$PlanesOnly,
     [switch]$CylindersOnly,

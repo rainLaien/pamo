@@ -622,8 +622,11 @@ bool ProjectAnalytic(const MeshPatch &patch, Point3 &point) {
 }
 
 class CudaEdgeClassifier {
+  bool Enabled;
 public:
+  explicit CudaEdgeClassifier(bool enabled=true):Enabled(enabled){}
   bool available() const {
+    if(!Enabled)return false;
 #ifdef _WIN32
     return true;
 #else
@@ -1562,8 +1565,11 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
     if (edgeId < 0 || edgeId >= int(mesh.getEdges().size())) continue;
     const auto &edge = mesh.getEdges()[edgeId]; constraints.insert(Key(edge.Vertex0, edge.Vertex1));
   }
-  if (config.Verbose) std::clog << "[CadMesh] native remesh: initializing CUDA" << std::endl;
-  CudaEdgeClassifier cuda;
+  if (config.DisableCuda && config.RequireCuda) {
+    error = "CPU mode conflicts with RequireCuda"; return false;
+  }
+  if (config.Verbose) std::clog << (config.DisableCuda ? "[CadMesh] native remesh: CPU thread pools" : "[CadMesh] native remesh: initializing CUDA") << std::endl;
+  CudaEdgeClassifier cuda(!config.DisableCuda);
   if (config.RequireCuda && !cuda.available()) {
     error = "native remesh CUDA Driver/NVRTC runtime is unavailable"; return false;
   }

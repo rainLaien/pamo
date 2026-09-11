@@ -21,7 +21,7 @@ int Run(int argc, char **argv) {
                  "[--max-normal-deviation-deg value] [--target-mean-quality value] "
                  "[--split-passes count] [--collapse-passes count] "
                  "[--flip-passes count] [--relax-iterations count] "
-                 "[--require-remesh-cuda] "
+                 "[--require-remesh-cuda | --cpu] "
                  "[--remesh-handoff] "
                  "[--stop-after-partition] "
                  "[--partition-snapshot (input is a prepared native snapshot)] "
@@ -39,6 +39,10 @@ int Run(int argc, char **argv) {
   std::clog.setf(std::ios::unitbuf);
   for (int i = 3; i < argc; ++i) {
     std::string option = argv[i];
+    if (option == "--cpu") {
+      remeshConfig.DisableCuda = true;
+      continue;
+    }
     if (option == "--partition-snapshot") {
       partitionSnapshot = true;
       nativeRemesh = true;
@@ -136,6 +140,12 @@ int Run(int argc, char **argv) {
       std::cerr << "Unknown option or value out of range: " << option << '\n';
       return 2;
     }
+  }
+  if (remeshConfig.DisableCuda) {
+    if (remeshConfig.RequireCuda)
+      throw std::invalid_argument("--cpu cannot be combined with --require-remesh-cuda");
+    config.ModelAnalyticSeedBackend = CadMesh::AnalyticSeedBackend::Cpu;
+    std::clog << "[CadMesh] CPU mode: CUDA disabled for fitting, boundaries and charts\n";
   }
   CadMesh::TriangleSoup soup;
   std::string error;

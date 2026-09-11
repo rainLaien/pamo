@@ -17,6 +17,7 @@ struct NativeRemeshConfig {
   int FlipPasses = 8;
   int RelaxIterations = 3;
   bool RequireCuda = false;
+  bool DisableCuda = false;
   bool Verbose = true;
   // Secondary Freeform partition only. Zero distance selects 0.0003 * target
   // length, capped by MaximumDeviation; remesh acceptance is unchanged.

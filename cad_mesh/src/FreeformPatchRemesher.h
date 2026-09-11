@@ -114,6 +114,7 @@ PreparedRemeshRegions PrepareRemeshRegions(
         if(globalConstraints.count(Key(vertexAliases[edge.Vertex0],vertexAliases[edge.Vertex1])))
           edge.IsConstrainedFeature=true;
       auto fitting=*partitionConfig;fitting.EnableModelFirst=true;fitting.Verbose=false;
+      if(config.DisableCuda)fitting.ModelAnalyticSeedBackend=AnalyticSeedBackend::Cpu;
       auto children=PartitionBySurfaceModels(localMesh,fitting);
       std::vector<std::vector<int>> fittedRegions;
       std::vector<MeshPatch> fittedModels;

@@ -726,7 +726,7 @@ bool RebuildAnalyticPatches(
     double maximumNormalDeviationDegrees, double targetMeanQuality,
     const std::vector<unsigned char> &excludedPatches,
     std::vector<unsigned char> &successfullyRebuilt,
-    AnalyticPatchRemeshReport &report, bool verbose,bool respectSurfaceFilter,bool validateResult) {
+    AnalyticPatchRemeshReport &report, bool verbose,bool respectSurfaceFilter,bool validateResult,bool allowCuda) {
   using Clock=std::chrono::steady_clock;
   successfullyRebuilt.assign(patches.size(), 0); report = {};
   report.PatchReasons.assign(patches.size(),PatchRemeshReason::Unknown);
@@ -758,7 +758,7 @@ bool RebuildAnalyticPatches(
     return patches[id].SurfaceType==(conesOnly?PatchSurfaceType::Cone:cylindersOnly?PatchSurfaceType::Cylinder:PatchSurfaceType::Plane);
   };
   const char *cudaSetting = std::getenv("CADMESH_REMESH_CHART_CUDA");
-  const bool useChartCuda = !cudaSetting || std::string(cudaSetting) != "0";
+  const bool useChartCuda = allowCuda && (!cudaSetting || std::string(cudaSetting) != "0");
   const auto prepare = [&](int patchId) {
     PreparedChart result;
     const auto &patch = patches[patchId];
@@ -856,8 +856,8 @@ bool RebuildAnalyticPatches(
   if (const char *setting = std::getenv("CADMESH_REMESH_THREADS")) {
     char *end = nullptr;
     const long value = std::strtol(setting, &end, 10);
-    if (end == setting || *end || value < 1 || value > 16)
-      throw std::invalid_argument("CADMESH_REMESH_THREADS must be 1..16");
+    if (end == setting || *end || value < 1 || value > 128)
+      throw std::invalid_argument("CADMESH_REMESH_THREADS must be 1..128");
     workerCount = int(value);
   }
   const auto rebuildStart = Clock::now();
