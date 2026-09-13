@@ -45,6 +45,10 @@ endif()
 
 add_executable(cad_mesh_segment app/cad_mesh_segment.cpp)
 target_link_libraries(cad_mesh_segment PRIVATE CadMesh)
+add_executable(cad_mesh_generic app/cad_mesh_generic.cpp)
+target_link_libraries(cad_mesh_generic PRIVATE CadMesh)
+add_executable(cad_mesh_quality app/cad_mesh_quality.cpp)
+target_compile_features(cad_mesh_quality PRIVATE cxx_std_17)
 
 if(CADMESH_BUILD_TESTS)
     enable_testing()

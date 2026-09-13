@@ -26,6 +26,7 @@ struct NativeRemeshConfig {
   double SecondaryPlaneMinimumAreaRatio = .25; // area / target length squared
   double GenericFeatureAngleDegrees = 10;
   int GenericRemeshIterations = 5;
+  bool GenericAnalyticGuides = false;
   int GenericRemeshWorkers = 20;
   // Internal local-operation policy; configured by the isotropic driver.
   double CollapseLengthRatio = .65;
@@ -88,6 +89,8 @@ struct NativeRemeshResult {
 
 class NativeRemesher {
 public:
+  static bool genericRemesh(const TriangleSoup &,const NativeRemeshConfig &,
+      const std::filesystem::path &,std::string &error);
   // Samples shared boundaries, rebuilds analytic and Freeform subregions, then
   // compacts the indexed mesh. No post-remesh deviation/collision rollback;
   // failed construction regions retain input while successful regions survive.

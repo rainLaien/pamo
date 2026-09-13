@@ -1,6 +1,7 @@
 #include "CadMesh/CudaAnalyticFitting.h"
 #include "CadMesh/AnalyticPatchRemesher.h"
 #include "CadMesh/NativeRemesher.h"
+#include "CadMesh/SurfaceFitting.h"
 #include "CadMesh/ModelFirstPartitioner.h"
 #include "RemeshWorkerPool.h"
 #include <algorithm>
@@ -1474,6 +1475,7 @@ int RelaxVertices(std::vector<Point3> &vertices,
 #include "IsotropicPatchRemesher.h"
 #include "FreeformPatchRemesher.h"
 #include "GlobalPatchRemesher.h"
+#include "GenericSurfaceRemesher.h"
 
 void Compact(NativeRemeshResult &result, std::unordered_set<EdgeKey> &constraints) {
   std::vector<unsigned char> used(result.Vertices.size(), 0);
@@ -1537,6 +1539,18 @@ std::array<int, 3> Color(int id) {
   return {64 + int(value & 127), 64 + int((value >> 8) & 127), 64 + int((value >> 16) & 127)};
 }
 } // namespace
+
+bool NativeRemesher::genericRemesh(const TriangleSoup &soup,const NativeRemeshConfig &config,
+    const std::filesystem::path &directory,std::string &error){
+  if(!(std::isfinite(config.TargetEdgeLength) && config.TargetEdgeLength>0
+       && std::isfinite(config.MaximumDeviation) && config.MaximumDeviation>0
+       && config.MaximumNormalDeviationDegrees>0 && config.MaximumNormalDeviationDegrees<90
+       && config.GenericFeatureAngleDegrees>0 && config.GenericFeatureAngleDegrees<180
+       && config.GenericRemeshIterations>=1 && config.GenericRemeshIterations<=30)){
+    error="invalid generic remesh settings";return false;
+  }
+  return GenericSurface::execute(soup,config,directory,error);
+}
 
 bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
                             const NativeRemeshConfig &config,
