@@ -1,11 +1,62 @@
 // Flat registry construction followed by global remesh scheduling.
+void ReconcileAnalyticBoundaries(std::vector<Point3> &vertices,
+    std::vector<std::array<int,3>> &faces,std::vector<int> &labels,
+    std::vector<std::array<int,3>> &referenceFaces,std::vector<int> &referenceLabels,
+    std::unordered_set<EdgeKey> &constraints,const std::vector<AnalyticBoundarySample> &samples){
+  std::unordered_map<EdgeKey,std::vector<AnalyticBoundarySample>> groups;
+  for(auto sample:samples){if(sample.A>sample.B){std::swap(sample.A,sample.B);sample.Parameter=1-sample.Parameter;}
+    groups[Key(sample.A,sample.B)].push_back(sample);}
+  std::unordered_map<int,int> aliases;
+  std::unordered_map<EdgeKey,std::vector<int>> chains;
+  for(auto &entry:groups){auto &list=entry.second;const int a=list[0].A,b=list[0].B;
+    std::sort(list.begin(),list.end(),[](const auto &x,const auto &y){
+      return x.Parameter!=y.Parameter?x.Parameter<y.Parameter:x.Vertex<y.Vertex;});
+    std::vector<int> unionIds{a};std::vector<double> parameters{0};
+    std::unordered_map<int,std::vector<int>> owners;
+    for(const auto &s:list){
+      if(s.Parameter-parameters.back()>1e-10){unionIds.push_back(s.Vertex);parameters.push_back(s.Parameter);}
+      aliases[s.Vertex]=unionIds.back();owners[s.Patch].push_back(int(unionIds.size())-1);
+    }
+    unionIds.push_back(b);
+    const auto addInterval=[&](int low,int high){
+      std::vector<int> chain(unionIds.begin()+low,unionIds.begin()+high+1);
+      if(chain.front()>chain.back())std::reverse(chain.begin(),chain.end());
+      chains[Key(chain.front(),chain.back())]=std::move(chain);
+    };
+    addInterval(0,int(unionIds.size())-1);
+    for(auto &owner:owners){auto &path=owner.second;path.push_back(0);path.push_back(int(unionIds.size())-1);
+      std::sort(path.begin(),path.end());path.erase(std::unique(path.begin(),path.end()),path.end());
+      for(std::size_t j=1;j<path.size();++j)addInterval(path[j-1],path[j]);}
+    constraints.erase(entry.first);
+    for(std::size_t j=1;j<unionIds.size();++j)constraints.insert(Key(unionIds[j-1],unionIds[j]));
+  }
+  const auto conform=[&](std::vector<std::array<int,3>> &input,std::vector<int> &ids){
+    std::vector<std::array<int,3>> output;std::vector<int> outputIds;
+    output.reserve(input.size());outputIds.reserve(ids.size());
+    for(std::size_t i=0;i<input.size();++i){auto f=input[i];
+      for(int &v:f){auto found=aliases.find(v);if(found!=aliases.end())v=found->second;}
+      std::vector<int> perimeter;
+      for(int k=0;k<3;++k){const int a=f[k],b=f[(k+1)%3];perimeter.push_back(a);
+        auto found=chains.find(Key(a,b));if(found==chains.end())continue;const auto &chain=found->second;
+        if(chain.front()==a)for(std::size_t j=1;j+1<chain.size();++j)perimeter.push_back(chain[j]);
+        else for(int j=int(chain.size())-2;j>0;--j)perimeter.push_back(chain[j]);
+      }
+      if(perimeter.size()==3){output.push_back(f);outputIds.push_back(ids[i]);continue;}
+      const int center=int(vertices.size());vertices.push_back(ToPoint(Mul(Add(Add(ToVec(vertices[f[0]]),ToVec(vertices[f[1]])),ToVec(vertices[f[2]])),1.0/3)));
+      for(std::size_t j=0;j<perimeter.size();++j){output.push_back({perimeter[j],perimeter[(j+1)%perimeter.size()],center});outputIds.push_back(ids[i]);}
+    }
+    input.swap(output);ids.swap(outputIds);
+  };
+  conform(faces,labels);conform(referenceFaces,referenceLabels);
+}
+
 bool RemeshGlobalPatches(NativeRemeshResult &result,const CadMeshPatchSegmenter &segmenter,
     const NativeRemeshConfig &config,std::unordered_set<EdgeKey> &constraints,
     bool planesOnly,bool cylindersOnly,bool conesOnly,bool othersOnly,std::string &error){
   using Clock=std::chrono::steady_clock;
   const auto started=Clock::now();
   const auto &sourcePatches=segmenter.getPatches();
-  const auto baseFaces=result.Triangles;
+  auto baseFaces=result.Triangles;
   std::vector<std::vector<int>> parents(sourcePatches.size());
   for(std::size_t f=0;f<baseFaces.size();++f){const int id=result.PatchIds[f];
     if(id<0 || std::size_t(id)>=parents.size()){error="invalid source patch ownership";return false;}
@@ -27,7 +78,8 @@ bool RemeshGlobalPatches(NativeRemeshResult &result,const CadMeshPatchSegmenter 
   for(std::size_t source=0;source<parents.size();++source){
     if(parents[source].empty())continue;
     const auto &model=sourcePatches[source];const auto type=model.SurfaceType;
-    const bool selected=(!planesOnly || type==PatchSurfaceType::Plane) &&
+    const bool selected=(config.SelectedSourcePatches.empty() || config.SelectedSourcePatches[source]) &&
+        (!planesOnly || type==PatchSurfaceType::Plane) &&
         (!cylindersOnly || type==PatchSurfaceType::Cylinder) && (!conesOnly || type==PatchSurfaceType::Cone) &&
         (!othersOnly || (type!=PatchSurfaceType::Plane && type!=PatchSurfaceType::Cylinder));
     if(!selected || type==PatchSurfaceType::Plane || type==PatchSurfaceType::Cylinder){
@@ -59,14 +111,41 @@ bool RemeshGlobalPatches(NativeRemeshResult &result,const CadMeshPatchSegmenter 
   const double partitionSeconds=std::chrono::duration<double>(Clock::now()-started).count();
   std::vector<std::vector<std::array<int,3>>> originals(result.OutputPatches.size()),replacements(result.OutputPatches.size());
   for(std::size_t f=0;f<baseFaces.size();++f)originals[result.PatchIds[f]].push_back(baseFaces[f]);
+  auto referenceLabels=result.PatchIds;
   auto chartModels=result.OutputPatches;
   for(std::size_t id=0;id<chartModels.size();++id)
     if(!result.RequestedPatches[id] || preserved[id])chartModels[id].ProjectionTarget=PatchProjectionTarget::ReferenceMesh;
   std::vector<unsigned char> excluded(chartModels.size(),0),rebuilt;
   AnalyticPatchRemeshReport report;
-  RebuildAnalyticPatches(result.Vertices,result.Triangles,result.PatchIds,chartModels,config.TargetEdgeLength,
-      config.MaximumDeviation,config.MaximumNormalDeviationDegrees,config.TargetMeanTriangleQuality,
-      excluded,rebuilt,report,false,false,false,!config.DisableCuda);
+  // Curved ruled domains first; adjacent analytic domains then consume the
+  // same original boundary IDs. Physical seam subdivision is deferred until
+  // both phases and generic remeshing finish.
+  for(int phase=0;phase<2;++phase){
+    auto models=chartModels;
+    for(auto &model:models){const bool ruled=model.SurfaceType==PatchSurfaceType::Cylinder || model.SurfaceType==PatchSurfaceType::Cone;
+      if(ruled!=(phase==0))model.ProjectionTarget=PatchProjectionTarget::ReferenceMesh;
+    }
+    AnalyticPatchRemeshReport current;std::vector<unsigned char> currentRebuilt;
+    RebuildAnalyticPatches(result.Vertices,result.Triangles,result.PatchIds,models,config.TargetEdgeLength,
+        config.MaximumDeviation,config.MaximumNormalDeviationDegrees,config.TargetMeanTriangleQuality,
+        excluded,currentRebuilt,current,false,false,false,!config.DisableCuda);
+    if(phase==0){
+      if(!current.BoundarySamples.empty()){
+        ReconcileAnalyticBoundaries(result.Vertices,result.Triangles,result.PatchIds,baseFaces,referenceLabels,constraints,current.BoundarySamples);
+        for(auto &list:originals)list.clear();
+        for(std::size_t f=0;f<baseFaces.size();++f)originals[referenceLabels[f]].push_back(baseFaces[f]);
+      }
+      if(config.Verbose)std::clog << "[CadMesh] ruled-first boundary handoff: proposals=" << current.BoundarySamples.size()
+          << "; shared vertex sequences reconciled before adjacent charts" << std::endl;
+      report=std::move(current);rebuilt=std::move(currentRebuilt);
+    }
+    else{report.ChartSeconds+=current.ChartSeconds;
+      for(std::size_t id=0;id<models.size();++id){const auto type=chartModels[id].SurfaceType;
+        if(type!=PatchSurfaceType::Cylinder && type!=PatchSurfaceType::Cone){
+          report.PatchReasons[id]=current.PatchReasons[id];report.FailureDetails[id]=current.FailureDetails[id];rebuilt[id]=currentRebuilt[id];}
+      }
+    }
+  }
   result.PatchReasons=report.PatchReasons;
   for(std::size_t id=0;id<chartModels.size();++id){
     if(!result.RequestedPatches[id])result.PatchReasons[id]=PatchRemeshReason::Unselected;
@@ -108,10 +187,41 @@ bool RemeshGlobalPatches(NativeRemeshResult &result,const CadMeshPatchSegmenter 
         << ", reason=" << PatchRemeshReasonName(out.Reason) << ", detail=" << out.Detail << std::endl;
   }
   std::vector<unsigned char> generic(chartModels.size(),0);for(int id:jobs)generic[id]=1;
+  // Acceptance is relative to the immutable input subpatch, not just the
+  // fitted analytic model. Reject only the affected output child region.
+  std::vector<std::vector<std::array<int,3>>> candidates(chartModels.size());
+  for(std::size_t f=0;f<result.Triangles.size();++f)candidates[result.PatchIds[f]].push_back(result.Triangles[f]);
+  for(int id:jobs)if(rebuilt[id])candidates[id]=std::move(replacements[id]);
+  size_t shapeRejected=0;
+  for(std::size_t id=0;id<candidates.size();++id)if(rebuilt[id]){
+    // The guard never accepts another patch as reference. Index only this
+    // source region rather than traversing unrelated large planar boxes.
+    const std::vector<int> localLabels(originals[id].size(),int(id));
+    const SurfaceIndex reference(sourceVertices,originals[id],localLabels);
+    ReferenceDeviationGuard deviation{reference,config.MaximumDeviation};
+    bool valid=!candidates[id].empty();deviation.Hint=-1;
+    const char *failure="empty_mesh";double measured=0;
+    for(const auto &t:candidates[id]){
+      const std::array<Point3,3> p{result.Vertices[t[0]],result.Vertices[t[1]],result.Vertices[t[2]]};
+      if(!deviation.accepts(p,int(id))){failure="reference_distance";measured=deviation.LastDistance;valid=false;break;}
+      SpatialTriangle hit;double distance=0;
+      const Point3 center=ToPoint(Mul(Add(Add(ToVec(p[0]),ToVec(p[1])),ToVec(p[2])),1.0/3));
+      const Vec3 normal=Normalize(Cross(Sub(ToVec(p[1]),ToVec(p[0])),Sub(ToVec(p[2]),ToVec(p[0]))));
+      if(!reference.closestTriangle(center,int(id),hit,distance)){failure="reference_missing";valid=false;break;}
+      const Vec3 sourceNormal=Normalize(Cross(Sub(ToVec(hit.Points[1]),ToVec(hit.Points[0])),Sub(ToVec(hit.Points[2]),ToVec(hit.Points[0]))));
+      if(Dot(normal,sourceNormal)<std::cos(config.MaximumNormalDeviationDegrees*std::acos(-1.0)/180)){
+        failure="reference_normal";measured=std::acos(std::clamp(Dot(normal,sourceNormal),-1.0,1.0))*180/std::acos(-1.0);valid=false;break;}
+    }
+    if(!valid){++shapeRejected;rebuilt[id]=0;candidates[id]=originals[id];
+      result.PatchReasons[id]=PatchRemeshReason::Deviation;
+      if(config.Verbose)std::clog << "[CadMesh] remesh shape rejected: patch_id=" << id
+          << ", source_patch_id=" << result.SourcePatchIds[id] << ", failure=" << failure << ", measured=" << measured << "; retained_original_child" << std::endl;
+    }
+  }
+  if(config.Verbose)std::clog << "[CadMesh] reference shape guard: rejected_children=" << shapeRejected
+      << ", distance_limit=" << config.MaximumDeviation << ", normal_limit_deg=" << config.MaximumNormalDeviationDegrees << std::endl;
   std::vector<std::array<int,3>> assembled;std::vector<int> labels;
-  for(std::size_t f=0;f<result.Triangles.size();++f){const int id=result.PatchIds[f];
-    if(generic[id] && rebuilt[id])continue;assembled.push_back(result.Triangles[f]);labels.push_back(id);}
-  for(int id:jobs)if(rebuilt[id])for(auto face:replacements[id]){assembled.push_back(face);labels.push_back(id);}
+  for(std::size_t id=0;id<candidates.size();++id)for(auto face:candidates[id]){assembled.push_back(face);labels.push_back(int(id));}
   result.Triangles.swap(assembled);result.PatchIds.swap(labels);result.RemeshedPatches=rebuilt;
   result.FaceRemeshed.clear();result.FaceReasons.clear();std::array<std::size_t,4> faceCounts{};
   for(auto &patch:result.OutputPatches)patch.TriangleIds.clear();

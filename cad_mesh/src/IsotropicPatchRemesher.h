@@ -23,6 +23,17 @@ struct Mesh {
   std::map<EdgeKey,std::set<int>> edges;
   std::unordered_set<EdgeKey> hard,crease;
   std::unordered_set<int> fixed;
+  std::function<bool(const std::array<Point3,3>&)> acceptGeometry;
+  std::function<Point3(const Point3&)> projectPoint;
+  bool accepts(const std::array<Point3,3>&p)const{return !acceptGeometry || acceptGeometry(p);}
+  Point3 project(const Point3&p)const{return projectPoint?projectPoint(p):p;}
+  bool moveVertex(int v,const Point3 &proposal){
+    const Point3 next=project(proposal);
+    for(int id:incident[v]){std::array<Point3,3> p;
+      for(int k=0;k<3;++k)p[k]=F[id][k]==v?next:P[F[id][k]];
+      if(!accepts(p))return false;}
+    P[v]=next;return true;
+  }
   Mesh(std::vector<Point3>&p,std::vector<Triangle>&f,const std::unordered_set<EdgeKey>&boundary):P(p),F(f),hard(boundary){
     for(auto key:hard){fixed.insert(KeyFirst(key));fixed.insert(KeySecond(key));}
     rebuild();
@@ -95,7 +106,7 @@ struct Mesh {
     if(!relaxed && Distance(P[a],P[b])>=minimum && area>=minimum*minimum/100)return false;
     const bool ma=movable(a,b),mb=movable(b,a);if(!ma && !mb)return false;
     const int drop=ma?a:b,keep=ma?b:a;
-    const Point3 midpoint=ma&&mb?ToPoint(Mul(Add(ToVec(P[a]),ToVec(P[b])),.5)):P[keep];
+    const Point3 midpoint=ma&&mb?project(ToPoint(Mul(Add(ToVec(P[a]),ToVec(P[b])),.5))):P[keep];
     auto na=neighbors(a),nb=neighbors(b);std::vector<int> common;
     std::set_intersection(na.begin(),na.end(),nb.begin(),nb.end(),std::back_inserter(common));
     if(common.size()!=2)return false;
@@ -105,6 +116,7 @@ struct Mesh {
       if(tri[0]==tri[1] || tri[1]==tri[2] || tri[2]==tri[0])continue;
       auto canonical=tri;std::sort(canonical.begin(),canonical.end());if(!unique.insert(canonical).second)return false;
       const auto pos=[&](int v)->const Point3&{return v==keep?midpoint:P[v];};
+      if(!accepts({pos(tri[0]),pos(tri[1]),pos(tri[2])}))return false;
       if(Quality(pos(tri[0]),pos(tri[1]),pos(tri[2]))<=.5*quality(id))return false;
       const auto cross=Cross(Sub(ToVec(pos(tri[1])),ToVec(pos(tri[0]))),Sub(ToVec(pos(tri[2])),ToVec(pos(tri[0]))));
       if(Norm(cross)<=0 || Dot(Normalize(cross),normal(id))<.7)return false;
@@ -133,6 +145,7 @@ struct Mesh {
       int d=-1;for(int v:F[other])if(v!=a && v!=b)d=v;
       if(d<0 || d==c || edges.count(Key(c,d)))continue;
       const Triangle t0{a,d,c},t1{b,c,d};
+      if(!accepts({P[a],P[d],P[c]}) || !accepts({P[b],P[c],P[d]}))continue;
       const auto error=[&](int v,int delta){return std::abs(int(neighbors(v).size())+delta-(border(v)?4:6));};
       const int before=error(a,0)+error(b,0)+error(c,0)+error(d,0),after=error(a,-1)+error(b,-1)+error(c,1)+error(d,1);
       const double oldQ=std::min(quality(id),quality(other)),newQ=std::min(Quality(P[a],P[d],P[c]),Quality(P[b],P[c],P[d]));
@@ -154,7 +167,7 @@ struct Mesh {
   std::size_t smooth(){std::vector<Vec3>sums;std::vector<int>counts;accumulate(sums,counts);std::size_t moved=0;
     for(int v=0;v<int(P.size());++v)if(counts[v] && !featureVertex(v) && !border(v) && manifold(v)){
       const auto average=Mul(Add(ToVec(P[v]),sums[v]),1.0/(counts[v]+1));
-      const auto next=ToPoint(Add(Mul(ToVec(P[v]),.8),Mul(average,.2)));moved+=Distance(next,P[v])>0;P[v]=next;}
+      const auto next=ToPoint(Add(Mul(ToVec(P[v]),.8),Mul(average,.2)));if(moveVertex(v,next))++moved;}
     std::vector<unsigned char> folded(P.size(),0);const double foldCos=std::cos(140*std::acos(-1.0)/180);
     for(const auto &e:edges)if(e.second.size()==2){auto it=e.second.begin();const int a=*it++,b=*it;
       if(Dot(normal(a),normal(b))<=foldCos)for(int f:{a,b})for(int v:F[f])if(!featureVertex(v) && manifold(v))folded[v]=1;}
@@ -162,7 +175,7 @@ struct Mesh {
       // VCGLib FoldRelax commits in face order using a sweep-start accumulator.
       for(int id=0;id<int(F.size());++id)if(!dead[id]){auto next=std::array<Point3,3>{P[F[id][0]],P[F[id][1]],P[F[id][2]]};
         for(int k=0;k<3;++k){const int v=F[id][k];if(folded[v] && counts[v])next[k]=ToPoint(Mul(Add(ToVec(P[v]),sums[v]),1.0/(counts[v]+1)));}
-        for(int k=0;k<3;++k){const int v=F[id][k];moved+=Distance(next[k],P[v])>0;P[v]=next[k];}}
+        for(int k=0;k<3;++k){const int v=F[id][k];if(!featureVertex(v) && moveVertex(v,next[k]))++moved;}}
     }return moved;
   }
 };
@@ -173,14 +186,25 @@ void RemeshIsotropicPatch(std::vector<Point3> &points,std::vector<std::array<int
   const auto originalPoints=points;const auto originalFaces=faces;
   std::vector<int> labels(faces.size(),0);const SurfaceIndex reference(originalPoints,originalFaces,labels);
   NativeVcgRules::Mesh mesh(points,faces,constraints);mesh.tag(config.GenericFeatureAngleDegrees);
+  ReferenceDeviationGuard guard{reference,config.MaximumDeviation};
+  mesh.projectPoint=[&](const Point3&p){Point3 nearest;double distance=0;return reference.closest(p,0,nearest,distance)?nearest:p;};
+  mesh.acceptGeometry=[&](const std::array<Point3,3>&p){
+    if(!guard.accepts(p,0))return false;
+    const Vec3 normal=Normalize(Cross(Sub(ToVec(p[1]),ToVec(p[0])),Sub(ToVec(p[2]),ToVec(p[0]))));
+    const Point3 center=ToPoint(Mul(Add(Add(ToVec(p[0]),ToVec(p[1])),ToVec(p[2])),1.0/3));
+    SpatialTriangle hit;double distance=0;
+    if(!reference.closestTriangle(center,0,hit,distance))return false;
+    const Vec3 sourceNormal=Normalize(Cross(Sub(ToVec(hit.Points[1]),ToVec(hit.Points[0])),Sub(ToVec(hit.Points[2]),ToVec(hit.Points[0]))));
+    return Dot(normal,sourceNormal)>=std::cos(config.MaximumNormalDeviationDegrees*std::acos(-1.0)/180);
+  };
   const double minimum=config.TargetEdgeLength*.8,maximum=config.TargetEdgeLength*4/3;
   for(int iteration=0;iteration<std::max(1,config.GenericRemeshIterations);++iteration){
     const auto tick=std::chrono::steady_clock::now();const auto split=mesh.split(maximum);
     const auto collapse=mesh.collapsePass(minimum,maximum,false),crosses=mesh.collapsePass(minimum,maximum,true);
     mesh.compact();const auto flips=mesh.flip(),moved=mesh.smooth();
-    // Projection belongs after all local operators, not inside candidate tests.
+    // Projection and incident triangles are checked before each move commits.
     for(int v=0;v<int(points.size());++v)if(!mesh.incident[v].empty() && !mesh.fixed.count(v)){
-      Point3 nearest;double distance=0;if(reference.closest(points[v],0,nearest,distance))points[v]=nearest;}
+      mesh.moveVertex(v,points[v]);}
     if(config.Verbose)std::clog << "[CadMesh] native vcg-rules iteration: " << iteration+1
         << ", split=" << split << ", collapse=" << collapse << ", cross_collapse=" << crosses
         << ", flips=" << flips << ", smooth_updates=" << moved << ", faces=" << faces.size()
@@ -188,6 +212,6 @@ void RemeshIsotropicPatch(std::vector<Point3> &points,std::vector<std::array<int
   }
   aliases.resize(points.size(),-1);for(int v=0;v<int(aliases.size());++v)if(!mesh.fixed.count(v))aliases[v]=-1;
   if(config.Verbose)std::clog << "[CadMesh] native vcg-rules complete: feature_angle_deg=" << config.GenericFeatureAngleDegrees
-      << ", iterations=" << config.GenericRemeshIterations << ", surf_dist_check=off, cleanup=off, shared_boundaries=fixed"
+      << ", iterations=" << config.GenericRemeshIterations << ", surf_dist_check=on, rejected_candidates=" << guard.Rejected << ", shared_boundaries=fixed"
       << ", seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count() << std::endl;
 }

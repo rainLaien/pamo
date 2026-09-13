@@ -24,6 +24,7 @@ add_library(CadMesh
     src/SurfaceRoles.cpp
     src/PatchGraphBuilder.cpp
     src/NativeRemesher.cpp
+    src/WallThicknessCalculator.cpp
     src/DebugVisualizer.cpp
     src/StlReader.cpp)
 target_include_directories(CadMesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${VCGLIB_ROOT} ${VCGLIB_ROOT}/eigenlib)

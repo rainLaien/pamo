@@ -485,7 +485,7 @@ void CadMeshPatchSegmenter::RebuildConnectedPatches() {
             }
         }
       }
-      if (patch.TriangleIds.size() != original.TriangleIds.size())
+      if (!mConfig.ModelCylindersOnly && !mConfig.ModelConesOnly && patch.TriangleIds.size() != original.TriangleIds.size())
         ApplyFit(patch, Fit(mMesh, patch, mConfig));
       rebuilt.push_back(std::move(patch));
     }

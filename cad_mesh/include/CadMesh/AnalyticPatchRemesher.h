@@ -7,7 +7,14 @@
 
 namespace CadMesh {
 
+struct AnalyticBoundarySample {
+  int A=-1,B=-1,Vertex=-1;
+  double Parameter=0;
+  int Patch=-1;
+};
+
 struct AnalyticPatchRemeshReport {
+  std::vector<AnalyticBoundarySample> BoundarySamples;
   std::vector<PatchRemeshReason> PatchReasons;
   std::vector<std::string> FailureDetails;
   std::size_t Attempted = 0;

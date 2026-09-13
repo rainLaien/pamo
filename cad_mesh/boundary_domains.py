@@ -110,10 +110,12 @@ def prepare_surface_domains(source):
     roots = np.array([root(i) for i in range(count)])
     representatives, patch_to_domain = np.unique(roots, return_inverse=True)
     labels = patch_to_domain[source.face_patch_ids]
+    face_order = np.argsort(labels, kind="stable")
+    face_offsets = np.r_[0, np.cumsum(np.bincount(labels, minlength=len(representatives)))]
     output_patches = []
     for domain, representative in enumerate(representatives):
         patch = dict(patches[representative])
-        ids = np.flatnonzero(labels == domain)
+        ids = face_order[face_offsets[domain]:face_offsets[domain + 1]]
         originals = np.flatnonzero(patch_to_domain == domain)
         patch.update(id=domain, triangle_ids=ids, triangle_count=len(ids),
                      source_patch_ids=originals.tolist(),

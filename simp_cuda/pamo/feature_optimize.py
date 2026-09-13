@@ -46,19 +46,10 @@ def _build_edge_faces(faces):
 def _unique_edges(faces):
     if len(faces) == 0:
         return np.empty((0, 2), dtype=np.int64)
-    return np.unique(
-        np.sort(
-            np.vstack(
-                (
-                    faces[:, (0, 1)],
-                    faces[:, (1, 2)],
-                    faces[:, (2, 0)],
-                )
-            ),
-            axis=1,
-        ),
-        axis=0,
-    )
+    directed = np.sort(faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1)
+    radix = np.int64(faces.max()) + 1
+    keys = np.unique(directed[:, 0] * radix + directed[:, 1])
+    return np.column_stack((keys // radix, keys % radix))
 
 
 def _triangle_cross_products(vertices, faces):
@@ -123,7 +114,7 @@ def mesh_quality_metrics(vertices, faces, edges=None):
     )
 
     triangles = vertices[faces]
-    angle_values = []
+    maximum_cosine = -1.0
     for center, first, second in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
         first_vector = triangles[:, first] - triangles[:, center]
         second_vector = triangles[:, second] - triangles[:, center]
@@ -137,11 +128,12 @@ def mesh_quality_metrics(vertices, faces, edges=None):
             out=np.ones(len(faces), dtype=np.float64),
             where=denominator > 0.0,
         )
-        angle_values.append(
-            np.rad2deg(np.arccos(np.clip(cosine, -1.0, 1.0)))
-        )
+        if len(cosine):
+            maximum_cosine = np.maximum(maximum_cosine, cosine.max())
     minimum_angle = (
-        float(np.min(np.column_stack(angle_values)))
+        # arccos is monotone decreasing: reduce before evaluating it instead
+        # of allocating and converting all three angles of every triangle.
+        float(np.rad2deg(np.arccos(np.clip(maximum_cosine, -1.0, 1.0))))
         if len(faces)
         else 0.0
     )

@@ -80,11 +80,11 @@ bool CadMeshPatchSegmenter::loadRemeshSnapshot(const std::filesystem::path &path
       const int type = in.count(), analytic = in.count(), role = in.count();
       expectedFaces[id] = in.count();
       const int supportCount = in.count();
-      Require(type <= 6 && analytic <= 1 && role <= 1 && supportCount <= patchCount,
+      Require(type <= 6 && analytic <= 1 && role <= 2 && supportCount <= patchCount,
               "Invalid patch metadata");
       patch.SurfaceType = static_cast<PatchSurfaceType>(type);
       patch.ProjectionTarget = analytic ? PatchProjectionTarget::AnalyticSurface : PatchProjectionTarget::ReferenceMesh;
-      patch.FeatureRole = role ? PatchFeatureRole::Fillet : PatchFeatureRole::Ordinary;
+      patch.FeatureRole = static_cast<PatchFeatureRole>(role);
       for (int i = 0; i < supportCount; ++i) {
         int support = in.count(); Require(support < patchCount, "Invalid support patch");
         patch.SupportPatchIds.push_back(support);

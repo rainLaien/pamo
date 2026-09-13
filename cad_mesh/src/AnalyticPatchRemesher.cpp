@@ -156,9 +156,9 @@ bool MakeFrame(const MeshPatch &patch,
     double radius = 0;
     for (int id : boundary) {
       const Vec3 d = Sub(ToVec(vertices[id]), frame.Origin);
-      radius += Norm(Sub(d, Mul(frame.Axis, Dot(d, frame.Axis))));
+      radius = std::max(radius,Norm(Sub(d, Mul(frame.Axis, Dot(d, frame.Axis)))));
     }
-    frame.Radius = boundary.empty() ? 0 : radius / boundary.size();
+    frame.Radius = radius;
     if (!(frame.Radius > 0)) return false;
     frame.UPeriod = 2 * Pi * frame.Radius;
   } else if (const auto *p = std::get_if<SphereParameters>(&patch.Parameters)) {
@@ -301,6 +301,8 @@ bool EarClip(const std::vector<UV> &points,
 }
 
 struct Chart {
+  std::vector<std::array<int,2>> InteriorConstraints;
+  std::vector<AnalyticBoundarySample> BoundarySamples; // Vertex is chart-local until commit
   Frame Surface;
   std::vector<UV> Points;
   std::vector<int> Aliases;
@@ -670,6 +672,7 @@ struct PreparedChart {
   enum Status { Skip, Collision, Deviation, Topology, Parameterization, GpuPending, Ready } State = Skip;
   Chart Value;
   double Target = 0;
+  double AxialTarget = 0;
   bool UsedCuda = false;
   bool SeededPlanar = false;
   bool SeededCylinder = false;
@@ -776,11 +779,14 @@ bool RebuildAnalyticPatches(
     const BoundaryData &boundary=boundaries[patchId];
     // Cylinder source charts recover boundary edges from triangle incidence;
     // failure to trace disjoint loops alone is not a construction failure.
-    if (!validBoundaries[patchId] && patch.SurfaceType != PatchSurfaceType::Cylinder) {
+    if (!validBoundaries[patchId] && patch.SurfaceType != PatchSurfaceType::Cylinder && patch.SurfaceType != PatchSurfaceType::Cone) {
       result.State = PreparedChart::Topology; return result;
     }
     std::vector<int> allBoundary;
     for (const auto &loop : boundary.Loops) allBoundary.insert(allBoundary.end(),loop.begin(),loop.end());
+    if(patch.SurfaceType==PatchSurfaceType::Cone){
+      for(const auto &face:patchFaces[patchId])for(int v:face)allBoundary.push_back(v);
+    }
     Frame frame;
     if (!MakeFrame(patch, sourceVertices, allBoundary, frame)) {
       result.State = PreparedChart::Parameterization; return result;
@@ -805,10 +811,11 @@ bool RebuildAnalyticPatches(
       if(!made)result.Value={};
       return result;
     }
-    if(frame.Type==PatchSurfaceType::Cylinder){
+    if(frame.Type==PatchSurfaceType::Cylinder || frame.Type==PatchSurfaceType::Cone){
       result.SeededCylinder=true;
+      result.AxialTarget=std::min(targetEdgeLength,chartTarget*2);
       const bool made=MakeSeededCylinderChart(frame,boundary.Loops,patchFaces[patchId],sourceVertices,chartTarget,chart,
-                                             targetEdgeLength,result.CylinderBuild);
+                                             result.AxialTarget,result.CylinderBuild);
       result.CylinderBuild.Points=chart.Points.size();result.CylinderBuild.Faces=chart.Faces.size();
       if(!made && result.CylinderBuild.Failure.empty())result.CylinderBuild.Failure=result.CylinderBuild.Stage+"_failed";
       result.MakeSeconds=std::chrono::duration<double>(Clock::now()-start).count();
@@ -1062,7 +1069,7 @@ bool RebuildAnalyticPatches(
           << ", boundary_loops=" << boundaries[patchId].Loops.size()
           << ", points=" << prepared.Value.Points.size() << ", faces=" << prepared.Value.Faces.size()
           << ", constructed=" << (prepared.State==PreparedChart::Ready?"yes":"no")
-          << ", circumferential_target=" << prepared.Target << ", axial_target=" << targetEdgeLength
+          << ", circumferential_target=" << prepared.Target << ", axial_target=" << prepared.AxialTarget
           << ", ring_rows=" << detail.RingRows << ", ring_columns=" << detail.RingColumns
           << ", ring_interior_spacing=" << detail.RingInteriorSpacing
           << ", stage=" << detail.Stage << ", failure=" << (detail.Failure.empty()?"none":detail.Failure)
@@ -1124,6 +1131,30 @@ bool RebuildAnalyticPatches(
     const auto liftStart=Clock::now();
     Chart &chart = prepared.Value;
     const Frame &frame = chart.Surface;
+    // Transfer the original trimmed surface through its parameter triangles.
+    // Nearest-point snapping is ambiguous around thin trims; barycentric
+    // transfer preserves the correspondence to the source sidewall.
+    struct SourceCell {std::array<UV,3> UVs;std::array<Point3,3> Points;};
+    std::vector<SourceCell> sourceCells;
+    if(frame.Type==PatchSurfaceType::Cone || frame.Type==PatchSurfaceType::Cylinder){
+      for(const auto &f:patchFaces[patchId]){SourceCell cell;bool valid=true;
+        for(int k=0;k<3;++k){cell.Points[k]=sourceVertices[f[k]];valid=frame.parameter(cell.Points[k],cell.UVs[k])&&valid;}
+        if(!valid)continue;
+        for(int k=1;k<3;++k)cell.UVs[k].X=cell.UVs[0].X+std::remainder(cell.UVs[k].X-cell.UVs[0].X,frame.UPeriod);
+        sourceCells.push_back(cell);
+      }
+    }
+    const auto liftPoint=[&](UV query){
+      for(const auto &cell:sourceCells){UV q=query;
+        q.X=cell.UVs[0].X+std::remainder(q.X-cell.UVs[0].X,frame.UPeriod);
+        const auto &a=cell.UVs[0],&b=cell.UVs[1],&c=cell.UVs[2];const double area=Cross2(a,b,c);
+        if(std::abs(area)<1e-20)continue;
+        const double u=Cross2(q,b,c)/area,v=Cross2(a,q,c)/area,w=1-u-v;
+        if(u>=-1e-9 && v>=-1e-9 && w>=-1e-9)
+          return ToPoint(Add(Add(Mul(ToVec(cell.Points[0]),u),Mul(ToVec(cell.Points[1]),v)),Mul(ToVec(cell.Points[2]),w)));
+      }
+      return frame.lift(query);
+    };
     const BoundaryData &boundary = boundaries[patchId];
     const std::size_t originalVertexCount=vertices.size();
     std::vector<int> mapping(chart.Points.size(),-1);
@@ -1133,8 +1164,13 @@ bool RebuildAnalyticPatches(
       else if(chart.Aliases[i] < -1) {
         auto found = periodicAliases.find(chart.Aliases[i]);
         if(found != periodicAliases.end()) mapping[i] = found->second;
-        else { mapping[i]=int(vertices.size()); periodicAliases[chart.Aliases[i]]=mapping[i]; vertices.push_back(frame.lift(chart.Points[i])); }
-      } else {mapping[i]=int(vertices.size());vertices.push_back(frame.lift(chart.Points[i]));}
+        else { mapping[i]=int(vertices.size()); periodicAliases[chart.Aliases[i]]=mapping[i]; vertices.push_back(liftPoint(chart.Points[i])); }
+      } else {mapping[i]=int(vertices.size());vertices.push_back(liftPoint(chart.Points[i]));}
+    }
+    for(const auto &sample:chart.BoundarySamples){
+      const int vertex=mapping[sample.Vertex];
+      vertices[vertex]=ToPoint(Add(Mul(ToVec(sourceVertices[sample.A]),1-sample.Parameter),
+                                  Mul(ToVec(sourceVertices[sample.B]),sample.Parameter)));
     }
     std::vector<std::array<int,3>> candidateFaces;candidateFaces.reserve(chart.Faces.size());
     double orientation = 0;const auto &oldFaces=patchFaces[patchId];
@@ -1152,6 +1188,7 @@ bool RebuildAnalyticPatches(
     if(!valid){report.FailureDetails[patchId]="failure=output_topology";reason=PatchRemeshReason::Topology;vertices.resize(originalVertexCount);++report.Fallback;++report.TopologyFallback;continue;}
     report.RebuiltFaces+=candidateFaces.size();
     replacements[patchId]=std::move(candidateFaces);
+    for(auto sample:chart.BoundarySamples){sample.Vertex=mapping[sample.Vertex];sample.Patch=int(patchId);report.BoundarySamples.push_back(sample);}
     successfullyRebuilt[patchId]=1;++report.Rebuilt;
     reason=PatchRemeshReason::Rebuilt;
     if(prepared.UsedCuda)++cudaAccepted;

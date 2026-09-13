@@ -53,6 +53,13 @@ PreparedRemeshRegions PrepareRemeshRegions(
   const auto start=std::chrono::steady_clock::now();
   const std::size_t count=sourceFaces.size();
   if(!count)return {};
+  // An analytic cone is one trimmed domain. Keeping short input triangles
+  // creates artificial holes and destroys its periodic sidewall topology.
+  if(patch.SurfaceType==PatchSurfaceType::Cone &&
+     patch.ProjectionTarget==PatchProjectionTarget::AnalyticSurface){
+    std::vector<int> faces(count);for(std::size_t i=0;i<count;++i)faces[i]=int(i);
+    return {{},{std::move(faces)},{patch}};
+  }
   std::vector<std::vector<int>> neighbors(count);
   for(const auto &edge:BuildEdges(sourceFaces)){
     if(!edge.NonManifold && edge.FaceCount==2 && !globalConstraints.count(Key(edge.A,edge.B))){neighbors[edge.Faces[0]].push_back(edge.Faces[1]);neighbors[edge.Faces[1]].push_back(edge.Faces[0]);}
@@ -87,6 +94,14 @@ PreparedRemeshRegions PrepareRemeshRegions(
     for(std::size_t head=0;head<region.size();++head)for(int n:neighbors[region[head]])
       if(!keep[n] && !seen[n]){seen[n]=1;region.push_back(n);}
     regions.push_back(std::move(region));
+  }
+  // A clipped subset of an already classified cone inherits its surface.
+  // Removing preserved triangles destroys the support needed to estimate an
+  // apex again; failed rediscovery must not silently relabel it Freeform.
+  if(patch.SurfaceType==PatchSurfaceType::Cone &&
+     patch.ProjectionTarget==PatchProjectionTarget::AnalyticSurface){
+    std::vector<MeshPatch> models(regions.size(),patch);
+    return {std::move(preserved),std::move(regions),std::move(models)};
   }
   // Reuse the initial model-first partitioner, including independent nonlinear
   // seeds. Preserve indexed source face IDs and the original fitting resolution.

@@ -23,6 +23,57 @@ class ModelPartition {
   MeshTopology &Mesh;
   const SegmentationConfig &Config;
   std::vector<std::array<int, 3>> Neighbors;
+  std::set<std::pair<int,int>> NarrowLinks;
+  std::vector<int> SliverShortSide;
+  std::vector<unsigned char> RuledStripFace;
+  size_t ConeSupportRejected=0;
+  int PreferredSeed(int cell) const {
+    int best=-1;
+    for(int f:Cells[cell].Faces)if(Owner[f]<0){
+      const auto rank=[&](int id){return !RuledStripFace.empty() && RuledStripFace[id]?2:SliverShortSide[id]<0?1:0;};
+      if(best<0 || rank(f)>rank(best) ||
+         (rank(f)==rank(best) &&
+          Mesh.getTriangles()[f].Area>Mesh.getTriangles()[best].Area))best=f;
+    }
+    return best;
+  }
+  bool NarrowLink(int a,int b) const {
+    return NarrowLinks.count({std::min(a,b),std::max(a,b)})!=0;
+  }
+  void BuildNarrowLinks(){
+    NarrowLinks.clear();
+    SliverShortSide.assign(Owner.size(),-1);
+    for(int f=0;f<int(Owner.size());++f){const auto &t=Mesh.getTriangles()[f];double lengths[3];
+      for(int k=0;k<3;++k){const auto &e=Mesh.getEdges()[t.EdgeIds[k]];
+        lengths[k]=Distance(Mesh.getVertices()[e.Vertex0].Position,Mesh.getVertices()[e.Vertex1].Position);}
+      const double longest=*std::max_element(lengths,lengths+3);
+      if(longest>0 && 2*t.Area/(longest*longest)<.05){
+        const int side=int(std::min_element(lengths,lengths+3)-lengths);SliverShortSide[f]=side;
+        const int n=Neighbors[f][side];if(n>=0)NarrowLinks.insert({std::min(f,n),std::max(f,n)});
+      }
+    }
+    // Aggregate cells rather than counting triangles. A change in STL
+    // density should not by itself turn an interface into a bottleneck.
+    std::map<std::pair<int,int>,double> interfaces;
+    for(const auto &edge:Mesh.getEdges()){
+      if(edge.IncidentTriangleIds.size()!=2)continue;
+      const int a=edge.IncidentTriangleIds[0],b=edge.IncidentTriangleIds[1];
+      const int ca=CellId[a],cb=CellId[b];if(ca<0||cb<0||ca==cb)continue;
+      const auto key=std::make_pair(std::min(ca,cb),std::max(ca,cb));
+      interfaces[key]+=Distance(Mesh.getVertices()[edge.Vertex0].Position,Mesh.getVertices()[edge.Vertex1].Position);
+    }
+    for(int a=0;a<int(Neighbors.size());++a)for(int b:Neighbors[a]){
+      if(b<=a)continue;const int ca=CellId[a],cb=CellId[b];if(ca<0||cb<0||ca==cb)continue;
+      const auto key=std::make_pair(std::min(ca,cb),std::max(ca,cb));
+      const auto found=interfaces.find(key);if(found==interfaces.end())continue;
+      const double area=std::min(Cells[ca].Area,Cells[cb].Area);
+      // Both sides must have physical support substantially wider than the
+      // total connecting interface. Aspect ratio alone never cuts a face.
+      if(area>0 && found->second<.2*std::sqrt(area))NarrowLinks.insert({a,b});
+    }
+    if(Config.Verbose)std::clog << "[CadMesh] narrow sampling links=" << NarrowLinks.size()
+        << " (soft partition barriers; mesh edges unchanged)\n";
+  }
   std::vector<int> Owner, CellId, Visit, CellVisit;
   std::vector<Cell> Cells;
   std::vector<unsigned char> Seeded;
@@ -127,11 +178,30 @@ class ModelPartition {
                           size_t maximum = 256) const {
     if (faces.size() <= maximum)
       return faces;
-    // Equal inclusion probability; fitters apply physical triangle area once.
-    // A hard budget bounds unsuccessful local proposal work.
+    if(maximum==0)return {};
+    // Stratify in physical space and normal direction. Dense fillet
+    // tessellation must not consume the sample just by having more faces.
+    Vec3 lo=ToVec(Mesh.getTriangles()[faces.front()].Centroid),hi=lo;
+    for(int f:faces){const Vec3 p=ToVec(Mesh.getTriangles()[f].Centroid);
+      for(int k=0;k<3;++k){lo[k]=std::min(lo[k],p[k]);hi[k]=std::max(hi[k],p[k]);}}
+    std::map<std::array<int,4>,std::vector<int>> buckets;
+    for(int f:faces){const auto &t=Mesh.getTriangles()[f];const Vec3 p=ToVec(t.Centroid),n=ToVec(t.Normal);
+      std::array<int,4> key{};
+      for(int k=0;k<3;++k)key[k]=hi[k]>lo[k]?std::min(3,int(4*(p[k]-lo[k])/(hi[k]-lo[k]))):0;
+      int axis=0;for(int k=1;k<3;++k)if(std::abs(n[k])>std::abs(n[axis]))axis=k;
+      key[3]=axis*2+(n[axis]<0?1:0);buckets[key].push_back(f);}
+    std::vector<std::vector<int>> groups;
+    for(auto &entry:buckets){auto &g=entry.second;
+      std::sort(g.begin(),g.end(),[&](int a,int b){const double x=Mesh.getTriangles()[a].Area,y=Mesh.getTriangles()[b].Area;return x!=y?x>y:a<b;});
+      groups.push_back(std::move(g));}
     std::vector<int> result;
-    for (size_t i = 0; i < maximum; ++i)
-      result.push_back(faces[(2 * i + 1) * faces.size() / (2 * maximum)]);
+    if(groups.size()>maximum){
+      for(size_t i=0;i<maximum;++i)result.push_back(groups[(2*i+1)*groups.size()/(2*maximum)].front());
+    }else for(size_t layer=0;result.size()<maximum;++layer){
+      bool added=false;for(const auto &g:groups)if(layer<g.size()){
+        result.push_back(g[layer]);added=true;if(result.size()==maximum)break;}
+      if(!added)break;
+    }
     return result;
   }
   bool Compatible(int f, const MeshPatch &p, double distanceRatio = -1,
@@ -143,6 +213,10 @@ class ModelPartition {
                                                : distanceRatio) &&
            check.MaxNormalError <= Config.ModelNormalTolerance;
   }
+  double CoreTolerance(const MeshPatch &p) const {
+    return (p.SurfaceType==PatchSurfaceType::Cone || p.SurfaceType==PatchSurfaceType::Cylinder)
+        ? std::min(1.0,Config.ModelFitToleranceRatio) : Config.ModelFitToleranceRatio;
+  }
   bool Certify(const std::vector<int> &faces, MeshPatch &p,
                CompatibilityCache *cache = nullptr) const {
     if (p.SurfaceType == PatchSurfaceType::Unknown ||
@@ -150,7 +224,7 @@ class ModelPartition {
       return false;
     const auto check = cache ? cache->evaluate(faces) : EvaluateSurfaceCompatibility(Mesh, faces, p);
     if (!check.Supported ||
-        check.MaxNormalizedDistance > Config.ModelFitToleranceRatio ||
+        check.MaxNormalizedDistance > CoreTolerance(p) ||
         check.MaxNormalError > Config.ModelNormalTolerance)
       return false;
     p.MaxFittingError =
@@ -158,7 +232,7 @@ class ModelPartition {
     return true;
   }
   void Store(std::vector<int> faces, MeshPatch patch) {
-    if (patch.SurfaceType != PatchSurfaceType::Freeform) {
+    if (patch.SurfaceType != PatchSurfaceType::Freeform && patch.SurfaceType != PatchSurfaceType::Unknown) {
       double weight = 0, squaredDistance = 0, normalError = 0;
       patch.MaxFittingError = 0;
       patch.MaxSampledSurfaceDeviation = 0;
@@ -209,6 +283,8 @@ class ModelPartition {
     InvalidateRemainingSizeEvidence();
   }
   double GrowthTolerance(const MeshPatch &p) const {
+    if(p.SurfaceType==PatchSurfaceType::Cone || p.SurfaceType==PatchSurfaceType::Cylinder)
+      return Config.ModelRuledGrowthDistance/std::max(Mesh.getResolution().FittingTolerance,1e-30);
     // Exact CAD models must not absorb the first tangent transition strip just
     // because the global mesh tolerance is larger than that strip's sagitta.
     const double measured =
@@ -217,17 +293,27 @@ class ModelPartition {
     return std::min(Config.ModelFitToleranceRatio, std::max(.2, 3 * measured));
   }
   std::vector<int> Grow(int seed, const MeshPatch &p, CompatibilityCache *cache = nullptr) {
+    const double discoveryTolerance=(p.SurfaceType==PatchSurfaceType::Cone || p.SurfaceType==PatchSurfaceType::Cylinder)
+        ? CoreTolerance(p) : GrowthTolerance(p);
+    const auto discoveryLinkAllowed=[&](int a,int b){
+      if(!NarrowLink(a,b))return true;
+      if(!Config.ModelConesOnly || p.SurfaceType!=PatchSurfaceType::Cone)return false;
+      // A fitted cone may cross a discovery-only bottleneck along long
+      // sides. Real feature edges are already absent from Neighbors.
+      return SliverShortSide[a]>=0 && SliverShortSide[b]>=0 &&
+          Neighbors[a][SliverShortSide[a]]!=b && Neighbors[b][SliverShortSide[b]]!=a;
+    };
     ++Stamp;
     std::vector<int> result;
     Visit[seed] = Stamp;
-    if (Owner[seed] >= 0 || !Compatible(seed, p, GrowthTolerance(p), cache))
+    if (Owner[seed] >= 0 || !Compatible(seed, p, discoveryTolerance, cache))
       return result;
     result.push_back(seed);
     for (size_t i = 0; i < result.size(); ++i)
       for (int next : Neighbors[result[i]])
-        if (next >= 0 && Owner[next] < 0 && Visit[next] != Stamp) {
+        if (next >= 0 && Owner[next] < 0 && Visit[next] != Stamp && discoveryLinkAllowed(result[i],next)) {
           Visit[next] = Stamp;
-          if (Compatible(next, p, GrowthTolerance(p), cache))
+          if (Compatible(next, p, discoveryTolerance, cache))
             result.push_back(next);
         }
     return result;
@@ -390,7 +476,7 @@ class ModelPartition {
         return true;
     return false;
   }
-  void ExtractPlaneCores() {
+  void ExtractPlaneCores(bool strict=false) {
     const double areaScale = Mesh.getResolution().MedianEdgeLength *
                              Mesh.getResolution().MedianEdgeLength;
     for (int id : CellOrder()) {
@@ -413,7 +499,7 @@ class ModelPartition {
       // A genuine mother plane dominates the small tessellation facets around
       // it. A cylindrical facet has peers of comparable area on both sides.
       // Small bevels are left to connected residual certification, not deleted.
-      if (cell.Faces.size() < 2 || cell.Area < .02 * longestSquared ||
+      if (cell.Faces.empty() || cell.Area < .02 * longestSquared ||
           cell.Area < 4 * areaScale || cell.Area < 1.5 * neighborArea)
         continue;
       std::vector<int> remaining;
@@ -425,7 +511,18 @@ class ModelPartition {
         continue;
       for (int seed : remaining)
         if (Owner[seed] < 0) {
-          auto faces = Grow(seed, plane);
+          std::vector<int> faces;
+          if(strict){
+            CompatibilityCache cache(Mesh,plane);
+            const auto accepts=[&](int f){const auto c=cache.evaluate(f);
+              return c.Supported && c.ReliableNormalSamples>0 &&
+                  c.MaxNormalizedDistance<=std::min(.1,Config.ModelFitToleranceRatio) &&
+                  c.MaxNormalError<=std::min(.005,Config.ModelNormalTolerance);};
+            if(!accepts(seed))continue;
+            ++Stamp;Visit[seed]=Stamp;faces.push_back(seed);
+            for(size_t k=0;k<faces.size();++k)for(int n:Neighbors[faces[k]])
+              if(n>=0 && Owner[n]<0 && Visit[n]!=Stamp){Visit[n]=Stamp;if(accepts(n))faces.push_back(n);}
+          }else faces=Grow(seed,plane);
           if (!faces.empty())
             Store(std::move(faces), plane);
         }
@@ -463,7 +560,7 @@ class ModelPartition {
     Visit[seed] = Stamp;
     for (size_t i = 0; i < faces.size(); ++i)
       for (int n : Neighbors[faces[i]])
-        if (n >= 0 && Owner[n] < 0 && Visit[n] != Stamp) {
+        if (n >= 0 && Owner[n] < 0 && Visit[n] != Stamp && !NarrowLink(faces[i],n)) {
           Visit[n] = Stamp;
           faces.push_back(n);
           ++RemainingTraversedFaces;
@@ -555,6 +652,15 @@ class ModelPartition {
         for (int n : Cells[out.Cells[k]].Neighbors) {
           if (CellVisit[n] == Stamp || !HasUnowned(n))
             continue;
+          // Cell adjacency was built before core ownership. A partially
+          // claimed cell must not bridge across an already locked plane.
+          bool connected=false;
+          for(int f:Cells[out.Cells[k]].Faces){
+            if(Owner[f]>=0)continue;
+            for(int adjacent:Neighbors[f])if(adjacent>=0 && Owner[adjacent]<0 && CellId[adjacent]==n && !NarrowLink(f,adjacent)){connected=true;break;}
+            if(connected)break;
+          }
+          if(!connected)continue;
           CellVisit[n] = Stamp;
           if (comparableArea && Cells[n].Area < .2 * Cells[id].Area)
             continue;
@@ -578,15 +684,13 @@ class ModelPartition {
     MeshPatch Model;
     std::vector<int> Faces;
     double Area = 0;
+    double ErrorScore = std::numeric_limits<double>::infinity();
   };
   void CollectProposalModels(const Neighborhood &peers,
                              const Neighborhood &broad) const {
     for (const auto *neighborhood : {&peers, &broad}) {
       const auto &support = neighborhood->Faces;
       if (support.size() < 6)
-        continue;
-      auto plane = FitOnly<PlaneSurfaceFitter>(support, true);
-      if (Certify(support, plane))
         continue;
       // These fits are independent until Consider/CommitCandidate runs. Stop
       // each fitter at its nonlinear solve and submit all initial guesses
@@ -598,8 +702,10 @@ class ModelPartition {
         } catch (const AnalyticSeedDeferred &) {
         }
       };
-      collect(CylinderSurfaceFitter{});
+      if(!Config.ModelConesOnly)collect(CylinderSurfaceFitter{});
+      if(Config.ModelCylindersOnly)continue;
       collect(ConeSurfaceFitter{});
+      if(Config.ModelConesOnly)continue;
       collect(SphereSurfaceFitter{});
       if (support.size() >= 20)
         collect(TorusSurfaceFitter{});
@@ -627,6 +733,40 @@ class ModelPartition {
       largest = std::max(largest, item.second);
     return areas.size() >= 4 && largest <= .8 * total;
   }
+  bool HasConeAngularSupport(const std::vector<int> &faces,const MeshPatch &model) const {
+    if(!Config.ModelConesOnly || model.SurfaceType!=PatchSurfaceType::Cone)return true;
+    const auto &cone=std::get<ConeParameters>(model.Parameters);
+    const Vec3 axis=Normalize(ToVec(cone.Axis.Direction));
+    const Vec3 reference=std::abs(axis[0])<.8?Vec3{1,0,0}:Vec3{0,1,0};
+    const Vec3 u=Normalize(Cross(axis,reference)),v=Cross(axis,u);
+    const double pi=std::acos(-1.0);
+    std::vector<std::pair<double,double>> angles;
+    double total=0;
+    for(int f:faces){const auto &t=Mesh.getTriangles()[f];
+      const Vec3 d=Sub(ToVec(t.Centroid),ToVec(cone.Axis.Origin));
+      const double x=Dot(d,u),y=Dot(d,v);
+      if(!(t.Area>0) || x*x+y*y<1e-30)continue;
+      const double angle=std::atan2(y,x);
+      if(!std::isfinite(angle))return false;
+      angles.push_back({angle,t.Area});total+=t.Area;
+    }
+    if(angles.size()<6 || !(total>0))return false;
+    std::sort(angles.begin(),angles.end());
+    // Cut at the largest empty angular gap, not at atan2's arbitrary seam.
+    double largestGap=-1;size_t start=0;
+    for(size_t i=0;i<angles.size();++i){const size_t j=(i+1)%angles.size();
+      const double gap=angles[j].first+(j==0?2*pi:0)-angles[i].first;
+      if(gap>largestGap){largestGap=gap;start=j;}
+    }
+    const double span=2*pi-largestGap;
+    if(span<pi/6)return false;
+    double area[3]={0,0,0};
+    for(const auto &entry:angles){double offset=entry.first-angles[start].first;
+      if(offset<0)offset+=2*pi;
+      const int sector=std::min(2,int(3*offset/span));area[sector]+=entry.second;
+    }
+    return area[0]>=.05*total && area[1]>=.05*total && area[2]>=.05*total;
+  }
   void Consider(int seed, const std::vector<int> &support, MeshPatch model,
                 Candidate &best) {
     CompatibilityCache cache(Mesh, model);
@@ -648,11 +788,20 @@ class ModelPartition {
     auto faces = Grow(seed, model, &cache);
     if (faces.size() < 6 || !HasGeometricSupport(faces))
       return;
+    if(!HasConeAngularSupport(faces,model)){++ConeSupportRejected;return;}
+    const auto fit=cache.evaluate(faces);
+    if(!fit.Supported || fit.MaxNormalizedDistance>Config.ModelFitToleranceRatio ||
+       fit.MaxNormalError>Config.ModelNormalTolerance)return;
+    const double errorScore=fit.MaxNormalizedDistance/std::max(Config.ModelFitToleranceRatio,1e-12)+
+        fit.MaxNormalError/std::max(Config.ModelNormalTolerance,1e-12);
     double area = 0;
     for (int f : faces)
       area += Mesh.getTriangles()[f].Area;
-    if (area > best.Area * (1 + 1e-8))
-      best = {std::move(model), std::move(faces), area};
+    // Comparable physical coverage must compete on geometric evidence. The
+    // previous strict area comparison always favored the first type on ties.
+    const bool comparable=area>=best.Area*.95 && best.Area>=area*.95;
+    if(best.Faces.empty() || (comparable ? errorScore<best.ErrorScore-1e-10 : area>best.Area))
+      best = {std::move(model), std::move(faces), area,errorScore};
   }
   bool CommitCandidate(int seed, Candidate candidate) {
     CudaAnalyticFitContext context("candidate full refit");
@@ -678,6 +827,7 @@ class ModelPartition {
     CompatibilityCache cache(Mesh, refined);
     if (!Certify(candidate.Faces, refined, &cache))
       return false;
+    if(!HasConeAngularSupport(candidate.Faces,refined)){++ConeSupportRejected;return false;}
     auto expanded = Grow(seed, refined, &cache);
     if (expanded.size() >= candidate.Faces.size() && Certify(expanded, refined, &cache))
       candidate.Faces = std::move(expanded);
@@ -687,6 +837,7 @@ class ModelPartition {
         if (n >= 0 && Owner[n] < 0)
           exposed.push_back(n);
     Store(std::move(candidate.Faces), refined);
+    if(Config.ModelCylindersOnly || Config.ModelConesOnly)return true;
     // Store starts a fresh epoch. Share size evidence only among the following
     // three probes; any successful probe calls Store and invalidates it again.
     // Avoid repeatedly scanning a huge residual component from every boundary
@@ -700,6 +851,98 @@ class ModelPartition {
       }
     return true;
   }
+  void ExtractRuledStrips(){
+    const auto &triangles=Mesh.getTriangles();
+    const size_t count=triangles.size();
+    RuledStripFace.assign(count,0);
+    struct Evidence {Vec3 Direction{};double Length=0;};
+    std::vector<Evidence> evidence(count);
+    for(int f=0;f<int(count);++f){
+      if(Owner[f]>=0 || SliverShortSide[f]<0)continue;
+      const auto &t=triangles[f];Vec3 directions[2];double lengths[2];int j=0;
+      for(int k=0;k<3;++k)if(k!=SliverShortSide[f]){const auto &e=Mesh.getEdges()[t.EdgeIds[k]];
+        const Vec3 d=Sub(ToVec(Mesh.getVertices()[e.Vertex1].Position),ToVec(Mesh.getVertices()[e.Vertex0].Position));
+        lengths[j]=Norm(d);directions[j]=Normalize(d);++j;}
+      if(!(lengths[0]>0 && lengths[1]>0) || std::min(lengths[0],lengths[1])<.9*std::max(lengths[0],lengths[1]) ||
+         std::abs(Dot(directions[0],directions[1]))<.98)continue;
+      if(Dot(directions[0],directions[1])<0)directions[1]=Mul(directions[1],-1);
+      evidence[f]={Normalize(Add(directions[0],directions[1])),.5*(lengths[0]+lengths[1])};
+    }
+    std::vector<unsigned char> visited(count,0);
+    const int budget=std::min(256,std::max(0,Config.ModelMaximumSeeds));
+    int attempts=0,accepted=0;size_t supported=0;
+    CudaAnalyticSeedPrefetch prepared("ruled strip candidates",Config.Verbose);
+    for(int seed=0;seed<int(count) && attempts<budget;++seed){
+      if(Owner[seed]>=0 || visited[seed] || !(evidence[seed].Length>0))continue;
+      std::vector<int> strip{seed};visited[seed]=1;
+      for(size_t i=0;i<strip.size() && strip.size()<128;++i){const int f=strip[i];
+        for(int k=0;k<3;++k){if(k==SliverShortSide[f])continue;const int n=Neighbors[f][k];
+          if(n<0 || Owner[n]>=0 || visited[n] || !(evidence[n].Length>0))continue;
+          // Traverse both faces' long sides only. A short-end contact to a
+          // second wall does not establish a common family of generators.
+          if(Neighbors[n][SliverShortSide[n]]==f)continue;
+          const double ratio=evidence[n].Length/evidence[seed].Length;
+          if(ratio<.75 || ratio>1/.75 || std::abs(Dot(evidence[n].Direction,evidence[seed].Direction))<std::cos(.35))continue;
+          strip.push_back(n);visited[n]=1;if(strip.size()==128)break;
+        }
+      }
+      if(strip.size()<6 || !ResolvedCurvedSupport(strip))continue;
+      for(int f:strip)RuledStripFace[f]=1;
+      supported+=strip.size();++attempts;
+      // Geometry only supplies a candidate support region. The existing
+      // fitters still estimate their parameters and certify the grown region.
+      if(prepared.enabled()){
+        prepared.begin();
+        const auto collect=[&](auto fitter){try{fitter.fit(Mesh,Sample(strip,128));}catch(const AnalyticSeedDeferred&) {}};
+        if(!Config.ModelConesOnly)collect(CylinderSurfaceFitter{});
+        if(!Config.ModelCylindersOnly)collect(ConeSurfaceFitter{});
+        prepared.flush();
+      }
+      Candidate best;
+      if(!Config.ModelConesOnly)Consider(seed,strip,FitOnly<CylinderSurfaceFitter>(strip,true),best);
+      if(!Config.ModelCylindersOnly)Consider(seed,strip,FitOnly<ConeSurfaceFitter>(strip,true),best);
+      if(CommitCandidate(seed,std::move(best)))++accepted;
+    }
+    if(Config.Verbose)std::clog << "[CadMesh] ruled strip candidates: attempts=" << attempts
+        << ", support_faces=" << supported << ", accepted=" << accepted << '\n';
+  }
+  void ExtractConeCircumferentialCandidates(){
+    // Diagnostic cone path: cross long sides without requiring equal edge
+    // lengths. Keep hard barriers; short-end connections do not seed a sweep.
+    std::vector<int> seeds;
+    for(int f=0;f<int(Owner.size());++f)if(Owner[f]<0 && SliverShortSide[f]>=0)seeds.push_back(f);
+    const size_t budget=std::min<size_t>(64,size_t(std::max(0,Config.ModelMaximumSeeds)));
+    const size_t count=std::min(budget,seeds.size());
+    size_t attempts=0,accepted=0;
+    for(size_t index=0;index<count;++index){
+      const int seed=seeds[(2*index+1)*seeds.size()/(2*count)];
+      if(Owner[seed]>=0)continue;
+      std::vector<int> support{seed};std::set<int> visited{seed};size_t begin=0;
+      const Vec3 seedNormal=ToVec(Mesh.getTriangles()[seed].Normal);
+      for(int depth=1;depth<=12 && begin<support.size();++depth){
+        const size_t end=support.size();
+        for(size_t i=begin;i<end && support.size()<256;++i){const int f=support[i];
+          for(int k=0;k<3 && support.size()<256;++k){
+            if(k==SliverShortSide[f])continue;
+            const int n=Neighbors[f][k];
+            if(n<0 || Owner[n]>=0 || visited.count(n))continue;
+            if(SliverShortSide[n]>=0 && Neighbors[n][SliverShortSide[n]]==f)continue;
+            if(std::abs(Dot(seedNormal,ToVec(Mesh.getTriangles()[n].Normal)))<.5)continue;
+            visited.insert(n);support.push_back(n);
+          }
+        }
+        begin=end;
+        if(depth%4!=0 && begin<support.size() && support.size()<256)continue;
+        if(support.size()<6)break;
+        ++attempts;Candidate best;
+        Consider(seed,support,FitOnly<ConeSurfaceFitter>(support),best);
+        if(CommitCandidate(seed,std::move(best))){++accepted;break;}
+        if(support.size()>=256)break;
+      }
+    }
+    if(Config.Verbose)std::clog << "[CadMesh] cone circumferential candidates: attempts=" << attempts
+        << ", accepted=" << accepted << ", seed_limit=" << budget << '\n';
+  }
   void ExtractCurves() {
     CudaAnalyticSeedPrefetch prepared("analytic neighborhoods", Config.Verbose);
     CellVisit.assign(Cells.size(), 0);
@@ -712,12 +955,7 @@ class ModelPartition {
     size_t prefetchedThrough = 0;
     for (size_t position = 0; position < cellOrder.size(); ++position) {
       const int id = cellOrder[position];
-      int seed = -1;
-      for (int f : Cells[id].Faces)
-        if (Owner[f] < 0) {
-          seed = f;
-          break;
-        }
+      int seed = PreferredSeed(id);
       if (seed < 0 || attempted[id] || Cells[id].Neighbors.empty())
         continue;
       if (proposals >= maximumSeeds) {
@@ -758,13 +996,14 @@ class ModelPartition {
         const auto &support = neighborhood->Faces;
         if (support.size() < 6)
           continue;
-        auto plane = FitOnly<PlaneSurfaceFitter>(support, true);
-        if (Certify(support, plane))
-          continue;
-        Consider(seed, support, FitOnly<CylinderSurfaceFitter>(support, true),
+        // A small cone/cylinder neighborhood can also pass a plane fit.
+        // Evaluate all curved models before deciding ownership.
+        if(!Config.ModelConesOnly)Consider(seed, support, FitOnly<CylinderSurfaceFitter>(support, true),
                  best);
+        if(Config.ModelCylindersOnly)continue;
         Consider(seed, support, FitOnly<ConeSurfaceFitter>(support, true),
                  best);
+        if(Config.ModelConesOnly)continue;
         Consider(seed, support, FitOnly<SphereSurfaceFitter>(support, true),
                  best);
         if (support.size() >= 20)
@@ -775,7 +1014,7 @@ class ModelPartition {
       attempted[id] = 1;
       // Suppression is a proposal scheduling choice. It never assigns a label
       // or creates a remesh edge; every skipped face remains in the residual.
-      if (!committed) {
+      if (!committed && !Config.ModelCylindersOnly && !Config.ModelConesOnly) {
         const size_t suppress = std::min<size_t>(
             broad.Cells.size(), Cells.size() > 10000 ? 64 : 12);
         for (size_t i = 0; i < suppress; ++i)
@@ -824,6 +1063,7 @@ class ModelPartition {
       }
       components.push_back(std::move(component));
     }
+    if(!Config.ModelConesOnly){
     std::vector<std::vector<int>> componentSamples;
     componentSamples.reserve(components.size());
     for (const auto &component : components)
@@ -844,17 +1084,13 @@ class ModelPartition {
           Store(component.Faces, model);
       }
     }
+    }
     using BucketKey = std::array<int, 3>;
     std::vector<std::map<BucketKey, std::vector<int>>> grids(components.size());
     for (int id : CellOrder()) {
       if (Seeded[id] || Cells[id].Neighbors.empty())
         continue;
-      int seed = -1;
-      for (int f : Cells[id].Faces)
-        if (Owner[f] < 0) {
-          seed = f;
-          break;
-        }
+      int seed = PreferredSeed(id);
       if (seed < 0)
         continue;
       const int c = componentId[seed];
@@ -940,12 +1176,7 @@ class ModelPartition {
           continue;
         available = true;
         Seeded[id] = 1;
-        int seed = -1;
-        for (int f : Cells[id].Faces)
-          if (Owner[f] < 0) {
-            seed = f;
-            break;
-          }
+        int seed = PreferredSeed(id);
         ++proposals;
         Candidate best;
         auto peers = SeedNeighborhood(id, 4, 48, true);
@@ -955,13 +1186,11 @@ class ModelPartition {
           const auto &support = neighborhood->Faces;
           if (support.size() < 6)
             continue;
-          auto plane = FitOnly<PlaneSurfaceFitter>(support, true);
-          if (Certify(support, plane))
-            continue;
-          Consider(seed, support, FitOnly<CylinderSurfaceFitter>(support, true),
+          if(!Config.ModelConesOnly)Consider(seed, support, FitOnly<CylinderSurfaceFitter>(support, true),
                    best);
           Consider(seed, support, FitOnly<ConeSurfaceFitter>(support, true),
                    best);
+          if(Config.ModelConesOnly)continue;
           Consider(seed, support, FitOnly<SphereSurfaceFitter>(support, true),
                    best);
           if (support.size() >= 20)
@@ -1026,7 +1255,353 @@ class ModelPartition {
       Store(std::move(entry.second), planes[index++]);
     return true;
   }
+  bool RecoverResidualCore(const std::vector<int> &component,int &budget,int &attempts) {
+    if(component.size()<6 || budget<=0)return false;
+    // One representative per planar cell, then spread the bounded attempts
+    // across that list. Do not repeatedly seed the same triangulated facet.
+    std::map<int,int> representatives;
+    for(int f:component){const int cell=CellId[f];auto it=representatives.find(cell);
+      if(it==representatives.end() || Mesh.getTriangles()[f].Area>Mesh.getTriangles()[it->second].Area)
+        representatives[cell]=f;}
+    std::vector<int> seeds;for(const auto &entry:representatives)seeds.push_back(entry.second);
+    const int count=std::min({32,budget,int(seeds.size())});
+    CudaAnalyticSeedPrefetch prepared("residual local recovery",Config.Verbose);
+    for(int i=0;i<count;++i){
+      const int seed=seeds[std::size_t(i)*seeds.size()/count];
+      if(Owner[seed]>=0)continue;
+      --budget;++attempts;
+      // Face-local neighborhoods can isolate a sidewall even when a cell
+      // neighborhood reaches a fillet or another connected primitive.
+      std::vector<int> local{seed};std::set<int> visited{seed};
+      for(std::size_t k=0;k<local.size() && local.size()<128;++k)
+        for(int n:Neighbors[local[k]])if(n>=0 && Owner[n]<0 && !NarrowLink(local[k],n) && visited.insert(n).second){
+          local.push_back(n);if(local.size()==128)break;}
+      Neighborhood small,broad;
+      small.Faces.assign(local.begin(),local.begin()+std::min(std::size_t(24),local.size()));
+      broad.Faces=local;
+      PrepareProposalModels(prepared,small,broad);
+      Candidate best;
+      for(const auto *neighborhood:{&small,&broad}){
+        const auto &support=neighborhood->Faces;if(support.size()<6)continue;
+        Consider(seed,support,FitOnly<CylinderSurfaceFitter>(support,true),best);
+        Consider(seed,support,FitOnly<ConeSurfaceFitter>(support,true),best);
+        Consider(seed,support,FitOnly<SphereSurfaceFitter>(support,true),best);
+        if(support.size()>=20)Consider(seed,support,FitOnly<TorusSurfaceFitter>(support,true),best);
+      }
+      if(CommitCandidate(seed,std::move(best)))return true;
+    }
+    return false;
+  }
+  void AbsorbRuledRings(){
+    const auto eligible=[](PatchSurfaceType type){return type==PatchSurfaceType::Cylinder || type==PatchSurfaceType::Cone;};
+    const size_t patchCount=Patches.size();
+    std::vector<double> limits(patchCount);
+    std::vector<unsigned char> changed(patchCount,0);
+    std::set<int> frontier;
+    for(size_t id=0;id<patchCount;++id){const auto &p=Patches[id];
+      if(!eligible(p.SurfaceType))continue;
+      limits[id]=GrowthTolerance(p); // Freeze tolerance as well as parameters.
+      for(int f:p.TriangleIds)for(int n:Neighbors[f])if(n>=0 && Owner[n]<0)frontier.insert(n);
+    }
+    size_t accepted=0,evaluated=0,ambiguous=0,relaxedAccepted=0,normalRejected=0;
+    size_t distanceRejected=0,unreliableRejected=0,examples=0;int rounds=0;
+    const double absorptionNormalLimit=10.0*std::acos(-1.0)/180.0;
+    constexpr size_t maximumEvaluations=100000; // Two stages share the old total cap.
+    // A tessellation ring can contain many short faces. In cone diagnostics
+    // converge geometrically rather than stopping after twelve face layers.
+    const int maximumRounds=Config.ModelConesOnly?int(maximumEvaluations):12;
+    for(;rounds<maximumRounds && !frontier.empty() && evaluated<maximumEvaluations;++rounds){
+      std::vector<std::pair<int,int>> additions;
+      for(int f:frontier){
+        if(Owner[f]>=0)continue;
+        std::set<int> neighboringModels;
+        // Neighbors already excludes hard features/nonmanifold edges. Do
+        // not consult NarrowLinks: those are discovery-only soft barriers.
+        for(int n:Neighbors[f])if(n>=0 && Owner[n]>=0)neighboringModels.insert(Owner[n]);
+        std::vector<std::pair<double,int>> candidates;std::set<int> relaxedModels;bool complete=true;
+        for(int id:neighboringModels){
+          const auto &p=Patches[id];
+          if(p.SurfaceType==PatchSurfaceType::Unknown||p.SurfaceType==PatchSurfaceType::Freeform)continue;
+          if(evaluated==maximumEvaluations){complete=false;break;}++evaluated;
+          auto c=EvaluateSurfaceCompatibility(Mesh,f,p);
+          const double limit=eligible(p.SurfaceType)?limits[id]:GrowthTolerance(p);
+          const double normalLimit=eligible(p.SurfaceType)?absorptionNormalLimit:Config.ModelNormalTolerance;
+          if(!c.Supported || c.ReliableNormalSamples<=0 || !std::isfinite(c.MaxNormalizedDistance)){
+            ++unreliableRejected;continue;
+          }
+          if(c.MaxNormalizedDistance>limit){
+            ++distanceRejected;
+            if(Config.ModelConesOnly && Config.Verbose && examples<8){++examples;
+              std::clog << "[CadMesh] cone absorption rejected: patch_id=" << id << ", face_id=" << f
+                  << ", reason=vertex_distance, normalized_distance=" << c.MaxNormalizedDistance
+                  << ", normalized_limit=" << limit << ", normal_deg=" << c.MaxNormalError*180/std::acos(-1.0) << '\n';
+            }
+            continue;
+          }
+          if(!std::isfinite(c.MaxNormalError)||c.MaxNormalError>normalLimit){++normalRejected;continue;}
+          const bool relaxed=eligible(p.SurfaceType) && c.MaxNormalError>Config.ModelNormalTolerance;
+          if(relaxed){
+            // Flat source facets have a legitimate chord error inside the
+            // triangle. Test model normals at vertices instead of applying
+            // the vertex fitting tolerance to chord midpoints/centroids.
+            const auto &t=Mesh.getTriangles()[f];
+            const auto checkPoint=[&](const Vec3 &point){double distance=0;Vec3 normal;
+              if(!SegmentationGuardDetail::SurfaceSample(p,point,distance,normal)||!std::isfinite(distance))return false;
+              const double cosine=std::abs(Dot(normal,ToVec(t.Normal)));
+              return std::isfinite(cosine) && cosine>=std::cos(absorptionNormalLimit);};
+            bool valid=true;
+            for(int k=0;k<3 && valid;++k){
+              const Vec3 a=ToVec(Mesh.getVertices()[t.VertexIds[k]].Position);
+              valid=checkPoint(a);
+            }
+            if(!valid){++normalRejected;continue;}
+            relaxedModels.insert(id);
+          }
+          const double score=c.MaxNormalizedDistance/std::max(Config.ModelFitToleranceRatio,1e-12)+
+              c.MaxNormalError/std::max(Config.ModelNormalTolerance,1e-12);
+          candidates.push_back({score,id});
+        }
+        if(!complete)break;
+        std::sort(candidates.begin(),candidates.end());
+        if(candidates.empty() || !eligible(Patches[candidates[0].second].SurfaceType))continue;
+        bool conflict=false;
+        for(size_t k=1;k<candidates.size();++k)if((relaxedModels.count(candidates[0].second) || candidates[k].first<=candidates[0].first+.1) &&
+            !SameModelIdentity(Patches[candidates[0].second],Patches[candidates[k].second])){conflict=true;break;}
+        if(conflict){++ambiguous;continue;}
+        if(relaxedModels.count(candidates[0].second))++relaxedAccepted;
+        additions.push_back({f,candidates[0].second});
+      }
+      if(additions.empty())break;
+      // All choices used the same ownership snapshot. Only the new ring
+      // seeds the next frontier; no full-mesh scan on each iteration.
+      frontier.clear();
+      for(const auto &entry:additions){const int f=entry.first,id=entry.second;
+        Owner[f]=id;Patches[id].TriangleIds.push_back(f);changed[id]=1;++accepted;}
+      for(const auto &entry:additions)for(int n:Neighbors[entry.first])if(n>=0 && Owner[n]<0)frontier.insert(n);
+    }
+    // Refresh diagnostics with unchanged fitted parameters and stable ids.
+    if(Config.ModelConesOnly && Config.Verbose){
+      size_t blockedEdges=0,openEdges=0;
+      for(const auto &edge:Mesh.getEdges()){
+        if(edge.IncidentTriangleIds.size()!=2)continue;
+        const int a=edge.IncidentTriangleIds[0],b=edge.IncidentTriangleIds[1];
+        if((Owner[a]>=0)==(Owner[b]>=0))continue;
+        const int owned=Owner[a]>=0?a:b,other=Owner[a]>=0?b:a;
+        if(Patches[Owner[owned]].SurfaceType!=PatchSurfaceType::Cone)continue;
+        bool adjacent=false;for(int n:Neighbors[owned])if(n==other)adjacent=true;
+        if(adjacent)++openEdges;else ++blockedEdges;
+      }
+      std::clog << "[CadMesh] cone residual boundary: accessible_edges=" << openEdges
+          << ", adjacency_blocked_edges=" << blockedEdges << '\n';
+    }
+    // Store is reused only to compute metadata, never to refit the cylinder.
+    for(size_t id=0;id<patchCount;++id)if(changed[id]){
+      auto model=Patches[id];auto faces=model.TriangleIds;
+      Store(std::move(faces),std::move(model));
+      auto updated=std::move(Patches.back());Patches.pop_back();updated.Id=int(id);
+      for(int f:updated.TriangleIds)Owner[f]=int(id);
+      Patches[id]=std::move(updated);
+    }
+    if(Config.Verbose)std::clog << "[CadMesh] cylinder/cone ring absorption: rounds=" << rounds
+        << ", absolute_distance_limit=" << Config.ModelRuledGrowthDistance
+        << ", accepted_faces=" << accepted << ", evaluations=" << evaluated << ", ambiguous=" << ambiguous
+        << ", normal_limit_deg=10, relaxed_faces=" << relaxedAccepted
+        << ", normal_rejections=" << normalRejected
+        << ", distance_rejections=" << distanceRejected << ", unreliable_rejections=" << unreliableRejected
+        << ", stop=" << (evaluated>=maximumEvaluations?"evaluation_budget":rounds==maximumRounds?"round_limit":frontier.empty()?"frontier_empty":"no_additions")
+        << ", budget_reached=" << (evaluated>=maximumEvaluations||rounds==maximumRounds?"yes":"no") << '\n';
+  }
+  void ExtractRuledEndTransitions(){
+    // Multi-source, ownership-frozen proposal. Do not turn proximity alone
+    // into fillet membership: require sustained turning away from a mother.
+    const size_t mothers=Patches.size();
+    std::vector<int> labels(Owner.size(),-1);
+    std::vector<int> transitionDepth(Owner.size(),0);
+    std::vector<double> transitionTurn(Owner.size(),0);
+    size_t evaluated=0;constexpr size_t budget=200000;
+    const double pi=std::acos(-1.0);
+    for(size_t id=0;id<mothers && evaluated<budget;++id){
+      const auto &mother=Patches[id];
+      if(mother.SurfaceType!=PatchSurfaceType::Cylinder && mother.SurfaceType!=PatchSurfaceType::Cone)continue;
+      const AxisLine axisLine=mother.SurfaceType==PatchSurfaceType::Cylinder?
+          std::get<CylinderParameters>(mother.Parameters).Axis:std::get<ConeParameters>(mother.Parameters).Axis;
+      const Vec3 axis=Normalize(ToVec(axisLine.Direction)),origin=ToVec(axisLine.Origin);
+      double low=std::numeric_limits<double>::infinity(),high=-low,radius=0;
+      for(int f:mother.TriangleIds)for(int v:Mesh.getTriangles()[f].VertexIds){
+        const Vec3 d=Sub(ToVec(Mesh.getVertices()[v].Position),origin);const double z=Dot(d,axis);
+        low=std::min(low,z);high=std::max(high,z);radius=std::max(radius,Norm(Sub(d,Mul(axis,z))));
+      }
+      if(!(radius>0) || !(high>low))continue;
+      const double width=std::min(radius,.25*(high-low));
+      struct Node{int Face,Depth;double Error,Turn,Travel;};
+      std::vector<Node> queue;std::set<int> visited;
+      auto sample=[&](int f,int depth,double travel,double previousError,double previousTurn){
+        if(evaluated>=budget || Owner[f]>=0 || visited.count(f))return;
+        ++evaluated;visited.insert(f);
+        const auto &t=Mesh.getTriangles()[f];
+        const double z=Dot(Sub(ToVec(t.Centroid),origin),axis);
+        if(std::min(std::abs(z-low),std::abs(z-high))>width || travel>2*width)return;
+        const auto c=EvaluateSurfaceCompatibility(Mesh,f,mother);
+        const double error=c.MaxNormalizedDistance*Mesh.getResolution().FittingTolerance;
+        const double turn=c.MaxNormalError*180/pi;
+        if(!c.Supported || c.ReliableNormalSamples<=0 || !std::isfinite(error) || !std::isfinite(turn) ||
+           error<=Config.ModelRuledGrowthDistance || error>width || turn<.5 || turn>85)return;
+        if(depth==0 && turn>25)return;
+        // Signed face normals must turn smoothly; plate interiors have no
+        // sustained turning and stop the traversal in the caller below.
+        if(depth>0 && (error+Mesh.getResolution().FittingTolerance<previousError || turn+2<previousTurn))return;
+        queue.push_back({f,depth,error,turn,travel});
+      };
+      for(int f:mother.TriangleIds)for(int n:Neighbors[f])if(n>=0 && Owner[n]<0)sample(n,0,0,0,0);
+      for(size_t i=0;i<queue.size() && evaluated<budget;++i){const auto node=queue[i];
+        if(node.Depth>=32)continue;
+        for(int n:Neighbors[node.Face])if(n>=0 && Owner[n]<0){
+          const auto &a=Mesh.getTriangles()[node.Face],&b=Mesh.getTriangles()[n];
+          const double turn=std::acos(std::clamp(Dot(ToVec(a.Normal),ToVec(b.Normal)),-1.0,1.0))*180/pi;
+          // Coplanar pairs are common inside one tessellation strip.
+          if(turn>25)continue;
+          if(turn<.1 && node.Turn>60)continue;
+          sample(n,node.Depth+1,node.Travel+Distance(a.Centroid,b.Centroid),node.Error,node.Turn);
+        }
+      }
+      // Require at least two layers with an observable turn change. A
+      // solitary off-surface triangle is not a transition region.
+      double minTurn=90,maxTurn=0;int depth=0;
+      for(const auto &node:queue){minTurn=std::min(minTurn,node.Turn);maxTurn=std::max(maxTurn,node.Turn);depth=std::max(depth,node.Depth);}
+      if(depth<2 || maxTurn-minTurn<5)continue;
+      for(const auto &node:queue){int &label=labels[node.Face];
+        if(label==-1){label=int(id);transitionDepth[node.Face]=node.Depth;transitionTurn[node.Face]=node.Turn;}
+        else if(label!=int(id))label=-2;}
+    }
+    size_t patches=0,faces=0,torus=0,fitAttempts=0;
+    for(int seed=0;seed<int(labels.size());++seed){const int label=labels[seed];if(label<0)continue;
+      std::vector<int> group{seed};labels[seed]=-1;
+      for(size_t i=0;i<group.size();++i)for(int n:Neighbors[group[i]])if(n>=0 && labels[n]==label){labels[n]=-1;group.push_back(n);}
+      if(group.size()<4)continue;
+      int minDepth=33,maxDepth=0;double minTurn=90,maxTurn=0;
+      for(int f:group){minDepth=std::min(minDepth,transitionDepth[f]);maxDepth=std::max(maxDepth,transitionDepth[f]);
+        minTurn=std::min(minTurn,transitionTurn[f]);maxTurn=std::max(maxTurn,transitionTurn[f]);}
+      if(minDepth!=0 || maxDepth<2 || maxTurn-minTurn<5)continue;
+      MeshPatch patch;patch.SurfaceType=PatchSurfaceType::Freeform;patch.ProjectionTarget=PatchProjectionTarget::ReferenceMesh;
+      if(group.size()>=20 && fitAttempts<24){++fitAttempts;
+        auto fitted=FitOnly<TorusSurfaceFitter>(Sample(group,128));
+        if(Certify(group,fitted)){patch=std::move(fitted);++torus;}
+      }
+      patch.FeatureRole=PatchFeatureRole::FilletCandidate;
+      faces+=group.size();++patches;Store(std::move(group),std::move(patch));
+    }
+    if(Config.Verbose)std::clog << "[CadMesh] ruled end transitions: patches=" << patches << ", faces=" << faces
+        << ", torus=" << torus << ", evaluations=" << evaluated << ", budget_reached=" << (evaluated>=budget?"yes":"no") << '\n';
+  }
+  void ReassignSmallRuledStrips(){
+    // Reconsider whole small strips, preserving source connectivity and every
+    // face. Large residual regions require a separate local splitting pass.
+    const auto ruled=[](PatchSurfaceType t){return t==PatchSurfaceType::Cylinder || t==PatchSurfaceType::Cone;};
+    std::vector<std::pair<int,int>> moves;
+    size_t evaluated=0,ambiguous=0;
+    constexpr size_t budget=50000;
+    const double cosineLimit=std::cos(10.0*std::acos(-1.0)/180.0);
+    for(int id=0;id<int(Patches.size()) && evaluated<budget;++id){
+      const auto &source=Patches[id];
+      if((source.SurfaceType!=PatchSurfaceType::Plane && source.SurfaceType!=PatchSurfaceType::Freeform) ||
+         source.TriangleIds.empty() || source.TriangleIds.size()>32)continue;
+      bool slender=true;std::set<int> targets;
+      for(int f:source.TriangleIds){
+        if(SliverShortSide[f]<0){slender=false;break;}
+        for(int k=0;k<3;++k)if(k!=SliverShortSide[f]){
+          const int n=Neighbors[f][k];
+          if(n>=0 && Owner[n]>=0 && ruled(Patches[Owner[n]].SurfaceType))targets.insert(Owner[n]);
+        }
+      }
+      if(!slender)continue;
+      std::vector<int> accepted;bool complete=true;
+      for(int target:targets){
+        const auto &model=Patches[target];const double limit=GrowthTolerance(model);
+        bool valid=true;int longContacts=0;
+        for(int f:source.TriangleIds){
+          if(evaluated>=budget){complete=false;valid=false;break;}++evaluated;
+          const auto c=EvaluateSurfaceCompatibility(Mesh,f,model);
+          if(!c.Supported || c.ReliableNormalSamples<=0 || !std::isfinite(c.MaxNormalizedDistance) ||
+             c.MaxNormalizedDistance>limit || !std::isfinite(c.MaxNormalError) ||
+             std::cos(c.MaxNormalError)<cosineLimit){valid=false;break;}
+          const auto &triangle=Mesh.getTriangles()[f];
+          for(int k=0;k<3;++k){
+            double distance=0;Vec3 normal;
+            if(!SegmentationGuardDetail::SurfaceSample(model,ToVec(Mesh.getVertices()[triangle.VertexIds[k]].Position),distance,normal) ||
+               !std::isfinite(Dot(normal,ToVec(triangle.Normal))) ||
+               std::abs(Dot(normal,ToVec(triangle.Normal)))<cosineLimit){valid=false;break;}
+            if(k==SliverShortSide[f])continue;
+            const int n=Neighbors[f][k];if(n<0)continue;
+            const int neighbor=Owner[n];
+            if(neighbor==target)++longContacts;
+            else if(neighbor>=0 && neighbor!=id &&
+                    Patches[neighbor].SurfaceType!=PatchSurfaceType::Freeform &&
+                    !SameModelIdentity(model,Patches[neighbor])){valid=false;break;}
+          }
+          if(!valid)break;
+        }
+        if(valid && longContacts>=2)accepted.push_back(target);
+        if(!complete)break;
+      }
+      if(!complete)break;
+      if(accepted.empty())continue;
+      bool conflict=false;
+      for(int target:accepted)if(!SameModelIdentity(Patches[accepted.front()],Patches[target]))conflict=true;
+      if(conflict){++ambiguous;continue;}
+      moves.push_back({id,accepted.front()});
+    }
+    size_t facesMoved=0;
+    // Choices use frozen owners/models. Only Plane/Freeform sources can move
+    // into ruled targets, so no source can also be a destination.
+    for(const auto &move:moves){auto &faces=Patches[move.first].TriangleIds;
+      auto &destination=Patches[move.second].TriangleIds;
+      facesMoved+=faces.size();destination.insert(destination.end(),faces.begin(),faces.end());faces.clear();}
+    if(!moves.empty()){
+      auto prior=std::move(Patches);Patches.clear();
+      for(auto &patch:prior)if(!patch.TriangleIds.empty()){
+        auto faces=std::move(patch.TriangleIds);Store(std::move(faces),std::move(patch));}
+    }
+    if(Config.Verbose)std::clog << "[CadMesh] ruled strip reassignment: patches=" << moves.size()
+        << ", faces=" << facesMoved << ", evaluations=" << evaluated << ", ambiguous=" << ambiguous
+        << ", budget_reached=" << (evaluated>=budget?"yes":"no") << '\n';
+  }
+  void AssignSliversFromLongSides(){
+    std::vector<int> choices(Owner.size(),-1);
+    for(int f=0;f<int(Owner.size());++f){
+      if(Owner[f]>=0 || SliverShortSide[f]<0)continue;
+      std::vector<std::pair<double,int>> candidates;
+      for(int k=0;k<3;++k){if(k==SliverShortSide[f])continue;
+        const int n=Neighbors[f][k];if(n<0||Owner[n]<0)continue;
+        const int id=Owner[n];auto model=Patches[id];
+        if(!Certify(std::vector<int>{f},model))continue;
+        const auto c=EvaluateSurfaceCompatibility(Mesh,f,model);
+        const double score=c.MaxNormalizedDistance/std::max(Config.ModelFitToleranceRatio,1e-12)+
+            c.MaxNormalError/std::max(Config.ModelNormalTolerance,1e-12);
+        candidates.push_back({score,id});
+      }
+      std::sort(candidates.begin(),candidates.end());
+      if(candidates.empty())continue;
+      if(candidates.size()>1 && candidates[0].second!=candidates[1].second &&
+         !SameModelIdentity(Patches[candidates[0].second],Patches[candidates[1].second]) &&
+         candidates[0].first+.1>=candidates[1].first)continue;
+      choices[f]=candidates.front().second;
+    }
+    // Decide from one immutable ownership snapshot; do not propagate an
+    // assignment down an entire thin strip in one sweep.
+    int assigned=0;
+    for(int seed=0;seed<int(choices.size());++seed){const int target=choices[seed];if(target<0)continue;
+      std::vector<int> faces{seed};choices[seed]=-1;
+      for(size_t k=0;k<faces.size();++k)for(int n:Neighbors[faces[k]])
+        if(n>=0 && choices[n]==target && !NarrowLink(faces[k],n)){choices[n]=-1;faces.push_back(n);}
+      auto model=Patches[target];
+      if(Certify(faces,model)){assigned+=int(faces.size());Store(std::move(faces),model);}
+    }
+    if(Config.Verbose)std::clog << "[CadMesh] long-side sliver assignments=" << assigned << '\n';
+  }
   void Residuals() {
+    // Separate bounded last-chance budget, capped even on huge residuals.
+    int recoveryBudget=std::min(256,std::max(0,Config.ModelResidualSeedBudget));
+    int recoveryAttempts=0,recoveredCores=0;
     // -1 means undiscovered; -2 means already collected by this traversal.
     // Never use Owner < 0 here: deferred commits would collect visited faces
     // again as singleton components and overwrite their previous ownership.
@@ -1037,7 +1612,7 @@ class ModelPartition {
         Owner[seed] = -2;
         for (size_t k = 0; k < faces.size(); ++k)
           for (int n : Neighbors[faces[k]])
-            if (n >= 0 && Owner[n] == -1) {
+            if (n >= 0 && Owner[n] == -1 && !NarrowLink(faces[k],n)) {
               Owner[n] = -2;
               faces.push_back(n);
             }
@@ -1047,12 +1622,22 @@ class ModelPartition {
             !Certify(faces, model)) {
           if (SplitSupportedPlanarComponent(faces))
             continue;
+          if(RecoverResidualCore(faces,recoveryBudget,recoveryAttempts)){
+            ++recoveredCores;
+            // Store may also certify newly exposed components. Release only
+            // uncommitted traversal markers, then rediscover connectivity.
+            for(int f:faces)if(Owner[f]==-2)Owner[f]=-1;
+            --seed;
+            continue;
+          }
           model = FitOnly<FreeformSurfaceFitter>(faces);
           model.SurfaceType = PatchSurfaceType::Freeform;
           model.Parameters = {};
         }
         Store(std::move(faces), model);
       }
+    if(Config.Verbose)std::clog << "[CadMesh] residual local recovery: attempts=" << recoveryAttempts
+        << ", recovered_cores=" << recoveredCores << ", remaining_budget=" << recoveryBudget << '\n';
   }
   bool SameModelIdentity(const MeshPatch &a, const MeshPatch &b) const {
     if (a.SurfaceType != b.SurfaceType ||
@@ -1659,16 +2244,55 @@ public:
                   << " s\n";
     };
     stage("model neighbors", [&] { BuildNeighbors(); });
+    if(Config.ModelCylindersOnly || Config.ModelConesOnly){
+      // Cells are sampling aids only: no plane or other primitive owns faces.
+      stage("single-primitive sampling cells", [&] { BuildCells(); });
+      stage("narrow sampling links", [&] { BuildNarrowLinks(); });
+      if(Config.ModelConesOnly)stage("cone circumferential candidates", [&] { ExtractConeCircumferentialCandidates(); });
+      stage("single-primitive strip candidates", [&] { ExtractRuledStrips(); });
+      stage("single-primitive core search", [&] { ExtractCurves(); });
+      stage("single-primitive ring absorption", [&] { AbsorbRuledRings(); });
+      if(Config.ModelConesOnly){
+        stage("residual cone search", [&] { DiscoverResidualModels(); });
+        stage("residual cone absorption", [&] { AbsorbRuledRings(); });
+      }
+      const size_t coreCount=Patches.size();
+      stage("ruled end transitions", [&] { ExtractRuledEndTransitions(); });
+      const size_t transitionCount=Patches.size()-coreCount;
+      size_t residualFaces=0;
+      for(int seed=0;seed<int(Owner.size());++seed)if(Owner[seed]<0){
+        std::vector<int> faces{seed};Owner[seed]=-2;
+        for(size_t i=0;i<faces.size();++i)for(int n:Neighbors[faces[i]])
+          if(n>=0 && Owner[n]==-1){Owner[n]=-2;faces.push_back(n);}
+        residualFaces+=faces.size();MeshPatch patch;
+        patch.SurfaceType=PatchSurfaceType::Unknown;
+        Store(std::move(faces),std::move(patch));
+      }
+      if(Config.Verbose)std::clog << (Config.ModelConesOnly ? "[CadMesh] cones-only partition: cone_patches=" : "[CadMesh] cylinders-only partition: cylinder_patches=") << coreCount
+          << ", transition_patches=" << transitionCount << ", unrecognized_patches=" << Patches.size()-coreCount-transitionCount << ", unrecognized_faces=" << residualFaces << '\n';
+      if(Config.ModelConesOnly && Config.Verbose)std::clog << "[CadMesh] cone angular support rejections=" << ConeSupportRejected << '\n';
+      return std::move(Patches);
+    }
     stage("whole component fits", [&] { WholeComponents(); });
     stage("planar cells", [&] { BuildCells(); });
-    stage("mother planes", [&] { ExtractPlaneCores(); });
+    stage("narrow sampling links", [&] { BuildNarrowLinks(); });
+    stage("ruled strip candidates", [&] { ExtractRuledStrips(); });
+    stage("early cylinder/cone absorption", [&] { AbsorbRuledRings(); });
+    stage("strict planar cores", [&] { ExtractPlaneCores(true); });
     stage("analytic seed search", [&] { ExtractCurves(); });
     LogRemainingProbes("analytic seed search");
+    // Certify curved cores before large planes grow into their shallow trims.
+    // WholeComponents still compares complete components; no primitive is
+    // accepted merely because it was visited earlier.
+    stage("mother planes", [&] { ExtractPlaneCores(); });
     stage("residual seed search", [&] { DiscoverResidualModels(); });
     LogRemainingProbes("residual seed search");
+    stage("residual cylinder/cone absorption", [&] { AbsorbRuledRings(); });
+    stage("long-side sliver assignment", [&] { AssignSliversFromLongSides(); });
     RemainingFailures.clear();
     RemainingCachedFaces = 0;
     stage("residual classification", [&] { Residuals(); });
+    stage("small ruled strip reassignment", [&] { ReassignSmallRuledStrips(); });
     stage("analytic adjacency merge", [&] { MergeAnalyticFragments(); });
     stage("residual seam bridging", [&] { BridgeResidualSeams(); });
     return std::move(Patches);

@@ -1,6 +1,7 @@
 """GPU surface sampling followed by feature-safe local retriangulation."""
 
 from dataclasses import dataclass
+import os
 from time import perf_counter
 
 import numpy as np
@@ -397,7 +398,7 @@ def _triangle_quality_numpy(vertices, faces):
     ).clip(0.0, 1.0)
 
 
-def _unique_edges_torch(faces):
+def _unique_edges_torch(faces, vertex_count=None):
     edges = torch.cat(
         (
             faces[:, (0, 1)],
@@ -406,11 +407,22 @@ def _unique_edges_torch(faces):
         ),
         dim=0,
     )
-    return torch.unique(torch.sort(edges, dim=1).values, dim=0)
+    if len(edges) == 0:
+        return edges
+    if vertex_count is None:
+        vertex_count = int(faces.max().item()) + 1
+    low = torch.minimum(edges[:, 0], edges[:, 1])
+    high = torch.maximum(edges[:, 0], edges[:, 1])
+    keys = torch.unique(low * vertex_count + high, sorted=True)
+    return torch.stack(
+        (torch.div(keys, vertex_count, rounding_mode="floor"), keys % vertex_count),
+        dim=1,
+    )
 
 
-def _mesh_energy_torch(vertices, faces):
-    edges = _unique_edges_torch(faces)
+def _mesh_energy_torch(vertices, faces, edges=None, quality=None):
+    if edges is None:
+        edges = _unique_edges_torch(faces, len(vertices))
     lengths = torch.linalg.norm(
         vertices[edges[:, 0]] - vertices[edges[:, 1]],
         dim=1,
@@ -420,7 +432,8 @@ def _mesh_energy_torch(vertices, faces):
     edge_cv_squared = ((lengths - mean_length) ** 2).mean() / (
         mean_length * mean_length
     )
-    quality = _triangle_quality_torch(vertices, faces)
+    if quality is None:
+        quality = _triangle_quality_torch(vertices, faces)
     return edge_cv_squared + ((1.0 - quality) ** 2).mean()
 
 
@@ -837,11 +850,14 @@ def subdivide_original_faces(
         )
     )
     sorted_edges = np.sort(stacked_edges, axis=1)
-    unique_edges, edge_inverse = np.unique(
-        sorted_edges,
-        axis=0,
+    # Integer keys retain the same lexicographic edge order without NumPy's
+    # substantially more expensive row-record sorting for every source face.
+    vertex_count = len(vertices)
+    unique_keys, edge_inverse = np.unique(
+        sorted_edges[:, 0] * vertex_count + sorted_edges[:, 1],
         return_inverse=True,
     )
+    unique_edges = np.column_stack((unique_keys // vertex_count, unique_keys % vertex_count))
     face_edge_ids = edge_inverse.reshape(3, len(faces)).T
     active_edge_ids = np.unique(
         face_edge_ids[np.unique(sample_face_ids)].reshape(-1)
@@ -855,17 +871,12 @@ def subdivide_original_faces(
         np.tile(eligible_face_mask, 3),
     )
     if protected_internal_edges is not None and len(protected_internal_edges):
-        protected_keys = {
-            tuple(edge)
-            for edge in np.sort(
-                np.asarray(protected_internal_edges, dtype=np.int64),
-                axis=1,
-            )
-        }
-        protected_edge_mask = np.asarray(
-            [tuple(edge) in protected_keys for edge in unique_edges],
-            dtype=bool,
-        )
+        protected = np.sort(np.asarray(protected_internal_edges, dtype=np.int64), axis=1)
+        # Out-of-range pairs could never match a source edge. Filter before
+        # packing so an invalid pair cannot alias another valid integer key.
+        protected = protected[(protected[:, 0] >= 0) & (protected[:, 1] < vertex_count)]
+        protected_keys = protected[:, 0] * vertex_count + protected[:, 1]
+        protected_edge_mask = np.isin(unique_keys, protected_keys)
         edge_is_safe &= ~protected_edge_mask
     active_edge_ids = active_edge_ids[edge_is_safe[active_edge_ids]]
     edge_point_ids = {}
@@ -1165,7 +1176,9 @@ def _gpu_edge_topology(faces, vertex_count):
     }
 
 
-def _gpu_independent_candidates(candidate_vertices, priorities, candidate_count):
+def _gpu_independent_candidates(
+    candidate_vertices, priorities, candidate_count, vertex_count=None,
+):
     """
     Select candidates with disjoint vertex footprints.
 
@@ -1179,21 +1192,29 @@ def _gpu_independent_candidates(candidate_vertices, priorities, candidate_count)
             dtype=torch.long,
             device=candidate_vertices.device,
         )
-    vertex_count = int(candidate_vertices[:, 1].max().item()) + 1
-    pair_keys = (
-        candidate_vertices[:, 1] * (int(candidate_count) + 1)
-        + priorities[candidate_vertices[:, 0]]
+    if vertex_count is None:
+        vertex_count = int(candidate_vertices[:, 1].max().item()) + 1
+    pair_candidates = candidate_vertices[:, 0]
+    pair_vertices = candidate_vertices[:, 1]
+    # Candidate IDs break ties as well, so even callers supplying equal
+    # priorities can never select overlapping footprints.
+    pair_priorities = priorities[pair_candidates] * (candidate_count + 1) + pair_candidates
+    # Only the minimum at each vertex is needed. Sorting all cavity records
+    # by a packed (vertex, priority) key was O(k log k) on every pass.
+    best_priority = torch.full(
+        (vertex_count,), torch.iinfo(torch.long).max,
+        dtype=torch.long, device=candidate_vertices.device,
     )
-    order = torch.argsort(pair_keys)
-    ordered_vertices = candidate_vertices[order, 1]
-    first = torch.ones(
-        len(order),
-        dtype=torch.bool,
-        device=order.device,
+    best_priority.scatter_reduce_(
+        0, pair_vertices, pair_priorities, reduce="amin", include_self=True,
     )
-    first[1:] = ordered_vertices[1:] != ordered_vertices[:-1]
-    winners = candidate_vertices[order[first], 0]
-    win_counts = torch.bincount(winners, minlength=candidate_count)
+    win_counts = torch.zeros(
+        candidate_count, dtype=torch.long, device=candidate_vertices.device,
+    )
+    win_counts.index_add_(
+        0, pair_candidates,
+        (pair_priorities == best_priority[pair_vertices]).to(torch.long),
+    )
     footprint_counts = torch.bincount(
         candidate_vertices[:, 0],
         minlength=candidate_count,
@@ -1201,6 +1222,93 @@ def _gpu_independent_candidates(candidate_vertices, priorities, candidate_count)
     return torch.nonzero(
         win_counts == footprint_counts
     ).reshape(-1)
+
+
+class _AnalyticSplitProjector:
+    """Project interior split proposals to their supplied analytic domain.
+
+    A model proposes a point only. The immutable reference patch still decides
+    whether both child triangles satisfy the distance and oriented-normal
+    limits, so an analytic fit never exempts a split from geometric checks.
+    """
+
+    def __init__(self, patches, device, tolerance, active_patch_ids=None):
+        kinds = {"Cylinder": 2, "Cone": 3, "Sphere": 4, "Torus": 5}
+        records = []
+        active_labels = None if active_patch_ids is None else set(map(int, active_patch_ids))
+        items = patches.items() if isinstance(patches, dict) else enumerate(patches)
+        for label, patch in items:
+            kind = kinds.get(patch.get("type"))
+            if kind is None:
+                continue
+            parameters = patch.get("parameters")
+            if not isinstance(parameters, dict):
+                raise ValueError(f"Analytic split patch {label} is missing surface parameters.")
+            origin = np.asarray(parameters.get("center" if kind == 4 else "axis_origin"), dtype=np.float64)
+            axis = (np.array([0., 0., 1.]) if kind == 4 else
+                    np.asarray(parameters.get("axis_direction"), dtype=np.float64))
+            if (origin.shape != (3,) or axis.shape != (3,) or not np.isfinite(origin).all()
+                    or not np.isfinite(axis).all() or not np.linalg.norm(axis) > 0):
+                raise ValueError(f"Analytic split patch {label} has invalid origin or axis.")
+            axis = axis / np.linalg.norm(axis)
+            radius = float(parameters.get("radius", np.nan)) if kind in (2, 4) else 1.
+            angle = float(parameters.get("semi_angle_radians", np.nan)) if kind == 3 else .25
+            major = float(parameters.get("major_radius", np.nan)) if kind == 5 else 2.
+            minor = float(parameters.get("minor_radius", np.nan)) if kind == 5 else 1.
+            if (not np.isfinite([radius, angle, major, minor]).all()
+                    or (kind in (2, 4) and radius <= 0)
+                    or (kind == 3 and not 0 < angle < np.pi / 2)
+                    or (kind == 5 and not major > minor > 0)):
+                raise ValueError(f"Analytic split patch {label} has invalid surface dimensions.")
+            if active_labels is None or int(label) in active_labels:
+                records.append((int(label), kind, origin, axis, radius, angle, major, minor))
+        records.sort(key=lambda row: row[0])
+        self.labels = torch.tensor([r[0] for r in records], device=device, dtype=torch.long)
+        self.kinds = torch.tensor([r[1] for r in records], device=device, dtype=torch.long)
+        self.origins = torch.as_tensor(np.array([r[2] for r in records]).reshape(-1, 3),
+                                       device=device, dtype=torch.float64)
+        self.axes = torch.as_tensor(np.array([r[3] for r in records]).reshape(-1, 3),
+                                    device=device, dtype=torch.float64)
+        self.dimensions = torch.as_tensor(np.array([r[4:] for r in records]).reshape(-1, 4),
+                                          device=device, dtype=torch.float64)
+        self.tolerance = float(tolerance)
+
+    def project(self, points, labels):
+        if not len(self.labels):
+            return points, torch.zeros_like(labels, dtype=torch.bool), torch.ones_like(labels, dtype=torch.bool)
+        rows = torch.searchsorted(self.labels, labels.contiguous())
+        rows = rows.clamp_max(len(self.labels) - 1)
+        curved = self.labels[rows] == labels
+        kind = self.kinds[rows]
+        origin, axis = self.origins[rows], self.axes[rows]
+        radius, angle, major, minor = self.dimensions[rows].unbind(dim=1)
+        offset = points - origin
+        height = (offset * axis).sum(dim=1)
+        radial = offset - height[:, None] * axis
+        radial_length = torch.linalg.norm(radial, dim=1)
+        radial_unit = radial / radial_length.clamp_min(torch.finfo(points.dtype).tiny)[:, None]
+        projected = origin + height[:, None] * axis + radius[:, None] * radial_unit
+        stable = radial_length > self.tolerance
+
+        sine, cosine = torch.sin(angle), torch.cos(angle)
+        slant = height * cosine + radial_length * sine
+        cone = origin + (slant * cosine)[:, None] * axis + (slant * sine)[:, None] * radial_unit
+        projected = torch.where((kind == 3)[:, None], cone, projected)
+        stable &= (kind != 3) | (slant > self.tolerance)
+
+        center_distance = torch.linalg.norm(offset, dim=1)
+        sphere = origin + radius[:, None] * offset / center_distance.clamp_min(torch.finfo(points.dtype).tiny)[:, None]
+        projected = torch.where((kind == 4)[:, None], sphere, projected)
+        stable = torch.where(kind == 4, center_distance > self.tolerance, stable)
+
+        circle = origin + major[:, None] * radial_unit
+        tube = points - circle
+        tube_distance = torch.linalg.norm(tube, dim=1)
+        torus = circle + minor[:, None] * tube / tube_distance.clamp_min(torch.finfo(points.dtype).tiny)[:, None]
+        projected = torch.where((kind == 5)[:, None], torus, projected)
+        stable &= (kind != 5) | (tube_distance > self.tolerance)
+        stable &= torch.isfinite(projected).all(dim=1)
+        return torch.where(curved[:, None], projected, points), curved, ~curved | stable
 
 
 def _gpu_split_long_edges(
@@ -1213,13 +1321,20 @@ def _gpu_split_long_edges(
     maximum_passes,
     protected_edges=None,
     source_face_maximum_edge_lengths=None,
+    reference_patch_projector=None,
+    maximum_surface_deviation=None,
+    maximum_normal_deviation_degrees=None,
+    candidate_maximum_normal_deviation_degrees=None,
+    analytic_split_projector=None,
+    diagnostics=None,
 ):
     """
     Bisect conflict-free long edges until the requested bound is reached.
 
-    This runs before quality flips. At that point every edge lies inside one
-    original source triangle or on a shared source edge, so its midpoint is
-    still exactly on the input STL surface.
+    Whole-patch pre-collapse and pre-flip can already cross source triangles.
+    Prefer analytic midpoint proposals, with reference and chord fallbacks.
+    Validate both children before mutation; never defer restoration of a
+    rejected normal to later relaxation.
     """
     maximum_edge_length = float(maximum_edge_length)
     maximum_passes = int(maximum_passes)
@@ -1248,6 +1363,26 @@ def _gpu_split_long_edges(
             device=vertices.device,
         )
     total_splits = 0
+    attempted_passes = 0
+    fallback_splits = 0
+    normal_limit_fallback_splits = 0
+    rejected_edges = torch.empty((0, 2), device=faces.device, dtype=torch.long)
+    allowed_normal_limit = maximum_normal_deviation_degrees
+    if candidate_maximum_normal_deviation_degrees is not None:
+        allowed_normal_limit = (
+            float(candidate_maximum_normal_deviation_degrees) if allowed_normal_limit is None else
+            min(allowed_normal_limit, float(candidate_maximum_normal_deviation_degrees))
+        )
+    if allowed_normal_limit is not None and (not np.isfinite(allowed_normal_limit)
+                                             or not 0 <= allowed_normal_limit <= 180):
+        raise ValueError("Split candidate normal limit must be finite and in [0, 180].")
+    # Prefer the existing normal safety margin, but mandatory refinement may
+    # use the declared limit when no proposal passes that stricter preference.
+    candidate_normal_limit = allowed_normal_limit
+    if maximum_normal_deviation_degrees is not None:
+        candidate_normal_limit = min(allowed_normal_limit, .5 * float(maximum_normal_deviation_degrees))
+    retry_normal_limit = (allowed_normal_limit is not None
+                          and allowed_normal_limit > candidate_normal_limit)
 
     for _ in range(maximum_passes):
         topology = _gpu_edge_topology(faces, len(vertices))
@@ -1305,16 +1440,14 @@ def _gpu_split_long_edges(
                     protected_edge_keys,
                 )
             ]
+        if len(rejected_edges) and len(candidate_groups):
+            rejected_keys = rejected_edges[:, 0] * len(vertices) + rejected_edges[:, 1]
+            candidate_edges = topology["edges"][candidate_groups]
+            candidate_keys = candidate_edges[:, 0] * len(vertices) + candidate_edges[:, 1]
+            candidate_groups = candidate_groups[~torch.isin(candidate_keys, rejected_keys)]
         if len(candidate_groups) == 0:
-            return (
-                vertices,
-                faces,
-                face_patch_ids,
-                face_source_ids,
-                support_face_ids,
-                total_splits,
-                0,
-            )
+            break
+        attempted_passes += 1
 
         candidate_counts = topology["counts"][candidate_groups]
         first_entries = topology["order"][
@@ -1413,6 +1546,134 @@ def _gpu_split_long_edges(
         old_patch_ids = face_patch_ids[incidence_faces]
         old_source_ids = face_source_ids[incidence_faces]
 
+        if reference_patch_projector is not None:
+            chord_vertices = new_vertices.clone()
+            first_owner_faces = topology["face_ids"][selected_first_entries]
+            midpoint_labels = face_patch_ids[first_owner_faces]
+            interior = selected_counts == 2
+            if len(selected_second_entries):
+                interior[selected_second_mask] &= (
+                    midpoint_labels[selected_second_mask]
+                    == face_patch_ids[topology["face_ids"][selected_second_entries]]
+                )
+            # Cross-domain/open/computational interfaces are sampled once by
+            # the global boundary pass. A local analytic projection must never
+            # create a separate point on either side of such a shared edge.
+            candidate_valid = interior.clone()
+            curved = torch.zeros_like(candidate_valid)
+            if analytic_split_projector is not None:
+                projected, curved, analytic_valid = analytic_split_projector.project(
+                    new_vertices, midpoint_labels,
+                )
+                new_vertices = projected
+                candidate_valid &= analytic_valid
+            reference_candidates = torch.nonzero(interior & ~curved).reshape(-1)
+            if len(reference_candidates):
+                projected, _ = reference_patch_projector.project(
+                    new_vertices[reference_candidates], midpoint_labels[reference_candidates],
+                )
+                new_vertices[reference_candidates] = projected
+            candidate_valid &= torch.isfinite(new_vertices).all(dim=1)
+
+            parent_cross = torch.cross(vertices[ends] - vertices[starts],
+                                       vertices[opposite] - vertices[starts], dim=1)
+
+            def validate_proposals(proposals, active, normal_limit=candidate_normal_limit):
+                valid = active & torch.isfinite(proposals).all(dim=1)
+                incidence = torch.nonzero(valid[incidence_candidates]).reshape(-1)
+                if not len(incidence):
+                    return valid
+                positions = proposals[incidence_candidates[incidence]]
+                first_triangles = torch.stack(
+                    (vertices[starts[incidence]], positions, vertices[opposite[incidence]]), dim=1,
+                )
+                second_triangles = torch.stack(
+                    (positions, vertices[ends[incidence]], vertices[opposite[incidence]]), dim=1,
+                )
+                first_cross = torch.cross(first_triangles[:, 1] - first_triangles[:, 0],
+                                          first_triangles[:, 2] - first_triangles[:, 0], dim=1)
+                second_cross = torch.cross(second_triangles[:, 1] - second_triangles[:, 0],
+                                           second_triangles[:, 2] - second_triangles[:, 0], dim=1)
+                incidence_valid = (
+                    torch.isfinite(first_cross).all(dim=1)
+                    & torch.isfinite(second_cross).all(dim=1)
+                    & ((first_cross * parent_cross[incidence]).sum(dim=1) > 0)
+                    & ((second_cross * parent_cross[incidence]).sum(dim=1) > 0)
+                )
+                query = torch.nonzero(incidence_valid).reshape(-1)
+                if len(query):
+                    labels = old_patch_ids[incidence[query]]
+                    checked = reference_patch_projector.valid_triangles(
+                        torch.cat((first_triangles[query], second_triangles[query]), dim=0),
+                        torch.cat((labels, labels), dim=0),
+                        maximum_surface_deviation, normal_limit,
+                    )
+                    incidence_valid[query] &= checked[:len(query)] & checked[len(query):]
+                valid[incidence_candidates[incidence[~incidence_valid]]] = False
+                return valid
+
+            normal_fallback_proposals = (
+                [(new_vertices.clone(), candidate_valid.clone())] if retry_normal_limit else []
+            )
+            candidate_valid = validate_proposals(new_vertices, candidate_valid)
+            preferred_valid = candidate_valid.clone()
+            retry = interior & curved & ~candidate_valid
+            if bool(retry.any()):
+                # An analytic fit is only a proposal. On thin or faceted input,
+                # its midpoint can rotate a child outside the reference limits.
+                # Retry projection of the original chord onto the reference.
+                proposals = chord_vertices.clone()
+                proposals[retry], _ = reference_patch_projector.project(
+                    chord_vertices[retry], midpoint_labels[retry],
+                )
+                if retry_normal_limit:
+                    normal_fallback_proposals.append((proposals, retry))
+                fallback_valid = validate_proposals(proposals, retry)
+                new_vertices[fallback_valid] = proposals[fallback_valid]
+                candidate_valid |= fallback_valid
+            retry = interior & ~candidate_valid
+            if bool(retry.any()):
+                # Exact bisection preserves planar source faces, including
+                # slivers whose nearest-point projection is numerically unstable.
+                # It still must pass every reference check on both children.
+                fallback_valid = validate_proposals(chord_vertices, retry)
+                new_vertices[fallback_valid] = chord_vertices[fallback_valid]
+                candidate_valid |= fallback_valid
+            if retry_normal_limit and bool((interior & ~candidate_valid).any()):
+                normal_fallback_proposals.append((chord_vertices, interior))
+                for proposals, available in normal_fallback_proposals:
+                    retry = available & ~candidate_valid
+                    if not bool(retry.any()):
+                        continue
+                    fallback_valid = validate_proposals(proposals, retry, allowed_normal_limit)
+                    new_vertices[fallback_valid] = proposals[fallback_valid]
+                    candidate_valid |= fallback_valid
+                    normal_limit_fallback_splits += int(fallback_valid.sum().item())
+            fallback_splits += int((candidate_valid & ~preferred_valid).sum().item())
+            rejected_edges = torch.cat((rejected_edges, selected_edges[~candidate_valid]), dim=0)
+            accepted = torch.nonzero(candidate_valid).reshape(-1)
+            if not len(accepted):
+                # Try the other edges of these cavities on the next pass;
+                # repeatedly selecting the rejected longest edge starves them.
+                continue
+            keep_incidence = candidate_valid[incidence_candidates]
+            compact_ids = torch.full_like(selected_ids, -1)
+            compact_ids[accepted] = torch.arange(len(accepted), device=faces.device)
+            selected_second_entries = selected_second_entries[candidate_valid[selected_second_mask]]
+            selected = selected[accepted]
+            selected_edges = selected_edges[accepted]
+            selected_counts = selected_counts[accepted]
+            selected_first_entries = selected_first_entries[accepted]
+            selected_second_mask = selected_counts == 2
+            new_vertices = new_vertices[accepted]
+            new_vertex_ids = torch.arange(len(vertices), len(vertices) + len(accepted),
+                                          dtype=torch.long, device=faces.device)
+            incidence_candidates = compact_ids[incidence_candidates[keep_incidence]]
+            incidence_faces = incidence_faces[keep_incidence]
+            starts, ends, opposite = starts[keep_incidence], ends[keep_incidence], opposite[keep_incidence]
+            old_patch_ids, old_source_ids = old_patch_ids[keep_incidence], old_source_ids[keep_incidence]
+            midpoint_ids = new_vertex_ids[incidence_candidates]
+
         faces[incidence_faces] = torch.stack(
             (starts, midpoint_ids, opposite),
             dim=1,
@@ -1463,6 +1724,19 @@ def _gpu_split_long_edges(
         )
         vertices = torch.cat((vertices, new_vertices), dim=0)
         total_splits += len(selected)
+        if len(rejected_edges):
+            # A neighbouring successful split changes the candidate cavity.
+            # Reconsider its rejected edges instead of caching a stale failure.
+            changed_edges = torch.sort(torch.cat((
+                torch.stack((starts, ends), dim=1),
+                torch.stack((ends, opposite), dim=1),
+                torch.stack((opposite, starts), dim=1),
+            )), dim=1).values
+            changed_keys = changed_edges[:, 0] * len(vertices) + changed_edges[:, 1]
+            rejected_keys = rejected_edges[:, 0] * len(vertices) + rejected_edges[:, 1]
+            rejected_edges = rejected_edges[
+                ~torch.isin(rejected_keys, changed_keys)
+            ]
 
     topology = _gpu_edge_topology(faces, len(vertices))
     final_lengths = torch.linalg.norm(
@@ -1489,9 +1763,49 @@ def _gpu_split_long_edges(
                     face_source_ids[topology["face_ids"][second_entries]]
                 ],
             )
-    remaining = int(
-        (final_lengths[final_groups] > final_limits[final_groups]).sum().item()
-    )
+    remaining = int((final_lengths > final_limits).sum().item())
+    if diagnostics is not None:
+        long_edges = final_lengths > final_limits
+        edge_keys = topology["edges"][:, 0] * len(vertices) + topology["edges"][:, 1]
+        protected_mask = torch.zeros_like(long_edges)
+        if protected_edges is not None and len(protected_edges):
+            protected_keys = protected_edges[:, 0] * len(vertices) + protected_edges[:, 1]
+            protected_mask = torch.isin(edge_keys, protected_keys)
+        rejected_mask = torch.zeros_like(long_edges)
+        if len(rejected_edges):
+            rejected_keys = rejected_edges[:, 0] * len(vertices) + rejected_edges[:, 1]
+            rejected_mask = torch.isin(edge_keys, rejected_keys)
+        manifold_mask = topology["counts"] <= 2
+        protected_long = int((long_edges & protected_mask).sum().item())
+        rejected_long = int((long_edges & rejected_mask & ~protected_mask).sum().item())
+        nonmanifold_long = int((long_edges & ~manifold_mask).sum().item())
+        eligible_long = int((long_edges & manifold_mask & ~protected_mask & ~rejected_mask).sum().item())
+        if not bool(long_edges.any()):
+            stop_reason = "converged"
+        elif eligible_long and attempted_passes >= maximum_passes:
+            stop_reason = "pass_limit"
+        elif rejected_long:
+            stop_reason = "geometric_rejections"
+        elif protected_long:
+            stop_reason = "protected_constraints"
+        elif nonmanifold_long:
+            stop_reason = "nonmanifold_edges"
+        else:
+            stop_reason = "no_selectable_edges"
+        diagnostics.update({
+            "stop_reason": stop_reason,
+            "attempted_passes": attempted_passes,
+            "maximum_passes": maximum_passes,
+            "remaining_long_edges": remaining,
+            "protected_long_edges": protected_long,
+            "rejected_long_edges": rejected_long,
+            "nonmanifold_long_edges": nonmanifold_long,
+            "eligible_long_edges": eligible_long,
+            "maximum_edge_length": float(final_lengths.max().item()) if len(final_lengths) else 0.0,
+            "fallback_splits": fallback_splits,
+            "normal_limit_fallback_splits": normal_limit_fallback_splits,
+            "normal_limit_degrees": allowed_normal_limit,
+        })
     return (
         vertices,
         faces,
@@ -1523,6 +1837,7 @@ def _gpu_vertex_ragged_pairs(edges, candidate_edges, vertex_count):
     first_degrees = degrees[candidate_edges[:, 0]]
     second_degrees = degrees[candidate_edges[:, 1]]
     totals = first_degrees + second_degrees
+    pair_count = int(totals.sum().item())
     candidate_ids = torch.repeat_interleave(
         torch.arange(
             len(candidate_edges),
@@ -1530,13 +1845,11 @@ def _gpu_vertex_ragged_pairs(edges, candidate_edges, vertex_count):
             device=edges.device,
         ),
         totals,
+        output_size=pair_count,
     )
-    repeated_starts = torch.repeat_interleave(
-        torch.cumsum(totals, dim=0) - totals,
-        totals,
-    )
+    repeated_starts = (torch.cumsum(totals, dim=0) - totals)[candidate_ids]
     local_offsets = torch.arange(
-        int(totals.sum().item()),
+        pair_count,
         dtype=torch.long,
         device=edges.device,
     ) - repeated_starts
@@ -1574,9 +1887,10 @@ def _gpu_vertex_ragged_pairs(edges, candidate_edges, vertex_count):
     return unique_pairs, common_counts
 
 
-def _gpu_candidate_face_pairs(faces, candidate_edges):
+def _gpu_candidate_face_pairs(faces, candidate_edges, vertex_count=None):
     """Expand candidate endpoints to unique candidate/incident-face pairs."""
-    vertex_count = int(faces.max().item()) + 1
+    if vertex_count is None:
+        vertex_count = int(faces.max().item()) + 1
     flat_vertices = faces.reshape(-1)
     flat_face_ids = torch.arange(
         len(faces),
@@ -1595,6 +1909,7 @@ def _gpu_candidate_face_pairs(faces, candidate_edges):
     first_degrees = degrees[candidate_edges[:, 0]]
     second_degrees = degrees[candidate_edges[:, 1]]
     totals = first_degrees + second_degrees
+    pair_count = int(totals.sum().item())
     candidate_ids = torch.repeat_interleave(
         torch.arange(
             len(candidate_edges),
@@ -1602,13 +1917,11 @@ def _gpu_candidate_face_pairs(faces, candidate_edges):
             device=faces.device,
         ),
         totals,
+        output_size=pair_count,
     )
-    repeated_starts = torch.repeat_interleave(
-        torch.cumsum(totals, dim=0) - totals,
-        totals,
-    )
+    repeated_starts = (torch.cumsum(totals, dim=0) - totals)[candidate_ids]
     local_offsets = torch.arange(
-        int(totals.sum().item()),
+        pair_count,
         dtype=torch.long,
         device=faces.device,
     ) - repeated_starts
@@ -1622,19 +1935,32 @@ def _gpu_candidate_face_pairs(faces, candidate_edges):
         - repeated_first_degrees,
     )
     incident_faces = sorted_face_ids[face_offsets]
-    pair_keys = candidate_ids * len(faces) + incident_faces
-    unique_pair_keys = torch.unique(pair_keys, sorted=True)
-    return torch.stack(
-        (
-            torch.div(
-                unique_pair_keys,
-                len(faces),
-                rounding_mode="floor",
-            ),
-            unique_pair_keys % len(faces),
-        ),
+    # Each endpoint's incidence list is already unique. Only faces containing
+    # both endpoints occur twice, so keep their first-endpoint occurrence.
+    # This removes a sort of the entire expanded cavity table each pass.
+    first_endpoint = candidate_edges[candidate_ids, 0]
+    duplicate = ~from_first & (
+        faces[incident_faces] == first_endpoint[:, None]
+    ).any(dim=1)
+    return torch.stack((candidate_ids, incident_faces), dim=1)[~duplicate]
+
+
+def _gpu_face_geometry(vertices, faces):
+    """Compute source geometry once for both collapse directions in a pass."""
+    triangles = vertices[faces]
+    ab = triangles[:, 1] - triangles[:, 0]
+    bc = triangles[:, 2] - triangles[:, 1]
+    ca = triangles[:, 0] - triangles[:, 2]
+    cross = torch.cross(ab, -ca, dim=1)
+    squared_lengths = torch.stack(
+        ((ab * ab).sum(dim=1), (bc * bc).sum(dim=1), (ca * ca).sum(dim=1)),
         dim=1,
     )
+    quality = (
+        2.0 * np.sqrt(3.0) * torch.linalg.norm(cross, dim=1)
+        / squared_lengths.sum(dim=1).clamp_min(torch.finfo(vertices.dtype).eps)
+    ).clamp(0.0, 1.0)
+    return cross, squared_lengths.amax(dim=1).sqrt(), quality
 
 
 def _gpu_evaluate_collapse_direction(
@@ -1652,8 +1978,12 @@ def _gpu_evaluate_collapse_direction(
     reference_patch_projector=None,
     face_patch_ids=None,
     maximum_normal_deviation_degrees=None,
+    candidate_maximum_normal_deviation_degrees=None,
     triangle_validation_cache=None,
     allowed_directions=None,
+    face_geometry=None,
+    minimum_cross_squared=None,
+    preserve_existing_maximum_edge=True,
 ):
     """Validate one endpoint choice for every short-edge candidate."""
     candidate_ids = candidate_face_pairs[:, 0]
@@ -1682,31 +2012,22 @@ def _gpu_evaluate_collapse_direction(
         & (proposed_faces[:, 2] != proposed_faces[:, 0])
     )
     active_candidates = candidate_ids[nondegenerate]
-    old_faces = local_faces[nondegenerate]
     new_faces = proposed_faces[nondegenerate]
-    old_cross = _triangle_cross_torch(vertices, old_faces)
-    new_cross = _triangle_cross_torch(vertices, new_faces)
-    old_cross_squared = (old_cross * old_cross).sum(dim=1)
+    if face_geometry is None:
+        face_geometry = _gpu_face_geometry(vertices, faces)
+    source_cross, source_maximum_length, source_quality = face_geometry
+    active_face_ids = face_ids[nondegenerate]
+    old_cross = source_cross[active_face_ids]
+    old_maximum_length = source_maximum_length[active_face_ids]
+    old_quality = source_quality[active_face_ids]
+    new_cross, new_maximum_length, new_quality = _gpu_face_geometry(vertices, new_faces)
     new_cross_squared = (new_cross * new_cross).sum(dim=1)
-    diameter = (
-        vertices.amax(dim=0) - vertices.amin(dim=0)
-    ).amax().clamp_min(torch.finfo(vertices.dtype).eps)
-    minimum_cross_squared = (diameter * diameter * 1e-12) ** 2
+    if minimum_cross_squared is None:
+        diameter = (
+            vertices.amax(dim=0) - vertices.amin(dim=0)
+        ).amax().clamp_min(torch.finfo(vertices.dtype).eps)
+        minimum_cross_squared = (diameter * diameter * 1e-12) ** 2
     orientation = (old_cross * new_cross).sum(dim=1)
-    new_triangles = vertices[new_faces]
-    new_edge_lengths = torch.linalg.norm(
-        new_triangles[:, (1, 2, 0)]
-        - new_triangles[:, (0, 1, 2)],
-        dim=2,
-    )
-    old_triangles = vertices[old_faces]
-    old_edge_lengths = torch.linalg.norm(
-        old_triangles[:, (1, 2, 0)]
-        - old_triangles[:, (0, 1, 2)],
-        dim=2,
-    )
-    old_quality = _triangle_quality_torch(vertices, old_faces)
-    new_quality = _triangle_quality_torch(vertices, new_faces)
     surface_deviation_invalid = torch.zeros(
         len(new_faces),
         dtype=torch.bool,
@@ -1719,6 +2040,7 @@ def _gpu_evaluate_collapse_direction(
         and source_face_origins is not None
         and source_face_normals is not None
     ):
+        new_triangles = vertices[new_faces]
         active_source_ids = face_source_ids[face_ids[nondegenerate]]
         source_origins = source_face_origins[active_source_ids]
         source_normals = source_face_normals[active_source_ids]
@@ -1740,21 +2062,21 @@ def _gpu_evaluate_collapse_direction(
         )[active_candidates]
     else:
         maximum_allowed_length = torch.full_like(
-            old_edge_lengths[:, 0],
+            old_maximum_length,
             float(maximum_edge_length),
         )
-    if not strict_quality:
+    if not strict_quality and preserve_existing_maximum_edge:
         maximum_allowed_length = torch.maximum(
             maximum_allowed_length,
-            old_edge_lengths.amax(dim=1),
+            old_maximum_length,
         )
     invalid_face = (
-        ~torch.isfinite(new_edge_lengths).all(dim=1)
+        ~torch.isfinite(new_maximum_length)
         | (new_cross_squared <= minimum_cross_squared)
         | (orientation <= 0.0)
         | surface_deviation_invalid
         | (
-            new_edge_lengths.amax(dim=1)
+            new_maximum_length
             > maximum_allowed_length * (1.0 + 1e-8)
         )
         | ((new_quality < old_quality * 0.5) & (not strict_quality))
@@ -1776,10 +2098,7 @@ def _gpu_evaluate_collapse_direction(
     )
     removed_candidates = candidate_ids[~nondegenerate]
     if len(removed_candidates):
-        removed_quality = _triangle_quality_torch(
-            vertices,
-            local_faces[~nondegenerate],
-        )
+        removed_quality = source_quality[face_ids[~nondegenerate]]
         energy_delta.index_add_(
             0,
             removed_candidates,
@@ -1815,13 +2134,13 @@ def _gpu_evaluate_collapse_direction(
     new_mean = new_sum / active_counts.clamp_min(1).to(vertices.dtype)
     if reference_patch_projector is not None and not strict_quality:
         old_sum = torch.zeros_like(new_sum)
-        old_sum.index_add_(0, candidate_ids, _triangle_quality_torch(vertices, local_faces))
+        old_sum.index_add_(0, candidate_ids, source_quality[face_ids])
         old_counts = torch.bincount(candidate_ids, minlength=len(candidate_edges))
         old_mean = old_sum / old_counts.clamp_min(1).to(vertices.dtype)
         valid &= (active_counts > 0) & (new_mean >= old_mean - 1e-10)
     if strict_quality:
         old_candidate_ids = candidate_ids
-        old_quality_all = _triangle_quality_torch(vertices, local_faces)
+        old_quality_all = source_quality[face_ids]
         old_minimum = torch.ones_like(new_minimum)
         old_minimum.scatter_reduce_(
             0,
@@ -1845,6 +2164,17 @@ def _gpu_evaluate_collapse_direction(
         )
     if allowed_directions is not None:
         valid &= allowed_directions
+    query_normal_limit = maximum_normal_deviation_degrees
+    if candidate_maximum_normal_deviation_degrees is not None:
+        query_normal_limit = (
+            float(candidate_maximum_normal_deviation_degrees)
+            if maximum_normal_deviation_degrees is None
+            else min(
+                float(maximum_normal_deviation_degrees),
+                float(candidate_maximum_normal_deviation_degrees),
+            )
+        )
+    query_surface_limit = maximum_surface_deviation
     if reference_patch_projector is not None:
         # Closest-surface queries are much more expensive than the cavity
         # checks above. Query only faces of candidates that can still pass;
@@ -1853,14 +2183,16 @@ def _gpu_evaluate_collapse_direction(
         if len(query_face_ids):
             query_labels = face_patch_ids[face_ids[nondegenerate][query_face_ids]]
             if triangle_validation_cache is not None:
-                surface_valid = triangle_validation_cache.check(new_faces[query_face_ids], query_labels)
-            else:
-                surface_valid = reference_patch_projector.valid_triangles(
-                    new_triangles[query_face_ids], query_labels,
-                    maximum_surface_deviation, maximum_normal_deviation_degrees,
+                query_surface_valid = triangle_validation_cache.check(
+                    new_faces[query_face_ids], query_labels,
                 )
-            rejected_candidates = active_candidates[query_face_ids[~surface_valid]]
-            valid[torch.unique(rejected_candidates)] = False
+            else:
+                query_surface_valid = reference_patch_projector.valid_triangles(
+                    vertices[new_faces[query_face_ids]], query_labels,
+                    query_surface_limit, query_normal_limit,
+                )
+            rejected_candidates = active_candidates[query_face_ids[~query_surface_valid]]
+            valid[rejected_candidates] = False
     return valid, energy_delta, new_minimum, new_mean
 
 
@@ -1884,6 +2216,10 @@ def _gpu_collapse_short_edges(
     compact_vertices=True,
     source_face_target_lengths=None,
     reference_patch_projector=None,
+    patch_face_counts=None,
+    small_patch_maximum_collapse_faces=0,
+    candidate_maximum_normal_deviation_degrees=None,
+    preserve_existing_maximum_edge=True,
 ):
     """
     Collapse independent short edges inside smooth patches on CUDA.
@@ -1956,6 +2292,11 @@ def _gpu_collapse_short_edges(
             dtype=vertices.dtype,
             device=vertices.device,
         )
+    if patch_face_counts is not None:
+        patch_face_counts = patch_face_counts.to(
+            device=faces.device,
+            dtype=torch.long,
+        )
     if protected_vertex_mask is not None:
         protected_vertex_mask = protected_vertex_mask.to(
             device=faces.device,
@@ -1966,15 +2307,32 @@ def _gpu_collapse_short_edges(
                 "Protected vertex mask must match the vertex count."
             )
     total_collapses = 0
+    # With fixed vertex IDs and endpoint coordinates, a rejected cavity keeps
+    # the same result until one of its incident faces changes. Remember those
+    # edges across passes, invalidating both endpoints' neighborhoods below.
+    rejected_edges = torch.empty((0, 2), dtype=torch.long, device=faces.device)
     # Endpoint collapses retain all coordinates when the vertex prefix is not
     # compacted. Repeated ordered triples can therefore share exact validation
     # across both directions and all passes in this call.
+    cache_normal_deviation_degrees = maximum_normal_deviation_degrees
+    if candidate_maximum_normal_deviation_degrees is not None:
+        cache_normal_deviation_degrees = (
+            float(candidate_maximum_normal_deviation_degrees)
+            if maximum_normal_deviation_degrees is None
+            else min(
+                float(maximum_normal_deviation_degrees),
+                float(candidate_maximum_normal_deviation_degrees),
+            )
+        )
+    # The final and candidate checks sample the same geometry; their AND is
+    # precisely the stricter normal limit. Cache that result directly instead
+    # of querying every triangle again at the candidate limit after a hit.
     triangle_validation_cache = (
         (reference_patch_projector.make_triangle_cache(vertices,
-            maximum_surface_deviation, maximum_normal_deviation_degrees)
+            maximum_surface_deviation, cache_normal_deviation_degrees)
          if getattr(reference_patch_projector, "is_cuda_backend", False)
          else _IndexedTriangleValidationCache(vertices, reference_patch_projector,
-            maximum_surface_deviation, maximum_normal_deviation_degrees)
+            maximum_surface_deviation, cache_normal_deviation_degrees)
         )
         if reference_patch_projector is not None and not compact_vertices
         else None
@@ -2034,7 +2392,12 @@ def _gpu_collapse_short_edges(
             )
             local_minimum_edge_lengths = 0.8 * local_targets
             local_maximum_edge_lengths = (4.0 / 3.0) * local_targets
-        face_quality = _triangle_quality_torch(vertices, faces)
+        face_geometry = _gpu_face_geometry(vertices, faces)
+        face_quality = face_geometry[2]
+        diameter = (
+            vertices.amax(dim=0) - vertices.amin(dim=0)
+        ).amax().clamp_min(torch.finfo(vertices.dtype).eps)
+        minimum_cross_squared = (diameter * diameter * 1e-12) ** 2
         adjacent_quality = torch.minimum(
             face_quality[first_faces],
             face_quality[second_faces],
@@ -2060,6 +2423,20 @@ def _gpu_collapse_short_edges(
             )
             & ~locked_candidate
         )
+        if len(rejected_edges):
+            rejected_keys = rejected_edges[:, 0] * len(vertices) + rejected_edges[:, 1]
+            candidate_keys = manifold_edges[:, 0] * len(vertices) + manifold_edges[:, 1]
+            # Topology groups already sort the edge keys. Search those keys
+            # directly instead of sorting both complete arrays again in isin.
+            locations = torch.searchsorted(candidate_keys, rejected_keys)
+            present = (locations < len(candidate_keys)) & (
+                candidate_keys[locations.clamp_max(len(candidate_keys) - 1)] == rejected_keys)
+            candidate_mask[locations[present]] = False
+        if patch_face_counts is not None and small_patch_maximum_collapse_faces > 0:
+            candidate_mask &= (
+                patch_face_counts[face_patch_ids[first_faces]]
+                > int(small_patch_maximum_collapse_faces)
+            )
         candidates = torch.nonzero(candidate_mask).reshape(-1)
         if len(candidates) == 0:
             break
@@ -2102,6 +2479,7 @@ def _gpu_collapse_short_edges(
         candidate_face_pairs = _gpu_candidate_face_pairs(
             faces,
             candidate_edges,
+            vertex_count=len(vertices),
         )
         pair_candidates = candidate_face_pairs[:, 0]
         pair_faces = candidate_face_pairs[:, 1]
@@ -2230,8 +2608,12 @@ def _gpu_collapse_short_edges(
             reference_patch_projector=reference_patch_projector,
             face_patch_ids=face_patch_ids,
             maximum_normal_deviation_degrees=maximum_normal_deviation_degrees,
+            candidate_maximum_normal_deviation_degrees=candidate_maximum_normal_deviation_degrees,
             triangle_validation_cache=triangle_validation_cache,
             allowed_directions=~locked[candidate_edges[:, 0]],
+            face_geometry=face_geometry,
+            minimum_cross_squared=minimum_cross_squared,
+            preserve_existing_maximum_edge=preserve_existing_maximum_edge,
         )
         (
             second_valid,
@@ -2253,12 +2635,18 @@ def _gpu_collapse_short_edges(
             reference_patch_projector=reference_patch_projector,
             face_patch_ids=face_patch_ids,
             maximum_normal_deviation_degrees=maximum_normal_deviation_degrees,
+            candidate_maximum_normal_deviation_degrees=candidate_maximum_normal_deviation_degrees,
             triangle_validation_cache=triangle_validation_cache,
             allowed_directions=~locked[candidate_edges[:, 1]],
+            face_geometry=face_geometry,
+            minimum_cross_squared=minimum_cross_squared,
+            preserve_existing_maximum_edge=preserve_existing_maximum_edge,
         )
         first_valid &= ~locked[candidate_edges[:, 0]]
         second_valid &= ~locked[candidate_edges[:, 1]]
         direction_valid = first_valid | second_valid
+        if not compact_vertices:
+            rejected_edges = torch.cat((rejected_edges, candidate_edges[~direction_valid]))
         if strict_constraints:
             first_is_better = (
                 (first_minimum > second_minimum)
@@ -2310,6 +2698,7 @@ def _gpu_collapse_short_edges(
             footprint_pairs,
             priorities,
             len(candidate_edges),
+            vertex_count=len(vertices),
         )
         if len(selected) == 0:
             break
@@ -2331,6 +2720,14 @@ def _gpu_collapse_short_edges(
             device=faces.device,
         )
         vertex_map[remove] = keep
+        if len(rejected_edges):
+            removed_vertex_mask = torch.zeros(len(vertices), dtype=torch.bool, device=faces.device)
+            removed_vertex_mask[remove] = True
+            changed_faces = removed_vertex_mask[faces].any(dim=1)
+            changed_vertices = torch.zeros_like(removed_vertex_mask)
+            changed_vertices[faces[changed_faces].reshape(-1)] = True
+            changed_vertices[keep] = True
+            rejected_edges = rejected_edges[~changed_vertices[rejected_edges].any(dim=1)]
         faces = vertex_map[faces]
         nondegenerate = (
             (faces[:, 0] != faces[:, 1])
@@ -2383,6 +2780,7 @@ def _gpu_flip_quality_edges(
     source_face_target_lengths=None,
     reference_patch_projector=None,
     preserve_existing_maximum_edge=False,
+    fixed_constraint_edges=None,
 ):
     """Flip conflict-free same-patch, source-safe edges on the GPU."""
     faces = faces.clone()
@@ -2433,6 +2831,11 @@ def _gpu_flip_quality_edges(
             "Maximum flip surface deviation must be non-negative."
         )
     vertex_count = len(vertices)
+    fixed_edge_keys = None
+    if fixed_constraint_edges is not None and len(fixed_constraint_edges):
+        fixed_edges = torch.sort(torch.as_tensor(
+            fixed_constraint_edges, device=faces.device, dtype=torch.long), dim=1).values
+        fixed_edge_keys = fixed_edges[:, 0] * vertex_count + fixed_edges[:, 1]
     total_flips = 0
     epsilon = torch.finfo(vertices.dtype).eps
     diameter = (
@@ -2513,6 +2916,11 @@ def _gpu_flip_quality_edges(
                 == face_patch_ids[second_faces]
             )
         )
+        if fixed_edge_keys is not None:
+            # External interfaces are immutable even when both incident faces
+            # have the same label. protected_edges retains its older coplanar
+            # tie-break meaning; it cannot enforce this topology contract.
+            valid &= ~torch.isin(unique_keys[manifold], fixed_edge_keys)
         if (
             face_source_ids is not None
             and protected_source_face_mask is not None
@@ -2571,6 +2979,17 @@ def _gpu_flip_quality_edges(
                     torch.linalg.norm(second_triangles - second_triangles.roll(1, dims=1), dim=2).amax(dim=1),
                 )
                 proposed_maximum_lengths = torch.maximum(proposed_maximum_lengths, old_maximum)
+            else:
+                # A short new diagonal can still retain long cavity sides.
+                # Before refinement, leave those source triangles intact so
+                # later subdivision does not inherit a changed normal field.
+                boundary_maximum = torch.stack((
+                    torch.linalg.norm(vertices[first_opposite] - vertices[first_start], dim=1),
+                    torch.linalg.norm(vertices[first_start] - vertices[second_opposite], dim=1),
+                    torch.linalg.norm(vertices[second_opposite] - vertices[first_end], dim=1),
+                    torch.linalg.norm(vertices[first_end] - vertices[first_opposite], dim=1),
+                ), dim=1).amax(dim=1)
+                proposed_edge_lengths = torch.maximum(proposed_edge_lengths, boundary_maximum)
             valid &= proposed_edge_lengths <= proposed_maximum_lengths * (1.0 + 1e-6)
         new_edge_start = torch.minimum(first_opposite, second_opposite)
         new_edge_end = torch.maximum(first_opposite, second_opposite)
@@ -2871,6 +3290,16 @@ def _gpu_source_sensitive_vertex_mask(
     return sensitive
 
 
+def _relaxation_diagnostics(iterations, diagnostics):
+    details = {} if diagnostics is None else diagnostics
+    details.update(
+        requested_iterations=int(iterations), attempted_iterations=0,
+        accepted_iterations=0, line_search_attempts=0, rollback_iterations=0,
+        unchanged_proposals=0, stop_reason="iteration_limit",
+    )
+    return details
+
+
 def _gpu_relax_inserted_vertices(
     vertices,
     faces,
@@ -2882,8 +3311,10 @@ def _gpu_relax_inserted_vertices(
     protected_source_face_mask=None,
     protected_vertex_mask=None,
     maximum_edge_length=None,
+    diagnostics=None,
 ):
     """Move unprotected inserted points on their original source triangles."""
+    details = _relaxation_diagnostics(iterations, diagnostics)
     current = vertices.clone()
     support_face_ids = support_face_ids.to(
         device=vertices.device,
@@ -2905,37 +3336,38 @@ def _gpu_relax_inserted_vertices(
             dtype=torch.bool,
         )
     movable = torch.nonzero(movable_mask).reshape(-1)
-    if len(movable) == 0:
+    if len(movable) == 0 or int(iterations) <= 0:
+        details["stop_reason"] = "disabled" if int(iterations) <= 0 else "no_movable_vertices"
         return current, 0
 
     support_triangles = original_vertices[
         original_faces[support_face_ids[movable]]
     ]
     accepted_iterations = 0
-    current_energy = _mesh_energy_torch(current, faces)
+    # Relaxation changes coordinates only; its topology and valences stay
+    # constant through every iteration and backtracking attempt.
+    edges = _unique_edges_torch(faces, len(vertices))
+    counts = torch.zeros(
+        (len(current), 1), dtype=current.dtype, device=current.device,
+    )
+    ones = torch.ones(
+        (len(edges), 1), dtype=current.dtype, device=current.device,
+    )
+    counts.index_add_(0, edges[:, 0], ones)
+    counts.index_add_(0, edges[:, 1], ones)
+    current_energy = _mesh_energy_torch(current, faces, edges=edges)
     for _ in range(int(iterations)):
-        edges = _unique_edges_torch(faces)
+        details["attempted_iterations"] += 1
         sums = torch.zeros_like(current)
-        counts = torch.zeros(
-            (len(current), 1),
-            dtype=current.dtype,
-            device=current.device,
-        )
-        ones = torch.ones(
-            (len(edges), 1),
-            dtype=current.dtype,
-            device=current.device,
-        )
         sums.index_add_(0, edges[:, 0], current[edges[:, 1]])
         sums.index_add_(0, edges[:, 1], current[edges[:, 0]])
-        counts.index_add_(0, edges[:, 0], ones)
-        counts.index_add_(0, edges[:, 1], ones)
         centroids = sums / counts.clamp_min(1.0)
 
         accepted = False
         step = float(smoothing_step)
         old_cross = _triangle_cross_torch(current, faces)
         for _ in range(8):
+            details["line_search_attempts"] += 1
             proposed = current.clone()
             raw = current[movable] + step * (
                 centroids[movable] - current[movable]
@@ -2944,6 +3376,12 @@ def _gpu_relax_inserted_vertices(
                 raw,
                 support_triangles,
             )
+            if torch.equal(proposed[movable], current[movable]):
+                # The current state cannot improve its own energy. A smaller
+                # step may project differently, so preserve the line search.
+                details["unchanged_proposals"] += 1
+                step *= 0.5
+                continue
             new_cross = _triangle_cross_torch(proposed, faces)
             orientation = (old_cross * new_cross).sum(dim=1)
             valid = bool(
@@ -2961,15 +3399,22 @@ def _gpu_relax_inserted_vertices(
                 valid = bool(
                     (proposed_lengths <= float(maximum_edge_length) * (1.0 + 1e-6)).all()
                 )
-            proposed_energy = _mesh_energy_torch(proposed, faces)
+            if not valid:
+                step *= 0.5
+                continue
+            proposed_energy = _mesh_energy_torch(proposed, faces, edges=edges)
             if valid and bool(proposed_energy < current_energy):
                 current = proposed
                 current_energy = proposed_energy
                 accepted = True
                 accepted_iterations += 1
+                details["accepted_iterations"] = accepted_iterations
                 break
             step *= 0.5
         if not accepted:
+            # current was never committed in this iteration. Another outer
+            # iteration would repeat the identical sequence of smaller steps.
+            details["stop_reason"] = "no_accepted_update"
             break
     return current, accepted_iterations
 
@@ -3068,6 +3513,7 @@ def _gpu_relax_patch_vertices(
     vertices, faces, face_patch_ids, support_face_ids, reference_patch_projector,
     iterations, smoothing_step, maximum_edge_length,
     maximum_surface_deviation, maximum_normal_deviation_degrees,
+    diagnostics=None,
 ):
     """Relax all used interior vertices on their complete reference patch.
 
@@ -3075,6 +3521,7 @@ def _gpu_relax_patch_vertices(
     Only explicit fixed vertices and vertices incident to multiple patch IDs
     are immovable. The original vertex table is never reordered or compacted.
     """
+    details = _relaxation_diagnostics(iterations, diagnostics)
     current = vertices.clone()
     vertex_ids = faces.reshape(-1)
     incidence_labels = face_patch_ids[:, None].expand(-1, 3).reshape(-1)
@@ -3086,30 +3533,35 @@ def _gpu_relax_patch_vertices(
     movable_mask = (minimum_labels == maximum_labels) & (support_face_ids >= -1)
     movable = torch.nonzero(movable_mask).reshape(-1)
     if len(movable) == 0 or int(iterations) <= 0:
+        details["stop_reason"] = "disabled" if int(iterations) <= 0 else "no_movable_vertices"
         return current, 0
     affected_faces = torch.nonzero(movable_mask[faces].any(dim=1)).reshape(-1)
-    edges = _unique_edges_torch(faces)
+    edges = _unique_edges_torch(faces, len(vertices))
     counts = torch.zeros((len(current), 1), dtype=current.dtype, device=current.device)
     ones = torch.ones((len(edges), 1), dtype=current.dtype, device=current.device)
     counts.index_add_(0, edges[:, 0], ones)
     counts.index_add_(0, edges[:, 1], ones)
     diameter = (vertices.amax(dim=0) - vertices.amin(dim=0)).amax()
     minimum_cross_squared = (diameter * diameter * 1e-12) ** 2
-    current_energy = _mesh_energy_torch(current, faces)
+    current_quality = _triangle_quality_torch(current, faces)
+    current_energy = _mesh_energy_torch(
+        current, faces, edges=edges, quality=current_quality,
+    )
     _, patch_inverse, patch_counts = torch.unique(face_patch_ids, return_inverse=True, return_counts=True)
 
-    def patch_mean_quality(points):
+    def patch_mean_quality(points, quality):
         sums = torch.zeros(len(patch_counts), dtype=points.dtype, device=points.device)
-        sums.index_add_(0, patch_inverse, _triangle_quality_torch(points, faces))
+        sums.index_add_(0, patch_inverse, quality)
         return sums / patch_counts.to(points.dtype)
 
-    current_mean_quality = patch_mean_quality(current)
+    current_mean_quality = patch_mean_quality(current, current_quality)
     surface_checks = _TriangleValidationCache(
         reference_patch_projector, face_patch_ids[affected_faces],
         maximum_surface_deviation, maximum_normal_deviation_degrees,
     )
     accepted_iterations = 0
     for _ in range(int(iterations)):
+        details["attempted_iterations"] += 1
         sums = torch.zeros_like(current)
         sums.index_add_(0, edges[:, 0], current[edges[:, 1]])
         sums.index_add_(0, edges[:, 1], current[edges[:, 0]])
@@ -3118,15 +3570,21 @@ def _gpu_relax_patch_vertices(
         step = float(smoothing_step)
         accepted = False
         for _ in range(8):
+            details["line_search_attempts"] += 1
             proposed = current.clone()
             raw = current[movable] + step * (centroids[movable] - current[movable])
             projected, _ = reference_patch_projector.project(
                 raw, minimum_labels[movable],
             )
             proposed[movable] = projected
+            if torch.equal(projected, current[movable]):
+                details["unchanged_proposals"] += 1
+                step *= 0.5
+                continue
             # A bad local proposal must not freeze unrelated patches. Revert
             # its incident vertices and check the remaining coupled update.
             for _ in range(4):
+                details["rollback_iterations"] += 1
                 new_cross = _triangle_cross_torch(proposed, faces[affected_faces])
                 valid_faces = (
                     (old_cross * new_cross).sum(dim=1) > 0
@@ -3141,26 +3599,43 @@ def _gpu_relax_patch_vertices(
                 if bool(valid_faces.all()):
                     break
                 reverted_vertices = faces[affected_faces[~valid_faces]].reshape(-1)
+                if torch.equal(proposed[reverted_vertices], current[reverted_vertices]):
+                    # This restoration would change nothing. Revalidating the
+                    # same cavity cannot repair it; try the next smaller step.
+                    break
                 proposed[reverted_vertices] = current[reverted_vertices]
             valid = bool(valid_faces.all() and torch.isfinite(proposed).all())
-            proposed_energy = _mesh_energy_torch(proposed, faces)
-            proposed_mean_quality = patch_mean_quality(proposed)
+            if not valid:
+                step *= 0.5
+                continue
+            if torch.equal(proposed[movable], current[movable]):
+                details["unchanged_proposals"] += 1
+                step *= 0.5
+                continue
+            proposed_quality = _triangle_quality_torch(proposed, faces)
+            proposed_energy = _mesh_energy_torch(
+                proposed, faces, edges=edges, quality=proposed_quality,
+            )
+            proposed_mean_quality = patch_mean_quality(proposed, proposed_quality)
             if (valid and bool(proposed_energy < current_energy)
                     and bool((proposed_mean_quality >= current_mean_quality - 1e-12).all())):
                 current = proposed
                 current_energy = proposed_energy
                 current_mean_quality = proposed_mean_quality
                 accepted_iterations += 1
+                details["accepted_iterations"] = accepted_iterations
                 accepted = True
                 break
             step *= 0.5
         if not accepted:
+            details["stop_reason"] = "no_accepted_update"
             break
     return current, accepted_iterations
 
 
 def _validated_external_partition(
     vertices, faces, face_patch_ids, constraint_edges, corner_vertex_ids=None,
+    *, return_edges=False,
 ):
     """Validate ownership and the complete shared interface graph once on CPU."""
     labels = np.asarray(face_patch_ids)
@@ -3181,7 +3656,9 @@ def _validated_external_partition(
         or np.any(constraints[:, 0] == constraints[:, 1])
     ):
         raise ValueError("Fixed constraint edges contain invalid vertex IDs or a self edge.")
-    constraints = np.unique(np.sort(constraints.astype(np.int64), axis=1), axis=0)
+    vertex_count = len(vertices)
+    constraint_keys = np.unique(_edge_keys(np.sort(constraints.astype(np.int64), axis=1), vertex_count))
+    constraints = np.column_stack((constraint_keys // vertex_count, constraint_keys % vertex_count))
     corners = np.asarray([] if corner_vertex_ids is None else corner_vertex_ids)
     if corners.shape == (0,):
         corners = np.empty(0, dtype=np.int64)
@@ -3192,21 +3669,30 @@ def _validated_external_partition(
     corners = np.unique(corners.astype(np.int64))
 
     face_edges = np.sort(faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1)
-    edges, inverse, counts = np.unique(face_edges, axis=0, return_inverse=True, return_counts=True)
-    minimum_labels = np.full(len(edges), np.iinfo(np.int64).max, dtype=np.int64)
-    maximum_labels = np.full(len(edges), -1, dtype=np.int64)
-    np.minimum.at(minimum_labels, inverse, np.repeat(labels, 3))
-    np.maximum.at(maximum_labels, inverse, np.repeat(labels, 3))
-    edge_keys = _edge_keys(edges, len(vertices))
-    constraint_keys = _edge_keys(constraints, len(vertices))
+    # Integer keys have the same lexicographic order as the endpoint pairs,
+    # without NumPy's expensive structured-record sort for unique(axis=0).
+    edge_keys, inverse, counts = np.unique(
+        _edge_keys(face_edges, vertex_count), return_inverse=True, return_counts=True,
+    )
     if not np.all(np.isin(constraint_keys, edge_keys)):
         raise ValueError("A fixed constraint is not an edge of the input mesh.")
-    required = (counts != 2) | (minimum_labels != maximum_labels)
+    required = counts != 2
+    if np.any(labels != labels[0]):
+        minimum_labels = np.full(len(edge_keys), np.iinfo(np.int64).max, dtype=np.int64)
+        maximum_labels = np.full(len(edge_keys), -1, dtype=np.int64)
+        np.minimum.at(minimum_labels, inverse, np.repeat(labels, 3))
+        np.maximum.at(maximum_labels, inverse, np.repeat(labels, 3))
+        required |= minimum_labels != maximum_labels
     if not np.all(np.isin(edge_keys[required], constraint_keys)):
         raise ValueError("Fixed constraints must cover every cross-patch, open, and non-manifold edge.")
-    referenced = np.unique(faces)
-    if len(corners) and not np.all(np.isin(corners, referenced)):
-        raise ValueError("Fixed corner vertex IDs must be referenced by an input face.")
+    if len(corners):
+        referenced = np.zeros(vertex_count, dtype=bool)
+        referenced[faces.reshape(-1)] = True
+        if not np.all(referenced[corners]):
+            raise ValueError("Fixed corner vertex IDs must be referenced by an input face.")
+    if return_edges:
+        edges = np.column_stack((edge_keys // vertex_count, edge_keys % vertex_count))
+        return labels, constraints, corners, edges
     return labels, constraints, corners
 
 
@@ -3232,7 +3718,7 @@ def surface_sample_remesh(
     split_passes=64,
     collapse_passes=24,
     protected_source_quality=0.8,
-    maximum_normal_deviation_degrees=5.0,
+    maximum_normal_deviation_degrees=10.0,
     maximum_surface_deviation_ratio=0.05,
     minimum_collapse_quality=0.25,
     coplanar_angle_degrees=1.0,
@@ -3246,6 +3732,10 @@ def surface_sample_remesh(
     whole_patch_optimization=False,
     whole_patch_reference=None,
     projection_backend="cuda",
+    analytic_patch_models=None,
+    trace_surface_validation=False,
+    *,
+    collect_diagnostics=True,
 ):
     """
     Sample the original surface, locally retriangulate, and optimize on CUDA.
@@ -3269,9 +3759,15 @@ def surface_sample_remesh(
     whole_patch_reference=(vertices, faces, patch_ids), or a cached
     _ReferencePatchProjector, can supply complete patches for a computational
     batch. Its patch IDs must use the same numbering as external_face_patch_ids.
+    Optional analytic_patch_models uses that same numbering and projects new
+    interior split points to Cylinder/Cone/Sphere/Torus before reference checks.
+    With collect_diagnostics=False, skip report-only quality measurements and
+    nearest local source reassignment. Source face IDs then retain operation
+    lineage on the same patch; all geometry and ownership checks still run.
     """
     if not vertices.is_cuda or not faces.is_cuda:
         raise ValueError("Surface sample remeshing requires CUDA tensors.")
+    collect_diagnostics = bool(collect_diagnostics)
     flip_passes = int(flip_passes)
     relax_iterations = int(relax_iterations)
     if flip_passes < 0 or relax_iterations < 0:
@@ -3324,17 +3820,60 @@ def surface_sample_remesh(
         raise ValueError("Minimum collapse quality must be in [0, 1].")
     if not 0.0 <= coplanar_angle_degrees < 180.0:
         raise ValueError("Coplanar angle must be in [0, 180).")
+    # Public/CLI defaults explicitly disable stage diagnostics. Retain the old
+    # environment switch only for callers opting into legacy resolution with
+    # None, so a stale shell variable cannot turn benchmark tracing back on.
+    if trace_surface_validation is None:
+        trace_surface_validation = os.environ.get(
+            "PAMO_TRACE_SURFACE_VALIDATION", "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        trace_surface_validation = bool(trace_surface_validation)
+    stage_validation_normal_deviation_degrees = float(maximum_normal_deviation_degrees)
+    split_candidate_normal_deviation_degrees = None
+    small_patch_maximum_collapse_faces = 0
 
     reference_vertices = np.asarray(reference_mesh.vertices, dtype=np.float64)
     reference_faces = np.asarray(reference_mesh.faces, dtype=np.int64)
     external_partition = external_face_patch_ids is not None
     whole_patch_optimization = bool(whole_patch_optimization)
+    if whole_patch_optimization:
+        candidate_normal_override = os.environ.get(
+            "PAMO_CANDIDATE_MAX_NORMAL_DEVIATION_DEGREES"
+        )
+        if candidate_normal_override is not None:
+            try:
+                stage_validation_normal_deviation_degrees = float(
+                    candidate_normal_override
+                )
+                split_candidate_normal_deviation_degrees = stage_validation_normal_deviation_degrees
+            except ValueError as error:
+                raise ValueError(
+                    "PAMO_CANDIDATE_MAX_NORMAL_DEVIATION_DEGREES must be numeric."
+                ) from error
+        else:
+            stage_validation_normal_deviation_degrees = max(
+                0.0, 0.5 * float(maximum_normal_deviation_degrees)
+            )
+        try:
+            small_patch_maximum_collapse_faces = int(
+                os.environ.get("PAMO_SMALL_PATCH_MAX_COLLAPSE_FACES", "0")
+            )
+        except ValueError as error:
+            raise ValueError(
+                "PAMO_SMALL_PATCH_MAX_COLLAPSE_FACES must be an integer."
+            ) from error
+        if small_patch_maximum_collapse_faces < 0:
+            small_patch_maximum_collapse_faces = 0
     if whole_patch_optimization and not external_partition:
         raise ValueError("Whole-patch optimization requires external_face_patch_ids.")
     if whole_patch_reference is not None and not whole_patch_optimization:
         raise ValueError("A whole-patch reference requires whole_patch_optimization.")
+    if analytic_patch_models is not None and not whole_patch_optimization:
+        raise ValueError("Analytic split models require whole_patch_optimization.")
     fixed_source_vertices = np.empty(0, dtype=np.int64)
     partition_constraints = np.empty((0, 2), dtype=np.int64)
+    reference_edges = None
     if external_partition:
         if feature_edges is not None:
             raise ValueError("Use fixed_constraint_edges instead of feature_edges with external patch IDs.")
@@ -3344,10 +3883,13 @@ def surface_sample_remesh(
             raise ValueError("External partition CUDA faces must exactly match reference_mesh face ordering.")
         if not np.isfinite(reference_vertices).all() or not np.array_equal(vertices.cpu().numpy(), reference_vertices):
             raise ValueError("External partition CUDA vertices must exactly match finite reference_mesh coordinates.")
-        patch_ids, partition_constraints, fixed_corners = _validated_external_partition(
+        partition_data = _validated_external_partition(
             reference_vertices, reference_faces, external_face_patch_ids,
-            fixed_constraint_edges, fixed_corner_vertex_ids,
+            fixed_constraint_edges, fixed_corner_vertex_ids, return_edges=collect_diagnostics,
         )
+        patch_ids, partition_constraints, fixed_corners = partition_data[:3]
+        if collect_diagnostics:
+            reference_edges = partition_data[3]
         fixed_source_vertices = np.unique(np.concatenate((partition_constraints.reshape(-1), fixed_corners)))
         reference_features = np.empty((0, 2), dtype=np.int64)
         coplanar_edges = np.empty((0, 2), dtype=np.int64)
@@ -3368,9 +3910,10 @@ def surface_sample_remesh(
     reference_patch_projector = None
     local_reference_projector = None
     if whole_patch_optimization:
-        local_reference_projector = _make_reference_projector(
-            reference_vertices, reference_faces, patch_ids, backend=projection_backend, device=vertices.device,
-        )
+        if collect_diagnostics or whole_patch_reference is None:
+            local_reference_projector = _make_reference_projector(
+                reference_vertices, reference_faces, patch_ids, backend=projection_backend, device=vertices.device,
+            )
         if whole_patch_reference is None:
             reference_patch_projector = local_reference_projector
         elif isinstance(whole_patch_reference, _ReferencePatchProjector):
@@ -3381,10 +3924,21 @@ def surface_sample_remesh(
             reference_patch_projector = _make_reference_projector(*whole_patch_reference, backend=projection_backend, device=vertices.device)
         if not set(np.unique(patch_ids)) <= reference_patch_projector.patch_faces.keys():
             raise ValueError("Whole-patch reference is missing an external patch ID.")
+    analytic_split_projector = (
+        _AnalyticSplitProjector(analytic_patch_models, vertices.device,
+                                reference_patch_projector.numeric_tolerance,
+                                active_patch_ids=np.unique(patch_ids))
+        if analytic_patch_models is not None else None
+    )
+    if analytic_split_projector is not None and not len(analytic_split_projector.labels):
+        # Most computational batches contain a single freeform domain. Do not
+        # launch every analytic primitive's projection kernels for those batches.
+        analytic_split_projector = None
     initial_metrics = mesh_quality_metrics(
         reference_vertices,
         reference_faces,
-    )
+        edges=reference_edges,
+    ) if collect_diagnostics else {}
 
     if poisson_radius is None:
         triangle_areas = np.asarray(reference_mesh.area_faces)
@@ -3545,7 +4099,7 @@ def surface_sample_remesh(
             "Surface retriangulation could not eliminate float32-degenerate "
             "faces within eight rollback passes."
         )
-    sampled_metrics = mesh_quality_metrics(output_vertices, output_faces)
+    sampled_metrics = mesh_quality_metrics(output_vertices, output_faces) if collect_diagnostics else {}
 
     device = vertices.device
     gpu_vertices = torch.as_tensor(
@@ -3597,6 +4151,14 @@ def surface_sample_remesh(
         support_face_ids,
         dtype=torch.long,
         device=device,
+    )
+    gpu_patch_face_counts = torch.bincount(
+        gpu_patch_ids,
+        minlength=(
+            int(gpu_patch_ids.max()) + 1
+            if len(gpu_patch_ids)
+            else 0
+        ),
     )
     gpu_coplanar_edges = torch.as_tensor(
         coplanar_edges,
@@ -3656,9 +4218,83 @@ def surface_sample_remesh(
         print(f"[remesh] {name}: {now - stage_start:.2f}s, {len(gpu_faces):,} faces", flush=True)
         stage_start = now
 
-    # Remove poor source diagonals before their long edges are subdivided.
-    # Spend part of the existing flip budget here, on the smaller mesh.
-    # Fixed vertices stay fixed; only explicit constraint edges forbid flips.
+    def _report_surface_stage(stage_name):
+        if not (
+            trace_surface_validation
+            and whole_patch_optimization
+            and reference_patch_projector is not None
+        ):
+            return
+        stage_faces = gpu_faces
+        if stage_faces.ndim == 1:
+            if stage_faces.numel() == 0:
+                raise RuntimeError(
+                    f"[surface-check {stage_name}] expected gpu_faces shape (n,3), got empty 1D tensor."
+                )
+            if stage_faces.numel() % 3 != 0:
+                raise RuntimeError(
+                    f"[surface-check {stage_name}] expected gpu_faces shape (n,3) or flat (3n), "
+                    f"got 1D shape={tuple(stage_faces.shape)}."
+                )
+            stage_faces = stage_faces.reshape(-1, 3)
+        elif stage_faces.ndim != 2 or stage_faces.shape[1] != 3:
+            raise RuntimeError(
+                f"[surface-check {stage_name}] expected gpu_faces shape (n,3), "
+                f"got {tuple(stage_faces.shape)}."
+            )
+
+        stage_patch_ids = gpu_patch_ids
+        if len(stage_patch_ids) != len(stage_faces):
+            raise RuntimeError(
+                f"[surface-check {stage_name}] patch-id count mismatch: "
+                f"faces={int(len(stage_faces))}, patch_ids={int(len(stage_patch_ids))}."
+            )
+
+        validation_device = reference_patch_projector.gpu_vertices.device
+        stage_triangles = gpu_vertices[stage_faces].to(
+            device=validation_device,
+            dtype=torch.float64,
+        ).contiguous()
+        stage_patch_ids = gpu_patch_ids.to(
+            device=validation_device,
+            dtype=torch.long,
+        ).contiguous()
+
+        valid, details = reference_patch_projector.valid_triangles(
+            stage_triangles,
+            stage_patch_ids,
+            maximum_surface_deviation,
+            maximum_normal_deviation_degrees,
+            return_details=True,
+        )
+        invalid = ~valid
+        invalid_count = int(invalid.cpu().numpy().sum())
+        distance_invalid = int(np.count_nonzero(~details["distance_valid"]))
+        normal_invalid = int(np.count_nonzero(~details["normal_valid"]))
+        if invalid_count:
+            patch_ids_cpu = stage_patch_ids.cpu().numpy()
+            bad_patches, bad_counts = np.unique(
+                patch_ids_cpu[invalid.cpu().numpy()],
+                return_counts=True,
+            )
+            patch_summary = list(zip(bad_patches[:8].tolist(), bad_counts[:8].tolist()))
+        else:
+            patch_summary = []
+        print(
+            f"[surface-check {stage_name}] invalid={invalid_count}/{len(gpu_faces)}; "
+            f"distance_invalid={distance_invalid} "
+            f"(max={float(details['maximum_sample_distance'].max()):.9g}/"
+            f"{maximum_surface_deviation:.9g}); "
+            f"normal_invalid={normal_invalid} "
+            f"(max={float(details['normal_deviation_degrees'].max()):.9g}/"
+            f"{maximum_normal_deviation_degrees:.9g}); "
+            f"patches={patch_summary}",
+            flush=True,
+        )
+
+    # Optimize already-short cavities before refinement. A replacement that
+    # still needs splitting can cross reference normal regions and leave no
+    # valid child geometry, even when the parent itself passes validation.
     pre_flip_passes = min(2, flip_passes) if whole_patch_optimization else 0
     pre_flip_count = 0
     if pre_flip_passes:
@@ -3674,9 +4310,11 @@ def surface_sample_remesh(
             protected_edges=topology_protected_edges,
             source_face_target_lengths=source_face_target_lengths,
             reference_patch_projector=reference_patch_projector,
-            preserve_existing_maximum_edge=True,
+            preserve_existing_maximum_edge=False,
+            fixed_constraint_edges=partition_constraints if external_partition else None,
         )
     finish_stage('pre-flip')
+    _report_surface_stage('pre-flip')
     pre_collapse_passes = min(2, collapse_passes) if whole_patch_optimization else collapse_passes
     (
         gpu_vertices,
@@ -3704,9 +4342,23 @@ def surface_sample_remesh(
         minimum_collapse_quality=minimum_collapse_quality,
         source_face_target_lengths=source_face_target_lengths,
         compact_vertices=not external_partition,
+        preserve_existing_maximum_edge=not whole_patch_optimization,
         reference_patch_projector=reference_patch_projector,
+        patch_face_counts=gpu_patch_face_counts,
+        small_patch_maximum_collapse_faces=(
+            small_patch_maximum_collapse_faces
+            if whole_patch_optimization
+            else 0
+        ),
+        candidate_maximum_normal_deviation_degrees=(
+            stage_validation_normal_deviation_degrees
+            if whole_patch_optimization
+            else None
+        ),
     )
     finish_stage('pre-collapse')
+    _report_surface_stage('pre-collapse')
+    split_diagnostics = {}
     (
         gpu_vertices,
         gpu_faces,
@@ -3727,8 +4379,27 @@ def surface_sample_remesh(
         source_face_maximum_edge_lengths=(
             source_face_maximum_edge_lengths
         ),
+        reference_patch_projector=reference_patch_projector,
+        maximum_surface_deviation=maximum_surface_deviation,
+        maximum_normal_deviation_degrees=maximum_normal_deviation_degrees,
+        candidate_maximum_normal_deviation_degrees=(
+            split_candidate_normal_deviation_degrees if whole_patch_optimization else None
+        ),
+        analytic_split_projector=analytic_split_projector,
+        diagnostics=split_diagnostics,
     )
     finish_stage('split')
+    if remaining_long_edges:
+        print(
+            "[remesh] split incomplete: {} edges remain; {} after {}/{} passes; "
+            "{} fixed, {} geometrically rejected, maximum {:.9g}".format(
+                remaining_long_edges, split_diagnostics["stop_reason"],
+                split_diagnostics["attempted_passes"], split_diagnostics["maximum_passes"],
+                split_diagnostics["protected_long_edges"], split_diagnostics["rejected_long_edges"],
+                split_diagnostics["maximum_edge_length"],
+            ), flush=True,
+        )
+    _report_surface_stage('split')
     if whole_patch_optimization:
         # The splitter also marks an internal midpoint fixed when both old
         # endpoints were fixed. Only supplied interface/corner vertices are
@@ -3762,10 +4433,23 @@ def surface_sample_remesh(
         minimum_collapse_quality=minimum_collapse_quality,
         source_face_target_lengths=source_face_target_lengths,
         compact_vertices=not external_partition,
+        preserve_existing_maximum_edge=not whole_patch_optimization,
         reference_patch_projector=reference_patch_projector,
+        patch_face_counts=gpu_patch_face_counts,
+        small_patch_maximum_collapse_faces=(
+            small_patch_maximum_collapse_faces
+            if whole_patch_optimization
+            else 0
+        ),
+        candidate_maximum_normal_deviation_degrees=(
+            stage_validation_normal_deviation_degrees
+            if whole_patch_optimization
+            else None
+        ),
     )
     collapse_count = pre_collapse_count + post_collapse_count
     finish_stage('post-collapse')
+    _report_surface_stage('post-collapse')
     gpu_source_sensitive_vertices = _gpu_source_sensitive_vertex_mask(
         gpu_faces,
         gpu_source_face_ids,
@@ -3800,12 +4484,15 @@ def surface_sample_remesh(
     )
     flip_count += pre_flip_count
     finish_stage('post-flip')
+    _report_surface_stage('post-flip')
+    relaxation_details = {}
     if whole_patch_optimization:
         gpu_vertices, accepted_relaxations = _gpu_relax_patch_vertices(
             gpu_vertices, gpu_faces, gpu_patch_ids, gpu_support_face_ids,
             reference_patch_projector, relax_iterations, smoothing_step,
             maximum_edge_length, maximum_surface_deviation,
             maximum_normal_deviation_degrees,
+            diagnostics=relaxation_details,
         )
     else:
         gpu_vertices, accepted_relaxations = _gpu_relax_inserted_vertices(
@@ -3817,6 +4504,7 @@ def surface_sample_remesh(
             relax_iterations,
             smoothing_step,
             maximum_edge_length=maximum_edge_length if external_partition else None,
+            diagnostics=relaxation_details,
             protected_source_face_mask=gpu_protected_source_faces,
             protected_vertex_mask=_gpu_source_sensitive_vertex_mask(
                 gpu_faces,
@@ -3828,20 +4516,45 @@ def surface_sample_remesh(
                 ),
                 vertex_count=len(gpu_vertices),
             ),
-        )
+    )
     finish_stage('relax')
+    _report_surface_stage('relax')
     if whole_patch_optimization:
-        # IDs remain local to reference_mesh even if projection used a larger
-        # global patch. They describe nearest reference support, rather than
-        # claiming the output triangle stays inside its ancestor face.
-        _, gpu_source_face_ids = local_reference_projector.project(
-            gpu_vertices[gpu_faces].mean(dim=1), gpu_patch_ids,
-        )
-        final_surface_valid, final_surface_details = reference_patch_projector.valid_triangles(
-            gpu_vertices[gpu_faces], gpu_patch_ids, maximum_surface_deviation,
-            maximum_normal_deviation_degrees, return_details=True,
-        )
+        if collect_diagnostics:
+            # IDs remain local to reference_mesh even if projection used a
+            # larger global patch. Only reporting needs nearest support;
+            # optimization already maintains valid same-patch lineage IDs.
+            _, gpu_source_face_ids = local_reference_projector.project(
+                gpu_vertices[gpu_faces].mean(dim=1), gpu_patch_ids,
+            )
+        summary_check = getattr(reference_patch_projector, "valid_triangles_with_ties", None)
+        final_surface_details = None
+        if not collect_diagnostics:
+            final_surface_valid = reference_patch_projector.valid_triangles(
+                gpu_vertices[gpu_faces], gpu_patch_ids, maximum_surface_deviation,
+                maximum_normal_deviation_degrees,
+            )
+        elif summary_check is not None:
+            final_surface_valid, final_surface_ties = summary_check(
+                gpu_vertices[gpu_faces], gpu_patch_ids, maximum_surface_deviation,
+                maximum_normal_deviation_degrees,
+            )
+            final_tie_count = int(final_surface_ties.sum().item())
+        else:
+            final_surface_valid, final_surface_details = reference_patch_projector.valid_triangles(
+                gpu_vertices[gpu_faces], gpu_patch_ids, maximum_surface_deviation,
+                maximum_normal_deviation_degrees, return_details=True,
+            )
+            final_tie_count = int(final_surface_details["normal_reference_ties_resolved"].sum())
         if not bool(final_surface_valid.all()):
+            # Exact maximum distances/angles are only consumed by the error
+            # diagnostic. The summary above still checks every surface sample
+            # and retains the same normal-tie decisions for successful output.
+            if final_surface_details is None:
+                _, final_surface_details = reference_patch_projector.valid_triangles(
+                    gpu_vertices[gpu_faces], gpu_patch_ids, maximum_surface_deviation,
+                    maximum_normal_deviation_degrees, return_details=True,
+                )
             invalid = ~final_surface_valid.cpu().numpy()
             bad_patches, bad_counts = np.unique(gpu_patch_ids.cpu().numpy()[invalid], return_counts=True)
             _, baseline_details = reference_patch_projector.valid_triangles(
@@ -3866,6 +4579,7 @@ def surface_sample_remesh(
     torch.cuda.synchronize(device)
     final_vertices = gpu_vertices.cpu().numpy()
     final_faces = gpu_faces.cpu().numpy()
+    final_edges = None
     if external_partition:
         final_labels = gpu_patch_ids.cpu().numpy()
         final_source_faces = gpu_source_face_ids.cpu().numpy()
@@ -3879,8 +4593,12 @@ def surface_sample_remesh(
             raise RuntimeError("External partition remeshing removed an entire input patch.")
         # Revalidate complete interfaces on the final global mesh. This also
         # detects a missing fixed edge, new crack, or a cross-label diagonal.
-        _validated_external_partition(final_vertices, final_faces, final_labels, partition_constraints, fixed_corners)
-    final_metrics = mesh_quality_metrics(final_vertices, final_faces)
+        validated = _validated_external_partition(
+            final_vertices, final_faces, final_labels, partition_constraints, fixed_corners,
+            return_edges=collect_diagnostics)
+        if collect_diagnostics:
+            final_edges = validated[3]
+    final_metrics = mesh_quality_metrics(final_vertices, final_faces, edges=final_edges) if collect_diagnostics else {}
 
     print(
         "Original-surface CUDA sampling: {} requested, {} candidates, "
@@ -3919,7 +4637,8 @@ def surface_sample_remesh(
         "faces, {} source faces rolled "
         "back; {} CUDA long-edge splits "
         "({} still over {:.6g}), {} CUDA short-edge collapses, {} GPU "
-        "flips, {} / {} relaxations accepted".format(
+        "flips, {} / {} attempted relaxations accepted "
+        "(limit {}, {} line-search attempts; {})".format(
             len(np.unique(patch_ids)) if external_partition else (int(patch_ids.max()) + 1 if len(patch_ids) else 0),
             len(reference_features),
             len(coplanar_edges),
@@ -3932,25 +4651,29 @@ def surface_sample_remesh(
             collapse_count,
             flip_count,
             accepted_relaxations,
+            relaxation_details["attempted_iterations"],
             relax_iterations,
+            relaxation_details["line_search_attempts"],
+            relaxation_details["stop_reason"],
         )
     )
-    print(
-        "Quality (input -> sampled -> optimized): edge CV "
-        "{:.6g} -> {:.6g} -> {:.6g}; mean triangle quality "
-        "{:.6g} -> {:.6g} -> {:.6g}; minimum angle "
-        "{:.6g} -> {:.6g} -> {:.6g} degrees".format(
-            initial_metrics["edge_cv"],
-            sampled_metrics["edge_cv"],
-            final_metrics["edge_cv"],
-            initial_metrics["mean_triangle_quality"],
-            sampled_metrics["mean_triangle_quality"],
-            final_metrics["mean_triangle_quality"],
-            initial_metrics["minimum_angle_degrees"],
-            sampled_metrics["minimum_angle_degrees"],
-            final_metrics["minimum_angle_degrees"],
+    if collect_diagnostics:
+        print(
+            "Quality (input -> sampled -> optimized): edge CV "
+            "{:.6g} -> {:.6g} -> {:.6g}; mean triangle quality "
+            "{:.6g} -> {:.6g} -> {:.6g}; minimum angle "
+            "{:.6g} -> {:.6g} -> {:.6g} degrees".format(
+                initial_metrics["edge_cv"],
+                sampled_metrics["edge_cv"],
+                final_metrics["edge_cv"],
+                initial_metrics["mean_triangle_quality"],
+                sampled_metrics["mean_triangle_quality"],
+                final_metrics["mean_triangle_quality"],
+                initial_metrics["minimum_angle_degrees"],
+                sampled_metrics["minimum_angle_degrees"],
+                final_metrics["minimum_angle_degrees"],
+            )
         )
-    )
     finish_stage('final-validation-and-metrics')
     statistics = {
         "stage_seconds": stage_seconds,
@@ -3981,12 +4704,22 @@ def surface_sample_remesh(
         ),
         "maximum_surface_deviation": maximum_surface_deviation,
         "minimum_collapse_quality": minimum_collapse_quality,
+        "small_patch_maximum_collapse_faces": small_patch_maximum_collapse_faces,
+        "candidate_maximum_normal_deviation_degrees": (
+            stage_validation_normal_deviation_degrees
+            if whole_patch_optimization
+            else maximum_normal_deviation_degrees
+        ),
         "coplanar_internal_edge_count": int(len(coplanar_edges)),
         "splits": split_count,
+        "split_diagnostics": split_diagnostics,
         "remaining_long_edges": remaining_long_edges,
         "collapses": collapse_count,
         "flips": flip_count,
         "accepted_relaxations": accepted_relaxations,
+        "relaxation": relaxation_details,
+        "trace_surface_validation": trace_surface_validation,
+        "diagnostics_collected": collect_diagnostics,
         "initial_metrics": initial_metrics,
         "sampled_metrics": sampled_metrics,
         "final_metrics": final_metrics,
@@ -4000,16 +4733,22 @@ def surface_sample_remesh(
             "source_face_ids": final_source_faces,
         })
         if whole_patch_optimization:
-            used_vertices = np.unique(final_faces)
-            used_original = used_vertices[used_vertices < len(reference_vertices)]
-            moved = np.linalg.norm(final_vertices[used_original] - reference_vertices[used_original], axis=1)
             statistics.update({
-                "source_face_id_semantics": "nearest_local_reference_support_on_same_patch",
+                "source_face_id_semantics": (
+                    "nearest_local_reference_support_on_same_patch" if collect_diagnostics
+                    else "operation_lineage_on_same_patch"
+                ),
                 "surface_validation": "vertices_edge_midpoints_centroid_and_oriented_centroid_normal",
                 "surface_validation_is_hausdorff_bound": False,
-                "reference_normal_distance_ties_resolved": int(final_surface_details["normal_reference_ties_resolved"].sum()),
                 "projection_reference": "complete_supplied_patch" if whole_patch_reference is not None else "complete_input_patch",
-                "original_interior_vertices_moved": int(np.count_nonzero(moved > numeric_surface_tolerance)),
-                "original_vertices_unused": int(len(reference_vertices) - len(used_original)),
             })
+            if collect_diagnostics:
+                used_vertices = np.unique(final_faces)
+                used_original = used_vertices[used_vertices < len(reference_vertices)]
+                moved = np.linalg.norm(final_vertices[used_original] - reference_vertices[used_original], axis=1)
+                statistics.update({
+                    "reference_normal_distance_ties_resolved": final_tie_count,
+                    "original_interior_vertices_moved": int(np.count_nonzero(moved > numeric_surface_tolerance)),
+                    "original_vertices_unused": int(len(reference_vertices) - len(used_original)),
+                })
     return final_vertices, final_faces, statistics

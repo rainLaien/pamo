@@ -1,4 +1,8 @@
 param(
+    [switch]$WallThickness,
+    [ValidateRange(1, 128)][int]$ThicknessWorkers = 20,
+    [ValidateRange(0.0, 1000000000.0)][double]$ThicknessMinimum = 0.01,
+    [ValidateRange(0.0, 180.0)][double]$ThicknessContactAngleDegrees = 0.0,
     [string]$PartitionDirectory = '',
     [string]$OutputDirectory = '',
     [ValidateRange(1, 128)][int]$AnalyticWorkers = 4,
@@ -23,6 +27,10 @@ $options = @{
     GenericRemeshIterations = $GenericRemeshIterations
     GenericRemeshWorkers = $GenericRemeshWorkers
     OtherFeaturesOnly = $true
+    WallThickness = $WallThickness.IsPresent
+    ThicknessWorkers = $ThicknessWorkers
+    ThicknessMinimum = $ThicknessMinimum
+    ThicknessContactAngleDegrees = $ThicknessContactAngleDegrees
     PatchDetails = $PatchDetails.IsPresent
 }
 Write-Host '[remesh] Others only: Cone, Sphere, Torus, Freeform; Plane/Cylinder interiors retained.'

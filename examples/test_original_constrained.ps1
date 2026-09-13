@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
-$inputPath = Join-Path $projectRoot "examples\2.stl"
+$inputPath = Join-Path $projectRoot "examples\Unnamed-Body.stl"
 $outputDirectory = Join-Path $projectRoot "examples\test_outputs"
 $outputPath = Join-Path $outputDirectory "2_constrained.stl"
 $partitionOutputPath = Join-Path $outputDirectory "2_constrained_partitions.ply"

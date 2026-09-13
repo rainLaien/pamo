@@ -14,6 +14,14 @@ bool MakePeriodicCylinderSeed(const Frame &frame,
   std::unordered_map<int,UV> parameters;
   std::unordered_map<EdgeKey,int> copies,physicalCounts;
   std::vector<int> globals;
+  std::unordered_map<EdgeKey,Vec3> sourceNormals;
+  std::unordered_set<EdgeKey> featureEdges;
+  for(const auto &f:sourceFaces){
+    const Vec3 normal=Normalize(Cross(Sub(ToVec(vertices[f[1]]),ToVec(vertices[f[0]])),Sub(ToVec(vertices[f[2]]),ToVec(vertices[f[0]]))));
+    for(int k=0;k<3;++k){const auto key=Key(f[k],f[(k+1)%3]);const auto inserted=sourceNormals.emplace(key,normal);
+      if(!inserted.second && Dot(inserted.first->second,normal)<std::cos(5*Pi/180))featureEdges.insert(key);
+    }
+  }
   for(const auto &source:sourceFaces){
     double angles[3],lifted[3];
     for(int k=0;k<3;++k){
@@ -81,6 +89,9 @@ bool MakePeriodicCylinderSeed(const Frame &frame,
     if(cutCounts.at(physical)!=physicalCounts.at(physical))return fail("periodic_unpaired_cut_edge");
   }
   diagnostics.Stage="periodic_cylinder_seam_sampling";
+  for(const auto &entry:edges)if(entry.second.Count==2 && featureEdges.count(Key(globals[entry.second.A],globals[entry.second.B])))
+    boundary.push_back(entry.first);
+  std::sort(boundary.begin(),boundary.end());
   std::unordered_map<EdgeKey,std::vector<int>> chains;
   int nextAlias=-2;
   for(EdgeKey key:boundary){
@@ -110,12 +121,20 @@ bool MakePeriodicCylinderSeed(const Frame &frame,
         chart.Aliases.push_back(samples.FirstAlias-(order-1));chart.Fixed.push_back(1);
       }
     }else if(length>target*(1+1e-6)){
-      diagnostics.GlobalEdgeA=globals[a];diagnostics.GlobalEdgeB=globals[b];
-      diagnostics.EdgeLength=length;diagnostics.EdgeTarget=target;
-      return fail("fixed_boundary_requires_sampling");
+      const double divisions=std::ceil(length/(target*.8));
+      if(!std::isfinite(divisions)||divisions>100000||chart.Points.size()+divisions>100000)return fail("boundary_sample_budget");
+      for(int j=1;j<int(divisions);++j){const double t=double(j)/divisions;
+        const int v=int(chart.Points.size());chain.push_back(v);
+        chart.Points.push_back({pa.X+(pb.X-pa.X)*t,pa.Y+(pb.Y-pa.Y)*t});
+        chart.Aliases.push_back(-1);chart.Fixed.push_back(1);
+        chart.BoundarySamples.push_back({globals[a],globals[b],v,t});
+      }
     }
     chain.push_back(b);
-    for(std::size_t j=1;j<chain.size();++j)segments.push_back({chain[j-1],chain[j]});
+    for(std::size_t j=1;j<chain.size();++j){
+      if(edges.at(key).Count==1)segments.push_back({chain[j-1],chain[j]});
+      else chart.InteriorConstraints.push_back({chain[j-1],chain[j]});
+    }
     chains.emplace(key,std::move(chain));
   }
   // Insert paired samples into their incident seed faces. A center fan handles

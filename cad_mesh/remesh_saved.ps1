@@ -1,4 +1,8 @@
 param(
+    [switch]$WallThickness,
+    [ValidateRange(1, 128)][int]$ThicknessWorkers = 20,
+    [ValidateRange(0.0, 1000000000.0)][double]$ThicknessMinimum = 0.01,
+    [ValidateRange(0.0, 180.0)][double]$ThicknessContactAngleDegrees = 0.0,
     [string]$PartitionDirectory = '',
     [string]$OutputDirectory = '',
     [ValidateRange(1, 128)][int]$AnalyticWorkers = 4,
@@ -82,6 +86,11 @@ $nativeArguments = @(
     '--flip-passes', "$FlipPasses", '--relax-iterations', "$RelaxIterations"
 )
 $nativeArguments += @('--max-deviation', $MaxDeviation.ToString('R', $culture))
+if ($WallThickness) {
+    $nativeArguments += @('--wall-thickness', '--thickness-workers', "$ThicknessWorkers",
+        '--thickness-minimum', $ThicknessMinimum.ToString('R', $culture),
+        '--thickness-contact-angle-deg', $ThicknessContactAngleDegrees.ToString('R', $culture))
+}
 & $nativeExecutable @nativeArguments
 if ($LASTEXITCODE -ne 0) { throw "Native remesh failed (exit $LASTEXITCODE)." }
 Write-Host "[remesh] Result: $(Join-Path $OutputDirectory 'remesh_result.ply')"

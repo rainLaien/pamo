@@ -46,7 +46,7 @@ bool ExportBinaryHandoffPly(const CadMeshPatchSegmenter &s,
   const auto &mesh = s.getMesh();
   out << "ply\nformat binary_little_endian 1.0\ncomment color_by surface_instance"
          "\ncomment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform"
-         "\ncomment feature_role_ids 0=Ordinary 1=Fillet\nelement vertex "
+         "\ncomment feature_role_ids 0=Ordinary 1=Fillet 2=FilletCandidate\nelement vertex "
       << mesh.getVertices().size()
       << "\nproperty double x\nproperty double y\nproperty double z\nelement face "
       << mesh.getTriangles().size()
@@ -74,7 +74,7 @@ bool ExportBinaryHandoffPly(const CadMeshPatchSegmenter &s,
     const auto *patch = triangle.PatchId >= 0 && triangle.PatchId < int(s.getPatches().size())
                             ? &s.getPatches()[triangle.PatchId] : nullptr;
     const auto type = patch ? patch->SurfaceType : PatchSurfaceType::Unknown;
-    const bool fillet = patch && patch->FeatureRole == PatchFeatureRole::Fillet;
+
     const auto color = Color(triangle.PatchId);
     AppendLittleEndian(buffer, std::uint8_t(3));
     for (int vertex : triangle.VertexIds)
@@ -83,7 +83,7 @@ bool ExportBinaryHandoffPly(const CadMeshPatchSegmenter &s,
     AppendLittleEndian(buffer, std::int32_t(SurfaceTypeId(type)));
     for (int channel : color)
       AppendLittleEndian(buffer, std::uint8_t(channel));
-    AppendLittleEndian(buffer, std::int32_t(fillet ? 1 : 0));
+    AppendLittleEndian(buffer, std::int32_t(patch ? static_cast<int>(patch->FeatureRole) : 0));
     if (buffer.size() >= BlockRows * 28)
       flush();
   }
@@ -93,7 +93,7 @@ bool ExportBinaryHandoffPly(const CadMeshPatchSegmenter &s,
   return bool(out);
 }
 const char *RoleName(PatchFeatureRole role) {
-  return role == PatchFeatureRole::Fillet ? "Fillet" : "Ordinary";
+  return role == PatchFeatureRole::FilletCandidate ? "FilletCandidate" : role == PatchFeatureRole::Fillet ? "Fillet" : "Ordinary";
 }
 bool ExportColoredPly(const CadMeshPatchSegmenter &s,
                       const std::filesystem::path &path, int colorMode) {
@@ -104,7 +104,7 @@ bool ExportColoredPly(const CadMeshPatchSegmenter &s,
   out << "ply\nformat ascii 1.0\ncomment color_by "
       << (colorMode == 1 ? "surface_type" : colorMode == 2 ? "feature_role" : "surface_instance")
       << "\ncomment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform"
-      << "\ncomment feature_role_ids 0=Ordinary 1=Fillet\nelement vertex "
+      << "\ncomment feature_role_ids 0=Ordinary 1=Fillet 2=FilletCandidate\nelement vertex "
       << mesh.getVertices().size()
       << "\nproperty double x\nproperty double y\nproperty double z\nelement face "
       << mesh.getTriangles().size()
@@ -126,7 +126,7 @@ bool ExportColoredPly(const CadMeshPatchSegmenter &s,
     out << "3 " << t.VertexIds[0] << ' ' << t.VertexIds[1] << ' '
         << t.VertexIds[2] << ' ' << t.PatchId << ' ' << SurfaceTypeId(type)
         << ' ' << color[0] << ' ' << color[1] << ' ' << color[2]
-        << ' ' << (fillet ? 1 : 0) << '\n';
+        << ' ' << (patch ? static_cast<int>(patch->FeatureRole) : 0) << '\n';
   }
   out.flush();
   return bool(out);

@@ -8,6 +8,7 @@ param(
     [ValidateRange(0.01, 100)][double]$FitToleranceRatio = 3,
     [ValidateRange(0.01, 89)][double]$NormalAngleDegrees = 8.0214091318,
     [ValidateRange(0.01, 89)][double]$SharpAngleDegrees = 37.2422566835,
+    [ValidateSet('auto', 'cpu', 'cuda')][string]$AnalyticSeedBackend = 'cuda',
     [switch]$Legacy,
     [switch]$Remesh,
     [ValidateSet('surface', 'legacy')][string]$RemeshMethod = 'surface',
@@ -48,7 +49,8 @@ if ($RunTests) {
     if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
 }
 $segmentArguments = @($InputStl, $OutputDirectory, '--fit-tolerance-ratio', $FitToleranceRatio,
-    '--normal-angle-deg', $NormalAngleDegrees, '--sharp-angle-deg', $SharpAngleDegrees)
+    '--normal-angle-deg', $NormalAngleDegrees, '--sharp-angle-deg', $SharpAngleDegrees,
+    '--analytic-seed-backend', $AnalyticSeedBackend)
 if ($Legacy) { $segmentArguments += @('--legacy', '--strong', $StrongBoundary, '--weak', $WeakBoundary, '--rings', $CurvatureRings) }
 & (Join-Path $buildDirectory "cad_mesh_segment.exe") @segmentArguments
 if ($LASTEXITCODE -ne 0) { throw "Segmentation failed." }

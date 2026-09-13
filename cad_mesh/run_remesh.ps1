@@ -10,7 +10,10 @@ param(
     [ValidateRange(0, 10000)][int]$CollapsePasses = 12,
     [ValidateRange(0, 10000)][int]$FlipPasses = 8,
     [ValidateRange(0, 10000)][int]$RelaxIterations = 3,
-    [ValidateRange(1, 10000000)][int]$BatchFaceLimit = 40000,
+    [ValidateRange(1, 10000000)][int]$BatchFaceLimit = 75000,
+    [ValidateRange(0.0, 180.0)][double]$MaxNormalDeviationDegrees = 10.0,
+    [switch]$TraceSurfaceValidation,
+    [switch]$FullOutput,
     [string]$PythonExecutable = ""
 )
 
@@ -31,7 +34,15 @@ $remeshArguments = @((Join-Path $moduleRoot 'remesh_partition.py'),
     '--sample-count', $SampleCount, '--split-passes', $SplitPasses,
     '--collapse-passes', $CollapsePasses, '--flip-passes', $FlipPasses,
     '--relax-iterations', $RelaxIterations, '--batch-face-limit', $BatchFaceLimit,
+    '--max-normal-deviation-degrees',
+    $MaxNormalDeviationDegrees.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture),
     '--method', $Method, '--projection-backend', $ProjectionBackend)
+if ($TraceSurfaceValidation) {
+    $remeshArguments += '--trace-surface-validation'
+}
+if ($FullOutput) {
+    $remeshArguments += '--full-output'
+}
 if (-not [string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $remeshArguments += @('--output', [System.IO.Path]::GetFullPath($OutputDirectory))
 }

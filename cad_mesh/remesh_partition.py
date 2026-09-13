@@ -10,7 +10,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cad_mesh.remesh_io import load_partition, write_remesh_result
-from cad_mesh.remesh_pipeline import remesh_partition
+from cad_mesh.remesh_pipeline import DEFAULT_BATCH_FACE_LIMIT, remesh_partition
 
 
 def main(argv=None):
@@ -28,9 +28,16 @@ def main(argv=None):
     parser.add_argument("--flip-passes", type=int, default=8)
     parser.add_argument("--relax-iterations", type=int, default=3)
     parser.add_argument("--max-boundary-splits", type=int, default=1000000)
-    parser.add_argument("--batch-face-limit", type=int, default=40000, help="Maximum source faces per CUDA batch before shared-edge refinement.")
+    parser.add_argument("--batch-face-limit", type=int, default=DEFAULT_BATCH_FACE_LIMIT,
+                        help="Maximum source faces per CUDA batch before shared-edge refinement (default 75000; comparison values: 50000 or 100000).")
     parser.add_argument("--max-deviation", type=float, help="Independent geometry deviation in model units; surface default: 0.00025 * input bbox diagonal; legacy default: 0.005 * target.")
+    parser.add_argument("--max-normal-deviation-degrees", type=float, default=10.0,
+                        help="Maximum allowed output normal deviation in degrees (default 10).")
+    parser.add_argument("--trace-surface-validation", action="store_true", default=False,
+                        help="Run expensive diagnostic surface checks after every stage (disabled by default; final validation always runs).")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--full-output", action="store_true",
+                        help="Also collect diagnostic statistics and export JSON, STL and alternate PLY views; default writes only remesh_result.ply.")
     args = parser.parse_args(argv)
     begin = time.perf_counter()
     try:
@@ -51,13 +58,16 @@ def main(argv=None):
             flip_passes=args.flip_passes, relax_iterations=args.relax_iterations,
             seed=args.seed, maximum_boundary_splits=args.max_boundary_splits,
             maximum_deviation=args.max_deviation,
+            maximum_normal_deviation_degrees=args.max_normal_deviation_degrees,
             batch_face_limit=args.batch_face_limit,
             method=args.method,
             projection_backend=args.projection_backend,
+            trace_surface_validation=args.trace_surface_validation,
+            collect_diagnostics=args.full_output or args.trace_surface_validation,
         )
         rebuild_seconds = time.perf_counter() - rebuild_begin
         export_begin = time.perf_counter()
-        paths = write_remesh_result(output, result, source)
+        paths = write_remesh_result(output, result, source, full_output=args.full_output)
         export_seconds = time.perf_counter() - export_begin
         print(f"[remesh] Complete: {len(source.faces):,} -> {len(result.faces):,} faces; "
               f"{result.stats['input_patch_count']:,} input labels -> {result.stats['output_patch_count']:,} output surface domains.")

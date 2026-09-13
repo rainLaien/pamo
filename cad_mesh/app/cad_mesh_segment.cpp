@@ -22,8 +22,9 @@ int Run(int argc, char **argv) {
                  "[--split-passes count] [--collapse-passes count] "
                  "[--flip-passes count] [--relax-iterations count] "
                  "[--require-remesh-cuda | --cpu] "
-                 "[--remesh-handoff] "
-                 "[--stop-after-partition] "
+                 "[--wall-thickness --thickness-workers count --thickness-minimum value --thickness-contact-angle-deg value] "
+                 "[--remesh-handoff] [--remesh-cone-limit count] "
+                 "[--stop-after-partition] [--cylinders-only | --cones-only] [--ruled-growth-distance value] "
                  "[--partition-snapshot (input is a prepared native snapshot)] "
                  "[--legacy] [--strong value] [--weak value] [--rings count]\n";
     return 2;
@@ -39,6 +40,10 @@ int Run(int argc, char **argv) {
   std::clog.setf(std::ios::unitbuf);
   for (int i = 3; i < argc; ++i) {
     std::string option = argv[i];
+    if (option == "--wall-thickness") {
+      remeshConfig.ComputeWallThickness = true;
+      continue;
+    }
     if (option == "--cpu") {
       remeshConfig.DisableCuda = true;
       continue;
@@ -46,6 +51,14 @@ int Run(int argc, char **argv) {
     if (option == "--partition-snapshot") {
       partitionSnapshot = true;
       nativeRemesh = true;
+      continue;
+    }
+    if (option == "--cylinders-only") {
+      config.ModelCylindersOnly = true;
+      continue;
+    }
+    if (option == "--cones-only") {
+      config.ModelConesOnly = true;
       continue;
     }
     if (option == "--stop-after-partition") {
@@ -88,8 +101,16 @@ int Run(int argc, char **argv) {
       throw std::invalid_argument("Expected a finite nonnegative value for " +
                                   option);
     constexpr double radians = 3.14159265358979323846 / 180;
-    if (option == "--fit-tolerance-ratio" && value > 0)
+    if (option == "--thickness-workers" && value >= 1 && value <= 128 && std::floor(value)==value)
+      remeshConfig.ThicknessOptions.Workers=int(value);
+    else if (option == "--thickness-minimum")
+      remeshConfig.ThicknessOptions.MinimumThickness=value;
+    else if (option == "--thickness-contact-angle-deg" && value <= 180)
+      remeshConfig.ThicknessOptions.MinimumContactAngleDegrees=value;
+    else if (option == "--fit-tolerance-ratio" && value > 0)
       config.ModelFitToleranceRatio = value;
+    else if (option == "--ruled-growth-distance" && std::isfinite(value) && value > 0)
+      config.ModelRuledGrowthDistance = value;
     else if (option == "--normal-angle-deg" && value > 0 && value < 90)
       config.ModelNormalTolerance = value * radians;
     else if (option == "--sharp-angle-deg" && value > 0 && value < 90)
@@ -106,6 +127,8 @@ int Run(int argc, char **argv) {
     else if (option == "--rings" && value >= 1 && value <= 16 &&
              std::floor(value) == value)
       config.CurvatureRingCount = int(value);
+    else if (option == "--remesh-cone-limit" && value >= 1 && value <= 1000000 && std::floor(value)==value)
+      remeshConfig.ConePatchLimit = int(value);
     else if (option == "--target-edge-length" && value > 0)
       remeshConfig.TargetEdgeLength = value;
     else if (option == "--generic-feature-angle-deg" && value >= 0 && value <= 180)
@@ -141,6 +164,16 @@ int Run(int argc, char **argv) {
       return 2;
     }
   }
+  if (config.ModelCylindersOnly && config.ModelConesOnly)
+    throw std::invalid_argument("--cylinders-only and --cones-only are mutually exclusive");
+  if (config.ModelCylindersOnly || config.ModelConesOnly) {
+    if (!config.EnableModelFirst || nativeRemesh || partitionSnapshot)
+      throw std::invalid_argument("Single-primitive mode requires model-first partition of an input mesh, without remesh");
+    stopAfterPartition = true;
+    remeshHandoff = true;
+  }
+  if (remeshConfig.ComputeWallThickness && (!nativeRemesh || stopAfterPartition))
+    throw std::invalid_argument("--wall-thickness requires a remesh run, without --stop-after-partition");
   if (remeshConfig.DisableCuda) {
     if (remeshConfig.RequireCuda)
       throw std::invalid_argument("--cpu cannot be combined with --require-remesh-cuda");

@@ -158,7 +158,8 @@ class AnalyticRemeshTests(unittest.TestCase):
         prepared_vertices, prepared_faces = prepare_shared_boundaries(vertices, faces, length)
         edges = boundary_edges(prepared_faces)
         out_v, out_f, stats = remesh_analytic_patch(
-            prepared_vertices, prepared_faces, patch, edges, length, deviation)
+            prepared_vertices, prepared_faces, patch, edges, length, deviation,
+            maximum_normal_deviation_degrees=180.0)
         self.assertTrue(stats["accepted"], stats)
         self.assertIsNotNone(out_v)
         self.assertIsNotNone(out_f)
@@ -299,6 +300,12 @@ class AnalyticRemeshTests(unittest.TestCase):
                 _, _, stats = self.check_remesh(vertices, faces, PLANE, target, 1e-9)
                 self.assertLessEqual(stats["maximum_edge_length"], target * (1.0 + 1e-6))
                 self.assertGreaterEqual(stats["interior_refinement_passes"], 0)
+
+    def test_repeated_plane_charts_keep_the_triangulator_alive(self):
+        vertices, faces = annulus()
+        for _ in range(8):
+            _, _, stats = self.check_remesh(vertices, faces, PLANE, .7, 1e-9)
+            self.assertTrue(stats["accepted"], stats)
 
 
 if __name__ == "__main__":

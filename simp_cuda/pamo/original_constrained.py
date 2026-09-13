@@ -4828,18 +4828,19 @@ def _subdivide_labeled_patch_boundaries(
         for limit in patch_edge_limits.values()
     ):
         raise ValueError("Per-patch boundary edge limits must be finite and positive.")
-    vertices_list = [vertex.copy() for vertex in vertices]
-    faces_list = [list(map(int, face)) for face in faces]
-    labels_list = list(map(int, raw_labels))
-    edge_faces = _build_edge_faces(np.asarray(faces_list, dtype=np.int64))
-    boundary_edges = set()
-    for edge, incidence in edge_faces.items():
-        incidence = tuple(incidence)
-        if (
-            len(incidence) != 2
-            or labels_list[incidence[0]] != labels_list[incidence[1]]
-        ):
-            boundary_edges.add(edge)
+    # Only constrained edges can enter the split queue. Discover them with
+    # flat integer arrays, then construct mutable incidence sets for those
+    # edges alone (not all ~3F/2 edges of a million-triangle mesh).
+    radix = np.int64(max(len(vertices), 1))
+    directed = np.sort(faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1)
+    keys, inverse, counts = np.unique(directed[:, 0] * radix + directed[:, 1],
+                                       return_inverse=True, return_counts=True)
+    minimum = np.full(len(keys), np.iinfo(np.int64).max, dtype=np.int64)
+    maximum = np.full(len(keys), np.iinfo(np.int64).min, dtype=np.int64)
+    repeated_labels = np.repeat(raw_labels, 3)
+    np.minimum.at(minimum, inverse, repeated_labels)
+    np.maximum.at(maximum, inverse, repeated_labels)
+    boundary_mask = (counts != 2) | (minimum != maximum)
     if explicit_constraint_edges is not None:
         explicit_edges = np.asarray(explicit_constraint_edges)
         if explicit_edges.size == 0 and explicit_edges.shape in ((0,), (0, 2)):
@@ -4852,13 +4853,30 @@ def _subdivide_labeled_patch_boundaries(
             raise ValueError(
                 "Explicit constraint edges must be an integer (K, 2) array."
             )
-        for endpoints in explicit_edges:
-            edge = tuple(sorted(map(int, endpoints)))
-            if edge not in edge_faces:
-                raise ValueError(
-                    "Explicit constraint is not a mesh edge: {}.".format(edge)
-                )
-            boundary_edges.add(edge)
+        explicit_edges = np.sort(np.asarray(explicit_edges, dtype=np.int64), axis=1)
+        if np.any(explicit_edges < 0) or np.any(explicit_edges >= len(vertices)):
+            raise ValueError("Explicit constraint is not a mesh edge: vertex index out of range.")
+        explicit_keys = explicit_edges[:, 0] * radix + explicit_edges[:, 1]
+        positions = np.searchsorted(keys, explicit_keys)
+        present = positions < len(keys)
+        present[present] &= keys[positions[present]] == explicit_keys[present]
+        if not np.all(present):
+            raise ValueError("Explicit constraint is not a mesh edge: {}.".format(
+                tuple(map(int, explicit_edges[np.flatnonzero(~present)[0]]))))
+        boundary_mask[positions] = True
+    boundary_ids = np.flatnonzero(boundary_mask)
+    edge_order = np.argsort(inverse, kind="stable")
+    offsets = np.r_[0, np.cumsum(counts)]
+    edge_faces = {
+        (int(keys[index] // radix), int(keys[index] % radix)):
+            set((edge_order[offsets[index]:offsets[index + 1]] // 3).tolist())
+        for index in boundary_ids
+    }
+    boundary_edges = set(edge_faces)
+    del directed, keys, inverse, counts, minimum, maximum, repeated_labels, boundary_mask, edge_order, offsets
+    vertices_list = list(vertices)
+    faces_list = faces.tolist()
+    labels_list = raw_labels.tolist()
     source_edges = sorted(boundary_edges)
     edge_sources = {edge: index for index, edge in enumerate(source_edges)}
 
@@ -4904,6 +4922,11 @@ def _subdivide_labeled_patch_boundaries(
         ):
             raise RuntimeError("Boundary edge limit is below coordinate precision.")
         vertices_list.append(midpoint)
+        children = (
+            tuple(sorted((edge[0], midpoint_index))),
+            tuple(sorted((midpoint_index, edge[1]))),
+        )
+        boundary_edges.update(children)
         replacements = []
         for face_index in incident_faces:
             first_face, second_face = _constraint_split_face(
@@ -4922,15 +4945,12 @@ def _subdivide_labeled_patch_boundaries(
             faces_list.append(second_face)
             labels_list.append(labels_list[face_index])
             for new_edge in _constraint_face_edges(first_face):
-                edge_faces.setdefault(new_edge, set()).add(face_index)
+                if new_edge in boundary_edges:
+                    edge_faces.setdefault(new_edge, set()).add(face_index)
             for new_edge in _constraint_face_edges(second_face):
-                edge_faces.setdefault(new_edge, set()).add(second_index)
+                if new_edge in boundary_edges:
+                    edge_faces.setdefault(new_edge, set()).add(second_index)
         boundary_edges.discard(edge)
-        children = (
-            tuple(sorted((edge[0], midpoint_index))),
-            tuple(sorted((midpoint_index, edge[1]))),
-        )
-        boundary_edges.update(children)
         source_index = edge_sources.pop(edge)
         for child in children:
             edge_sources[child] = source_index

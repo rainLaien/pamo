@@ -1,4 +1,8 @@
 param(
+    [switch]$WallThickness,
+    [ValidateRange(1, 128)][int]$ThicknessWorkers = 20,
+    [ValidateRange(0.0, 1000000000.0)][double]$ThicknessMinimum = 0.01,
+    [ValidateRange(0.0, 180.0)][double]$ThicknessContactAngleDegrees = 0.0,
     [string]$InputStl = '',
     [string]$OutputDirectory = '',
     [ValidateRange(0.000001, 1000000000.0)][double]$TargetEdgeLength = 6.0,
@@ -20,6 +24,10 @@ $arguments = @{
     MaxNormalDeviationDegrees = $MaxNormalDeviationDegrees
     AnalyticWorkers = $AnalyticWorkers
     GenericRemeshWorkers = $GenericRemeshWorkers
+    WallThickness = $WallThickness.IsPresent
+    ThicknessWorkers = $ThicknessWorkers
+    ThicknessMinimum = $ThicknessMinimum
+    ThicknessContactAngleDegrees = $ThicknessContactAngleDegrees
     PatchDetails = $PatchDetails
     Cpu = $true
 }

@@ -6,7 +6,11 @@ Geometry-error diagnostics below are sampled distances, not Hausdorff bounds.
 """
 from __future__ import annotations
 
+import atexit
 import math
+import multiprocessing as mp
+import time
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor
 
 import numpy as np
 
@@ -17,6 +21,47 @@ class _Rejected(ValueError):
 
 def _reject(reason):
     raise _Rejected(reason)
+
+
+def _triangle_worker(pslg, opts):
+    import triangle
+    return triangle.triangulate(pslg, opts)
+
+
+_TRIANGLE_POOL = None
+
+
+def _shutdown_triangle_pool():
+    global _TRIANGLE_POOL
+    pool = _TRIANGLE_POOL
+    _TRIANGLE_POOL = None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _triangle_pool():
+    global _TRIANGLE_POOL
+    if _TRIANGLE_POOL is None:
+        _TRIANGLE_POOL = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
+        atexit.register(_shutdown_triangle_pool)
+    return _TRIANGLE_POOL
+
+
+def _run_triangle(pslg, opts):
+    """Triangulate in a child process so Triangle access violations cannot kill remesh."""
+    payload = {key: np.asarray(value) for key, value in pslg.items()}
+    for _ in range(2):
+        try:
+            return _triangle_pool().submit(_triangle_worker, payload, opts).result(timeout=60)
+        except KeyboardInterrupt:
+            _shutdown_triangle_pool()
+            raise
+        except (BrokenExecutor, OSError, EOFError, BrokenPipeError):
+            _shutdown_triangle_pool()
+        except TimeoutError:
+            _shutdown_triangle_pool()
+            break
+    _reject("constrained_chart_triangulation_failed")
 
 
 def _unit(vector):
@@ -37,10 +82,11 @@ def _basis(axis):
 
 def _edge_topology(faces):
     directed = faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2)
-    edges, inverse, counts = np.unique(
-        np.sort(directed, axis=1), axis=0, return_inverse=True,
-        return_counts=True,
-    )
+    radix = np.int64(faces.max(initial=0)) + 1
+    ordered = np.sort(directed, axis=1)
+    keys, inverse, counts = np.unique(ordered[:, 0] * radix + ordered[:, 1],
+                                      return_inverse=True, return_counts=True)
+    edges = np.column_stack((keys // radix, keys % radix))
     orientation = np.zeros(len(edges), dtype=np.int64)
     np.add.at(orientation, inverse,
               np.where(directed[:, 0] < directed[:, 1], 1, -1))
@@ -160,12 +206,12 @@ def _inside_polygon(point, polygon):
     return bool(np.count_nonzero(x > point[0]) % 2)
 
 
-def _interior_point(polygon, triangle):
+def _interior_point(polygon):
     count = len(polygon)
-    result = triangle.triangulate({
+    result = _run_triangle({
         "vertices": polygon,
         "segments": np.column_stack((np.arange(count), np.roll(np.arange(count), -1))),
-    }, "pYQ")
+    }, "pY")
     if "triangles" not in result or not len(result["triangles"]):
         _reject("cannot_find_boundary_loop_interior")
     triangles = result["vertices"][result["triangles"]]
@@ -460,7 +506,10 @@ def _trimmed_periodic_chart(vertices, faces, surface, target, cut=0., allow_shar
             if key not in seam_edges:
                 continue
             if key not in seam_sites:
-                divisions = max(1, int(math.ceil(np.linalg.norm(uv[b] - uv[a]) / (target * .8))))
+                # A cylinder has independent circumferential/axial lengths.
+                # Both seam copies use this same metric and alias sequence.
+                divisions = max(1, int(math.ceil(np.linalg.norm(
+                    (uv[b] - uv[a]) / np.asarray(target)) / .8)))
                 if divisions > 100000:
                     _reject('periodic_seam_sample_budget_exceeded')
                 new_aliases = np.arange(next_alias, next_alias - divisions + 1, -1, dtype=np.int64)
@@ -513,14 +562,62 @@ def _routed_periodic_chart(vertices, faces, surface, target):
     raise last_error
 
 
+def _validate_fixed_chart_edge_feasibility(chart, segments, fixed_boundary_edges):
+    """Reject an immutable trim that no triangle can meet within the span cap."""
+    if "circumferential_edge_length" not in chart:
+        return
+    uv, aliases = chart["uv"], chart["aliases"]
+    limit = float(chart["circumferential_edge_length"]) * (1.0 + 1e-6)
+    # For an incident triangle with two movable sides, the angular span of
+    # its fixed side cannot exceed the sum of their two allowed spans. A
+    # triangle with another fixed side is the only exception; examine every
+    # fixed neighbor, including all copies of its alias at a periodic seam.
+    numeric_margin = max(float(np.max(np.abs(uv[:, 0]), initial=0.0)), limit, 1.0)
+    numeric_margin *= np.finfo(np.float64).eps * 8
+    spans = np.abs(uv[segments[:, 1], 0] - uv[segments[:, 0], 0])
+    candidates = segments[spans > 2.0 * limit + numeric_margin]
+    if not len(candidates):
+        return
+    fixed = set(map(tuple, np.sort(fixed_boundary_edges, axis=1)))
+    neighbors, alias_sites = {}, {}
+    for first, second in fixed:
+        neighbors.setdefault(first, set()).add(second)
+        neighbors.setdefault(second, set()).add(first)
+    for site, alias in enumerate(aliases):
+        if alias >= 0:
+            alias_sites.setdefault(alias, []).append(site)
+    for first, second in candidates:
+        first_alias, second_alias = aliases[first], aliases[second]
+        if tuple(sorted((first_alias, second_alias))) not in fixed:
+            continue
+        possible = False
+        for alias in neighbors.get(first_alias, set()) | neighbors.get(second_alias, set()):
+            for third in alias_sites.get(alias, ()):
+                if third == first or third == second:
+                    continue
+                if all(
+                    tuple(sorted((aliases[endpoint], alias))) in fixed
+                    or abs(uv[endpoint, 0] - uv[third, 0]) <= limit + numeric_margin
+                    for endpoint in (first, second)
+                ):
+                    possible = True
+                    break
+            if possible:
+                break
+        if not possible:
+            _reject("fixed_boundary_prevents_chart_edge_limits")
+
+
 def _triangulate_chart(chart, target, triangle, original_vertices,
                        fixed_boundary_edges, maximum_edge_length):
     uv, loops = chart["uv"], chart["loops"]
-    offset = uv.min(axis=0)
-    coordinate_scale = float(np.max(np.ptp(uv, axis=0)))
+    metric_scale = np.asarray(chart.get("metric_scale", (1.0, 1.0)), dtype=np.float64)
+    metric_uv = uv * metric_scale
+    offset = metric_uv.min(axis=0)
+    coordinate_scale = float(np.max(np.ptp(metric_uv, axis=0)))
     if not np.isfinite(coordinate_scale) or coordinate_scale <= 0.0:
         _reject("parameter_domain_has_invalid_scale")
-    normalized_uv = (uv - offset) / coordinate_scale
+    normalized_uv = (metric_uv - offset) / coordinate_scale
     areas = np.array([abs(_polygon_area(normalized_uv[loop])) for loop in loops])
     outer = int(np.argmax(areas))
     if areas[outer] <= 0.0:
@@ -529,7 +626,7 @@ def _triangulate_chart(chart, target, triangle, original_vertices,
     for index, loop in enumerate(loops):
         if index == outer:
             continue
-        point = _interior_point(normalized_uv[loop], triangle)
+        point = _interior_point(normalized_uv[loop])
         if not _inside_polygon(point, normalized_uv[loops[outer]]):
             _reject("parameter_domain_has_multiple_outer_components")
         if any(_inside_polygon(point, normalized_uv[other])
@@ -541,7 +638,7 @@ def _triangulate_chart(chart, target, triangle, original_vertices,
         _reject("invalid_parameter_domain_area")
     source_area = chart["source_chart_area"]
     if source_area is not None:
-        source_area /= coordinate_scale * coordinate_scale
+        source_area *= float(np.prod(metric_scale)) / (coordinate_scale * coordinate_scale)
         if abs(source_area - domain_area) > max(domain_area * 1e-7, 1e-20):
             _reject("source_chart_does_not_cover_the_boundary_domain_once")
     normalized_target = min(target / coordinate_scale, 2.0)
@@ -551,6 +648,7 @@ def _triangulate_chart(chart, target, triangle, original_vertices,
     if domain_area / maximum_area > 200000:
         _reject("analytic_chart_face_budget_exceeded")
     segments = np.vstack([np.column_stack((loop, np.roll(loop, -1))) for loop in loops])
+    _validate_fixed_chart_edge_feasibility(chart, segments, fixed_boundary_edges)
     # A long immutable edge can prevent Triangle's circumcenter refinement:
     # the desired center would encroach on a segment that Y forbids splitting.
     # Place a thin row of interior support points beside those edges instead.
@@ -583,15 +681,21 @@ def _triangulate_chart(chart, target, triangle, original_vertices,
     pslg = {"vertices": input_points, "segments": segments}
     if holes:
         pslg["holes"] = np.asarray(holes)
+    options = f"pYq25a{maximum_area:.17f}Q"
     # Triangle's maximum area is a density request, not an edge-length bound.
     # Certify actual 3D lengths and add midpoint sites only to the generated
     # chart's long interior edges. This never subdivides source triangles or
     # independently resamples the supplied boundary/seam constraints.
-    fixed_edges = set(map(tuple, fixed_boundary_edges))
+    fixed_keys = (fixed_boundary_edges[:, 0] * np.int64(len(original_vertices))
+                  + fixed_boundary_edges[:, 1])
     edge_bound = maximum_edge_length * (1.0 + 1e-6)
     aliases = chart["aliases"]
+    original_sites = np.flatnonzero(aliases >= 0)
+    seam_sites = np.flatnonzero(aliases < 0)
+    _, seam_first, seam_inverse = np.unique(aliases[seam_sites], return_index=True,
+                                           return_inverse=True)
     for refinement_pass in range(9):
-        result = triangle.triangulate(pslg, f"pYq25a{maximum_area:.17f}Q")
+        result = _run_triangle(pslg, options)
         if "triangles" not in result or not len(result["triangles"]):
             _reject("constrained_chart_triangulation_failed")
         normalized_output = np.asarray(result["vertices"], dtype=np.float64)
@@ -602,27 +706,27 @@ def _triangulate_chart(chart, target, triangle, original_vertices,
                 or not np.array_equal(normalized_output[:len(uv)], normalized_uv)):
             _reject("triangulator_changed_supplied_constraint_vertices")
         output_edges, counts, _ = _edge_topology(output_faces)
-        output_uv = normalized_output * coordinate_scale + offset
+        output_uv = (normalized_output * coordinate_scale + offset) / metric_scale
         output_uv[:len(uv)] = uv
         spatial = chart["lift"](output_uv)
-        original_sites = np.flatnonzero(aliases >= 0)
         spatial[original_sites] = original_vertices[aliases[original_sites]]
-        seam_sites = {}
-        for site in np.flatnonzero(aliases < 0):
-            alias = int(aliases[site])
-            if alias in seam_sites:
-                spatial[site] = spatial[seam_sites[alias]]
-            else:
-                seam_sites[alias] = site
+        spatial[seam_sites] = spatial[seam_sites[seam_first[seam_inverse]]]
         fixed = np.zeros(len(output_edges), dtype=bool)
-        for index in np.flatnonzero(np.all(output_edges < len(aliases), axis=1)):
-            endpoints = aliases[output_edges[index]]
-            if np.all(endpoints >= 0):
-                fixed[index] = tuple(sorted(map(int, endpoints))) in fixed_edges
+        indices = np.flatnonzero(np.all(output_edges < len(aliases), axis=1))
+        endpoints = np.sort(aliases[output_edges[indices]], axis=1)
+        physical = np.all(endpoints >= 0, axis=1)
+        fixed[indices[physical]] = np.isin(
+            endpoints[physical, 0] * np.int64(len(original_vertices)) + endpoints[physical, 1],
+            fixed_keys)
         lengths = np.linalg.norm(spatial[output_edges[:, 1]] - spatial[output_edges[:, 0]], axis=1)
         if not np.isfinite(lengths).all():
             _reject("nonfinite_analytic_chart_edge_length")
         long_edges = (~fixed) & (lengths > edge_bound)
+        if "circumferential_edge_length" in chart:
+            # An area target alone does not bound angular spans, especially
+            # beside immutable trims. Refine only movable interior edges.
+            spans = np.abs(output_uv[output_edges[:, 1], 0] - output_uv[output_edges[:, 0], 0])
+            long_edges |= (~fixed) & (spans > chart["circumferential_edge_length"] * (1.0 + 1e-6))
         if not np.any(long_edges):
             chart["interior_refinement_passes"] = refinement_pass
             chart["maximum_internal_edge_length"] = float(np.max(lengths[~fixed], initial=0.0))
@@ -650,41 +754,83 @@ def _triangulate_chart(chart, target, triangle, original_vertices,
                                        triangles[:, 2] - triangles[:, 0])).sum()
     if abs(output_area - domain_area) > max(domain_area * 1e-7, 1e-20):
         _reject("triangulation_did_not_preserve_parameter_domain_area")
-    return output_uv, output_faces, len(holes), domain_area * coordinate_scale * coordinate_scale
+    return (output_uv, output_faces, len(holes),
+            domain_area * coordinate_scale * coordinate_scale / float(np.prod(metric_scale)))
 
 
 def _map_to_shared_geometry(vertices, chart, uv, faces):
-    output = [point.copy() for point in vertices]
     chart_map = np.empty(len(uv), dtype=np.int64)
     lifted = chart["lift"](uv)
-    seam_ids = {}
-    for index, alias in enumerate(chart["aliases"]):
-        if alias >= 0:
-            chart_map[index] = alias
-        elif int(alias) in seam_ids:
-            chart_map[index] = seam_ids[int(alias)]
-        else:
-            seam_ids[int(alias)] = len(output)
-            chart_map[index] = len(output)
-            output.append(lifted[index])
-    for index in range(len(chart["aliases"]), len(uv)):
-        chart_map[index] = len(output)
-        output.append(lifted[index])
-    return np.asarray(output), chart_map[faces]
+    aliases = chart["aliases"]
+    original_sites = np.flatnonzero(aliases >= 0)
+    chart_map[original_sites] = aliases[original_sites]
+    seam_sites = np.flatnonzero(aliases < 0)
+    _, first, inverse = np.unique(aliases[seam_sites], return_index=True, return_inverse=True)
+    # Assign seam vertices in first-occurrence order, preserving the existing
+    # output numbering as well as exact sharing between both chart copies.
+    order = np.argsort(first)
+    seam_map = np.empty(len(first), dtype=np.int64)
+    seam_map[order] = np.arange(len(first))
+    chart_map[seam_sites] = len(vertices) + seam_map[inverse]
+    interior_count = len(uv) - len(aliases)
+    chart_map[len(aliases):] = len(vertices) + len(first) + np.arange(interior_count)
+    output = np.vstack((vertices, lifted[seam_sites[first[order]]], lifted[len(aliases):]))
+    return output, chart_map[faces]
 
 
-def _sampled_mesh_distance(points, vertices, faces, igl):
+def _cylinder_metric_quality(vertices, faces, surface, circumferential, axial):
+    height, theta, _ = surface.coordinates(vertices)
+    face_angles = theta[faces]
+    relative = np.arctan2(np.sin(face_angles - face_angles[:, :1]),
+                          np.cos(face_angles - face_angles[:, :1]))
+    uv = np.stack((surface.radius * relative / circumferential,
+                   height[faces] / axial), axis=-1)
+    edges = uv[:, (1, 2, 0)] - uv
+    twice_area = np.abs(np.cross(edges[:, 0], -edges[:, 2]))
+    denominator = np.einsum('fij,fij->f', edges, edges)
+    quality = 2.0 * math.sqrt(3.0) * twice_area / np.maximum(denominator, np.finfo(float).tiny)
+    return float(np.mean(quality))
+
+
+def _sampled_mesh_distance(points, vertices, faces, igl, centroid_normals=None):
+    # point_mesh_squared_distance rebuilds its AABB on every call. A chart
+    # with more than 32768 samples must reuse one tree across its chunks.
+    tree = igl.AABB_f64_3()
+    tree_vertices = np.ascontiguousarray(vertices, dtype=np.float64)
+    tree_faces = np.ascontiguousarray(faces, dtype=np.int32)
+    tree.init(tree_vertices, tree_faces)
     maximum = 0.0
+    maximum_normal = 0.0
+    if centroid_normals is not None:
+        triangles = tree_vertices[tree_faces]
+        reference_normals = np.cross(triangles[:, 1] - triangles[:, 0],
+                                     triangles[:, 2] - triangles[:, 0])
+        reference_normals /= np.maximum(np.linalg.norm(reference_normals, axis=1)[:, None],
+                                        np.finfo(float).tiny)
+        centroid_begin = len(points) - len(centroid_normals)
     for start in range(0, len(points), 32768):
-        squared, _, _ = igl.point_mesh_squared_distance(points[start:start + 32768], vertices, faces)
+        squared, nearest, _ = tree.squared_distance(tree_vertices, tree_faces,
+                                             np.ascontiguousarray(points[start:start + 32768]),
+                                             return_index=True, return_closest_point=True)
         if not np.isfinite(squared).all():
             _reject("nonfinite_reference_distance")
         maximum = max(maximum, math.sqrt(max(0.0, float(np.max(squared)))))
-    return maximum
+        if centroid_normals is not None:
+            first = max(start, centroid_begin)
+            last = start + len(squared)
+            if first < last:
+                indices = np.asarray(nearest).reshape(-1)[first - start:]
+                alignment = np.einsum('ij,ij->i',
+                    centroid_normals[first - centroid_begin:last - centroid_begin],
+                    reference_normals[indices])
+                maximum_normal = max(maximum_normal, float(np.max(
+                    np.rad2deg(np.arccos(np.clip(alignment, -1.0, 1.0))))))
+    return maximum if centroid_normals is None else (maximum, maximum_normal)
 
 
 def remesh_analytic_patch(vertices, faces, patch, boundary_edges,
-                          target_edge_length, maximum_deviation):
+                          target_edge_length, maximum_deviation,
+                          maximum_normal_deviation_degrees=10.0):
     """Return whole-chart geometry, or ``(None, None, rejected_diagnostics)``.
 
     Accepted geometry retains the original vertex table as an unchanged
@@ -695,7 +841,19 @@ def remesh_analytic_patch(vertices, faces, patch, boundary_edges,
     """
     diagnostics = {"accepted": False, "mode": "whole_analytic_chart",
                    "surface_type": patch.get("type", "Unknown")}
+    timing = {
+        "setup": 0.0,
+        "surface_projection": 0.0,
+        "chart_construction": 0.0,
+        "triangulation": 0.0,
+        "mapping": 0.0,
+        "distance_sampling": 0.0,
+        "validation": 0.0,
+        "total": 0.0,
+    }
+    overall_begin = time.perf_counter()
     try:
+        begin = time.perf_counter()
         import triangle
         import igl
         vertices = np.asarray(vertices, dtype=np.float64)
@@ -703,6 +861,9 @@ def remesh_analytic_patch(vertices, faces, patch, boundary_edges,
         boundary_edges = np.asarray(boundary_edges)
         target = float(target_edge_length)
         deviation = float(maximum_deviation)
+        normal_limit = float(maximum_normal_deviation_degrees)
+        if not np.isfinite(normal_limit) or not 0.0 <= normal_limit <= 180.0:
+            _reject("invalid_maximum_normal_deviation")
         if not np.isfinite(target) or target <= 0 or not np.isfinite(deviation) or deviation < 0:
             _reject("invalid_target_length_or_deviation")
         if (vertices.ndim != 2 or vertices.shape[1] != 3 or not np.isfinite(vertices).all()
@@ -726,7 +887,9 @@ def remesh_analytic_patch(vertices, faces, patch, boundary_edges,
                                            - vertices[actual_boundary[:, 0]], axis=1)
         if np.any(boundary_lengths > target * (1.0 + 1e-6)):
             _reject("fixed_boundary_exceeds_target_edge_length")
+        timing["setup"] += time.perf_counter() - begin
         loops = _fan_boundary_loops(faces)
+        begin = time.perf_counter()
         surface = _Surface(patch)
         source_points = _sample_points(vertices, faces)
         scale = max(float(np.max(np.abs(source_points))), float(np.max(np.ptp(source_points, axis=0))), 1e-30)
@@ -751,15 +914,28 @@ def remesh_analytic_patch(vertices, faces, patch, boundary_edges,
                 _reject("curved_chart_requires_positive_radius_and_deviation")
             effective_target = min(target, math.sqrt(8 * radius * deviation) * .7,
                                    radius * math.pi / 3)
+        # Both developed chart coordinates measure physical distance. Keep
+        # their spacing equal so quality describes the actual 3D triangles.
+        # The sampled reference normals below enforce the configured budget;
+        # an angular span heuristic cannot account for fixed STL boundaries.
+        chart_spacing = effective_target
+        timing["surface_projection"] += time.perf_counter() - begin
+        begin = time.perf_counter()
         try:
             chart = _simple_chart(vertices, faces, loops, surface)
         except _Rejected as failure:
             if str(failure) != "surface_requires_a_periodic_parameter_seam":
                 raise
-            chart = _routed_periodic_chart(vertices, faces, surface, effective_target)
+            chart = _routed_periodic_chart(vertices, faces, surface, chart_spacing)
+        timing["chart_construction"] += time.perf_counter() - begin
+        begin = time.perf_counter()
         uv, chart_faces, holes, chart_area = _triangulate_chart(
             chart, effective_target, triangle, vertices, actual_boundary, target)
+        timing["triangulation"] += time.perf_counter() - begin
+        begin = time.perf_counter()
         output_vertices, output_faces = _map_to_shared_geometry(vertices, chart, uv, chart_faces)
+        timing["mapping"] += time.perf_counter() - begin
+        begin = time.perf_counter()
         output_triangles = output_vertices[output_faces]
         crosses = np.cross(output_triangles[:, 1] - output_triangles[:, 0],
                             output_triangles[:, 2] - output_triangles[:, 0])
@@ -770,6 +946,7 @@ def remesh_analytic_patch(vertices, faces, patch, boundary_edges,
         # notably for the cone development. Correct only one global reversal.
         if np.all(alignment < 0.0):
             output_faces = output_faces[:, [0, 2, 1]]
+            crosses = -crosses
         elif np.any(alignment < 0.0):
             _reject("remeshed_chart_folds_on_the_surface")
         output_edges, output_counts, output_orientation = _edge_topology(output_faces)
@@ -784,17 +961,29 @@ def remesh_analytic_patch(vertices, faces, patch, boundary_edges,
             output_vertices[output_edges[:, 1]] - output_vertices[output_edges[:, 0]], axis=1)))
         if maximum_output_edge > target * (1.0 + 1e-6):
             _reject("analytic_remesh_exceeds_target_edge_length")
+        timing["validation"] += time.perf_counter() - begin
+        begin = time.perf_counter()
         output_points = _sample_points(output_vertices, output_faces)
-        outward = _sampled_mesh_distance(output_points, vertices, faces, igl)
+        output_normals = crosses / np.maximum(np.linalg.norm(crosses, axis=1)[:, None],
+                                              np.finfo(float).tiny)
+        outward, normal_maximum = _sampled_mesh_distance(
+            output_points, vertices, faces, igl, centroid_normals=output_normals)
         inward = _sampled_mesh_distance(source_points, output_vertices, output_faces, igl)
+        timing["distance_sampling"] += time.perf_counter() - begin
+        begin = time.perf_counter()
         diagnostics.update({
             "output_to_reference_sampled_maximum": outward,
             "reference_to_output_sampled_maximum": inward,
             "geometry_sampling": "all_vertices_edge_midpoints_and_face_centroids",
             "hausdorff_upper_bound": False,
+            "maximum_reference_normal_deviation_degrees": normal_maximum,
+            "maximum_normal_deviation_degrees": normal_limit,
         })
         if max(outward, inward) > deviation + numeric_tolerance:
             _reject("remeshed_chart_exceeds_sampled_reference_deviation")
+        if normal_maximum > normal_limit + 1e-8:
+            _reject("remeshed_chart_exceeds_reference_normal_deviation")
+        timing["validation"] += time.perf_counter() - begin
         diagnostics.update({
             "accepted": True, "reason": "accepted", "periodic_seam": chart["periodic"],
             "trimmed_cylinder_chart": bool(chart.get("trimmed_cylinder", False)),
@@ -812,7 +1001,12 @@ def remesh_analytic_patch(vertices, faces, patch, boundary_edges,
             "chart_area": chart_area, "boundary_vertices_fixed": True,
             "source_interior_triangulation_reused": False,
         })
+        timing["total"] = time.perf_counter() - overall_begin
+        diagnostics["timing"] = {key: float(value) for key, value in timing.items()}
         return output_vertices, output_faces, diagnostics
     except (ValueError, KeyError, TypeError, OverflowError, ImportError, RuntimeError) as failure:
         diagnostics["reason"] = str(failure) or type(failure).__name__
+        timing["validation"] += time.perf_counter() - begin
+        timing["total"] = time.perf_counter() - overall_begin
+        diagnostics["timing"] = {key: float(value) for key, value in timing.items()}
         return None, None, diagnostics

@@ -76,8 +76,9 @@ class PlanarDomain {
 public:
   PlanarDomain(Chart &chart,const std::vector<std::array<int,2>> &segments,bool multipleLoops,double flipLimit=0):C(chart),MultipleLoops(multipleLoops),FlipLimit(flipLimit){
     for(const auto &edge:segments)Fixed.insert(Key(edge[0],edge[1]));
+    for(const auto &edge:C.InteriorConstraints)Fixed.insert(Key(edge[0],edge[1]));
     for(int i=0;i<int(C.Faces.size());++i)add(i);
-    for(const auto &edge:Adj)if((edge.second.B<0)!=bool(Fixed.count(edge.first)))Good=false;
+    for(const auto &edge:Adj)if(edge.second.B<0 && !Fixed.count(edge.first))Good=false;
     for(auto key:Fixed)if(!Adj.count(key))Good=false;
     if(!Good)Failure="seed_topology";
     if(Good && FlipLimit>0)for(auto key:Fixed){
@@ -608,6 +609,14 @@ bool MakeSeededCylinderChart(const Frame &frame,
                              const std::vector<std::array<int,3>> &sourceFaces,
                              const std::vector<Point3> &vertices,double target,Chart &chart,
                              double axialTarget,ChartBuildDiagnostics &diagnostics){
+  // Source topology supplies the trimmed domain. Boundary subdivision stays
+  // local until its proposals are reconciled with the neighboring patches.
+  if(frame.Type==PatchSurfaceType::Cylinder || frame.Type==PatchSurfaceType::Cone){
+    const double scale=target/axialTarget;
+    const bool made=MakePeriodicCylinderChart(frame,sourceFaces,vertices,target,scale,chart,diagnostics);
+    for(UV &point:chart.Points)point.Y/=scale;
+    return made;
+  }
   // Preserve the inexpensive boundary-only path when it succeeds. Retry from
   // source topology when a trimmed cylinder violates the ring/ear-clip assumptions.
   if(MakeBoundaryCylinderChart(frame,loops,vertices,target,chart,axialTarget,diagnostics))return true;

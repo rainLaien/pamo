@@ -19,7 +19,11 @@ class _CudaTriangleValidationCache:
     """Exact, bounded device cache for fixed-coordinate endpoint collapses.
 
     Ordered vertex IDs and the compact patch ID form a lossless integer key.
-    Hash collisions only evict entries: full keys are checked before reuse.
+    Keys are stored separately rather than packed into one int64: packing
+    silently disabled caching on large meshes. Hash collisions only evict
+    entries, and all reads finish before the elected writers update slots.
+    Uncached rows are packed on the device so BVH traversal runs on occupied
+    lanes instead of leaving most lanes idle among scattered cache hits.
     """
 
     def __init__(self, vertices, projector, maximum_deviation, normal_degrees):
@@ -27,52 +31,63 @@ class _CudaTriangleValidationCache:
         self.projector = projector
         self.maximum_deviation = maximum_deviation
         self.normal_degrees = normal_degrees
-        self.version = vertices._version
-        self.base = len(vertices)
-        self.enabled = self.base > 0 and len(projector.label_values) * self.base**3 <= 2**63 - 1
-        self.capacity = 1 << 20
-        if self.enabled:
-            self.keys = torch.full((self.capacity,), -1, device=vertices.device, dtype=torch.long)
-            self.values = torch.zeros(self.capacity, device=vertices.device, dtype=torch.bool)
-            self.owners = torch.empty(self.capacity, device=vertices.device, dtype=torch.long)
+        self.version = -1
+        self.enabled = len(vertices) > 0
+        # Each endpoint direction proposes many cavity triangles per vertex.
+        # Leave room for both directions and successive passes to avoid
+        # repeatedly evicting unchanged geometry (at most 148 MiB total).
+        self.capacity = min(1 << 22, 1 << max(0, (32 * len(vertices) - 1).bit_length()))
+        self.keys = torch.empty((self.capacity, 3), device=vertices.device, dtype=torch.long)
+        self.labels = torch.full((self.capacity,), -1, device=vertices.device, dtype=torch.long)
+        self.values = torch.empty(self.capacity, device=vertices.device, dtype=torch.bool)
+        # The bundled Warp 1.0 beta exposes integer atomic_min only for
+        # int32 values and int32 indices. Owners are query-row numbers, not
+        # geometric IDs; keep the lossless face/patch keys as int64.
+        self.owners = torch.full((self.capacity,), 2**31 - 1, device=vertices.device, dtype=torch.int32)
 
     def check(self, faces, patch_ids):
         if not self.enabled:
             return self.projector.valid_triangles(self.vertices[faces], patch_ids,
                 self.maximum_deviation, self.normal_degrees)
         if self.version != self.vertices._version:
-            self.keys.fill_(-1)
+            if (self.vertices.ndim != 2 or self.vertices.shape[1] != 3
+                    or self.vertices.dtype != torch.float64
+                    or self.vertices.device != self.projector.gpu_vertices.device):
+                raise ValueError('CUDA validation cache needs float64 (n,3) reference-device vertices.')
+            if not bool(torch.isfinite(self.vertices).all()):
+                raise ValueError('Patch projection points must be finite.')
+            self.labels.fill_(-1)
             self.version = self.vertices._version
+        if faces.ndim != 2 or faces.shape[1] != 3 or faces.dtype != torch.long or faces.device != self.vertices.device:
+            raise ValueError('CUDA validation cache needs int64 (n,3) reference-device faces.')
         labels = self.projector._labels(patch_ids, len(faces))
-        base = self.base
-        encoded = ((labels * base + faces[:, 0]) * base + faces[:, 1]) * base + faces[:, 2]
-        keys, inverse = torch.unique(encoded, return_inverse=True)
-        # Mix high bits so triangles sharing an endpoint do not share one slot.
-        mixed = keys ^ (keys >> 21) ^ (keys >> 42)
-        slots = mixed & (self.capacity - 1)
-        hit = self.keys[slots] == keys
-        valid = self.values[slots].clone()
-        missing = torch.nonzero(~hit).reshape(-1)
-        if len(missing):
-            decoded = keys[missing]
-            c = decoded % base
-            decoded = decoded // base
-            b = decoded % base
-            decoded = decoded // base
-            a = decoded % base
-            patch = self.projector.label_values[decoded // base]
-            triangles = self.vertices[torch.stack((a, b, c), dim=1)]
-            valid[missing] = self.projector.valid_triangles(triangles, patch,
-                self.maximum_deviation, self.normal_degrees)
-            # Elect one writer per slot; key/value stores must have the same
-            # owner, even when multiple new keys hash to an identical slot.
-            self.owners.fill_(len(keys))
-            indices = torch.arange(len(keys), device=keys.device)
-            self.owners.scatter_reduce_(0, slots, indices, reduce='amin', include_self=True)
-            winners = torch.nonzero(self.owners[slots] == indices).reshape(-1)
-            self.keys[slots[winners]] = keys[winners]
-            self.values[slots[winners]] = valid[winners]
-        return valid[inverse]
+        valid = torch.empty(len(faces), device=faces.device, dtype=torch.bool)
+        if len(faces):
+            # Retain Torch's checked indexing before passing coordinates to
+            # Warp, without sorting keys or compacting a GPU miss list on CPU.
+            triangles = self.vertices[faces].reshape(-1, 3).contiguous()
+            query_faces = wp.from_torch(faces.contiguous(), dtype=vec3l)
+            query_labels = wp.from_torch(labels)
+            cache_args = [wp.from_torch(self.keys, dtype=vec3l), wp.from_torch(self.labels),
+                          wp.from_torch(self.values), wp.from_torch(self.owners), self.capacity - 1]
+            misses = torch.empty(len(faces), device=faces.device, dtype=torch.int32)
+            miss_count = torch.zeros(1, device=faces.device, dtype=torch.int32)
+            miss_args = [wp.from_torch(misses), wp.from_torch(miss_count)]
+            cosine, limit = self.projector._validation_limits(self.maximum_deviation, self.normal_degrees)
+            with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(faces.device))):
+                wp.launch(_validation_cache_lookup, dim=len(faces), inputs=[
+                    query_faces, query_labels, *cache_args, *miss_args, wp.from_torch(valid)])
+                # The device count bounds work without a host synchronization;
+                # threads beyond the compacted queue return immediately.
+                wp.launch(_validate_cache_misses, dim=len(faces), inputs=[
+                    wp.from_torch(triangles, dtype=wp.vec3d), query_labels,
+                    *self.projector._reference_args, *self.projector._normal_args,
+                    limit, cosine, self.projector.normal_tie_tolerance,
+                    self.maximum_deviation is not None, self.normal_degrees is not None,
+                    *miss_args, wp.from_torch(valid)])
+                wp.launch(_store_validation_cache, dim=len(faces), inputs=[
+                    query_faces, query_labels, *cache_args, wp.from_torch(valid)])
+        return valid
 
 
 @wp.func
@@ -164,12 +179,64 @@ def _nearest(p: wp.vec3d, root: wp.int64, capacity: wp.int64,
 
 
 @wp.func
+def _within_distance(p: wp.vec3d, limit: wp.float64, seed: wp.int64,
+                     root: wp.int64, capacity: wp.int64,
+                     lower: wp.array(dtype=wp.vec3d), upper: wp.array(dtype=wp.vec3d),
+                     node_faces: wp.array(dtype=wp.int64), vertices: wp.array(dtype=wp.vec3d),
+                     faces: wp.array(dtype=vec3l)):
+    # Boolean distance validation needs an exact witness inside the bound,
+    # not the globally nearest face. Try the centroid's support first, then
+    # traverse the complete patch BVH until such a witness is found.
+    if seed >= wp.int64(0):
+        f = faces[seed]
+        q = _triangle_point(p, vertices[f[0]], vertices[f[1]], vertices[f[2]])
+        if wp.dot(q - p, q - p) <= limit:
+            return True
+    pending = stack32(wp.int64(0))
+    pending[0] = root
+    size = int(1)
+    while size > 0:
+        size -= 1
+        node = pending[size]
+        local = node - root
+        if _box_distance(p, lower[node], upper[node]) <= limit:
+            if local >= capacity - wp.int64(1):
+                face_id = node_faces[node]
+                if face_id >= wp.int64(0):
+                    f = faces[face_id]
+                    q = _triangle_point(p, vertices[f[0]], vertices[f[1]], vertices[f[2]])
+                    if wp.dot(q - p, q - p) <= limit:
+                        return True
+            else:
+                left = root + wp.int64(2) * local + wp.int64(1)
+                right = left + wp.int64(1)
+                left_distance = _box_distance(p, lower[left], upper[left])
+                right_distance = _box_distance(p, lower[right], upper[right])
+                near = left
+                far = right
+                near_distance = left_distance
+                far_distance = right_distance
+                if right_distance < left_distance:
+                    near = right
+                    far = left
+                    near_distance = right_distance
+                    far_distance = left_distance
+                if far_distance <= limit:
+                    pending[size] = far
+                    size += 1
+                if near_distance <= limit:
+                    pending[size] = near
+                    size += 1
+    return False
+
+
+@wp.func
 def _normal_support(p: wp.vec3d, normal: wp.vec3d, cosine: wp.float64,
                     tolerance: wp.float64, thin_only: bool, root: wp.int64, capacity: wp.int64,
                     lower: wp.array(dtype=wp.vec3d), upper: wp.array(dtype=wp.vec3d),
                     node_faces: wp.array(dtype=wp.int64), vertices: wp.array(dtype=wp.vec3d),
                     faces: wp.array(dtype=vec3l), normals: wp.array(dtype=wp.vec3d),
-                    thin: wp.array(dtype=wp.bool)):
+                    thin: wp.array(dtype=wp.bool), first_match: bool):
     found = wp.int64(-1)
     best_plane = wp.float64(1.7976931348623157e308)
     node = root
@@ -206,6 +273,8 @@ def _normal_support(p: wp.vec3d, normal: wp.vec3d, cosine: wp.float64,
                                     and wp.dot(wp.cross(b-a, p-a), n) / wp.length(b-a) >= -tolerance
                                     and wp.dot(wp.cross(c-b, p-b), n) / wp.length(c-b) >= -tolerance
                                     and wp.dot(wp.cross(a-c, p-c), n) / wp.length(a-c) >= -tolerance):
+                                if first_match:
+                                    return face_id
                                 if plane < best_plane or (plane == best_plane and (found < wp.int64(0) or face_id < found)):
                                     found = face_id
                                     best_plane = plane
@@ -214,6 +283,138 @@ def _normal_support(p: wp.vec3d, normal: wp.vec3d, cosine: wp.float64,
         previous = node
         node = next_node
     return found
+
+
+@wp.func
+def _triangle_valid(a: wp.vec3d, b: wp.vec3d, c: wp.vec3d, root: wp.int64, capacity: wp.int64,
+                    lower: wp.array(dtype=wp.vec3d), upper: wp.array(dtype=wp.vec3d),
+                    node_faces: wp.array(dtype=wp.int64), vertices: wp.array(dtype=wp.vec3d),
+                    faces: wp.array(dtype=vec3l), normals: wp.array(dtype=wp.vec3d),
+                    thin: wp.array(dtype=wp.bool), distance_limit_squared: wp.float64,
+                    cosine: wp.float64, tolerance: wp.float64, check_distance: bool, check_normal: bool):
+    center = (a + b + c) / wp.float64(3.0)
+    cross = wp.cross(b - a, c - a)
+    area = wp.length(cross)
+    if check_normal and not (area > wp.float64(0.0)):
+        return False
+    q, center_distance, center_id = _nearest(
+        center, root, capacity, lower, upper, node_faces, vertices, faces)
+    if center_id < wp.int64(0):
+        return False
+    if check_distance and not (center_distance <= distance_limit_squared):
+        return False
+    if check_normal:
+        unit_normal = cross / area
+        if not (wp.dot(unit_normal, normals[center_id]) >= cosine):
+            support = _normal_support(
+                center, unit_normal, cosine, tolerance, center_distance > tolerance * tolerance,
+                root, capacity, lower, upper, node_faces, vertices, faces, normals, thin, True)
+            if support < wp.int64(0):
+                return False
+            center_id = support
+    if check_distance:
+        for sample in range(6):
+            p = (a + b) * wp.float64(0.5)
+            if sample == 1:
+                p = (b + c) * wp.float64(0.5)
+            elif sample == 2:
+                p = (c + a) * wp.float64(0.5)
+            elif sample == 3:
+                p = a
+            elif sample == 4:
+                p = b
+            elif sample == 5:
+                p = c
+            if not _within_distance(p, distance_limit_squared, center_id,
+                    root, capacity, lower, upper, node_faces, vertices, faces):
+                return False
+    return True
+
+
+@wp.kernel
+def _validate_mask(triangles: wp.array(dtype=wp.vec3d), labels: wp.array(dtype=wp.int64),
+                   roots: wp.array(dtype=wp.int64), capacities: wp.array(dtype=wp.int64),
+                   lower: wp.array(dtype=wp.vec3d), upper: wp.array(dtype=wp.vec3d),
+                   node_faces: wp.array(dtype=wp.int64), vertices: wp.array(dtype=wp.vec3d),
+                   faces: wp.array(dtype=vec3l), normals: wp.array(dtype=wp.vec3d), thin: wp.array(dtype=wp.bool),
+                   distance_limit_squared: wp.float64, cosine: wp.float64, tolerance: wp.float64,
+                   check_distance: bool, check_normal: bool, valid: wp.array(dtype=wp.bool)):
+    i = wp.tid()
+    label = labels[i]
+    valid[i] = _triangle_valid(triangles[3 * i], triangles[3 * i + 1], triangles[3 * i + 2],
+        roots[label], capacities[label], lower, upper, node_faces, vertices, faces, normals, thin,
+        distance_limit_squared, cosine, tolerance, check_distance, check_normal)
+
+
+@wp.func
+def _validation_slot(f: vec3l, label: wp.int64, mask: wp.int64):
+    # Unsigned multiplication wraps by definition; the complete integer key
+    # is checked below, so hashing cannot introduce an incorrect cache hit.
+    mixed = ((wp.uint64(f[0]) * wp.uint64(73856093))
+             ^ (wp.uint64(f[1]) * wp.uint64(19349663))
+             ^ (wp.uint64(f[2]) * wp.uint64(83492791))
+             ^ (wp.uint64(label) * wp.uint64(2654435761)))
+    mixed = mixed ^ (mixed >> wp.uint64(32))
+    # Cache slots are bounded by 2**22, and Warp's atomic index overload is
+    # int32 even though ordinary array indexing also accepts int64.
+    return int(mixed & wp.uint64(mask))
+
+
+@wp.kernel
+def _validation_cache_lookup(query_faces: wp.array(dtype=vec3l), labels: wp.array(dtype=wp.int64),
+                             cached_faces: wp.array(dtype=vec3l), cached_labels: wp.array(dtype=wp.int64),
+                             cached_valid: wp.array(dtype=wp.bool), owners: wp.array(dtype=wp.int32),
+                             slot_mask: wp.int64, misses: wp.array(dtype=wp.int32),
+                             miss_count: wp.array(dtype=wp.int32), valid: wp.array(dtype=wp.bool)):
+    i = wp.tid()
+    f = query_faces[i]
+    label = labels[i]
+    slot = _validation_slot(f, label, slot_mask)
+    if cached_labels[slot] == label:
+        old = cached_faces[slot]
+        if old[0] == f[0] and old[1] == f[1] and old[2] == f[2]:
+            valid[i] = cached_valid[slot]
+            return
+    row = wp.atomic_add(miss_count, 0, 1)
+    misses[row] = i
+    wp.atomic_min(owners, slot, i)
+
+
+@wp.kernel
+def _validate_cache_misses(triangles: wp.array(dtype=wp.vec3d),
+                     labels: wp.array(dtype=wp.int64), roots: wp.array(dtype=wp.int64),
+                     capacities: wp.array(dtype=wp.int64), lower: wp.array(dtype=wp.vec3d),
+                     upper: wp.array(dtype=wp.vec3d), node_faces: wp.array(dtype=wp.int64),
+                     vertices: wp.array(dtype=wp.vec3d), faces: wp.array(dtype=vec3l),
+                     normals: wp.array(dtype=wp.vec3d), thin: wp.array(dtype=wp.bool),
+                     distance_limit_squared: wp.float64, cosine: wp.float64, tolerance: wp.float64,
+                     check_distance: bool, check_normal: bool,
+                     misses: wp.array(dtype=wp.int32), miss_count: wp.array(dtype=wp.int32),
+                     valid: wp.array(dtype=wp.bool)):
+    row = wp.tid()
+    if row >= miss_count[0]:
+        return
+    i = misses[row]
+    label = labels[i]
+    valid[i] = _triangle_valid(triangles[3 * i], triangles[3 * i + 1], triangles[3 * i + 2],
+        roots[label], capacities[label], lower, upper, node_faces, vertices, faces, normals, thin,
+        distance_limit_squared, cosine, tolerance, check_distance, check_normal)
+
+
+@wp.kernel
+def _store_validation_cache(query_faces: wp.array(dtype=vec3l), labels: wp.array(dtype=wp.int64),
+                            cached_faces: wp.array(dtype=vec3l), cached_labels: wp.array(dtype=wp.int64),
+                            cached_valid: wp.array(dtype=wp.bool), owners: wp.array(dtype=wp.int32),
+                            slot_mask: wp.int64, valid: wp.array(dtype=wp.bool)):
+    i = wp.tid()
+    f = query_faces[i]
+    label = labels[i]
+    slot = _validation_slot(f, label, slot_mask)
+    if owners[slot] == i:
+        cached_faces[slot] = f
+        cached_labels[slot] = label
+        cached_valid[slot] = valid[i]
+        owners[slot] = int(2147483647)
 
 
 @wp.kernel
@@ -293,7 +494,7 @@ def _validate(triangles: wp.array(dtype=wp.vec3d), labels: wp.array(dtype=wp.int
             alignment = wp.dot(unit_normal, normals[center_id])
             if alignment < cosine:
                 support = _normal_support(center, unit_normal, cosine, tolerance, center_distance > tolerance*tolerance,
-                    root, capacity, lower, upper, node_faces, vertices, faces, normals, thin)
+                    root, capacity, lower, upper, node_faces, vertices, faces, normals, thin, False)
                 if support >= wp.int64(0):
                     center_id = support
                     alignment = wp.dot(unit_normal, normals[support])
@@ -308,6 +509,73 @@ def _validate(triangles: wp.array(dtype=wp.vec3d), labels: wp.array(dtype=wp.int
     areas[i] = area
     centroid_ids[i] = center_id
     resolved[i] = tie_resolved
+
+
+@wp.kernel
+def _validate_with_ties(triangles: wp.array(dtype=wp.vec3d), labels: wp.array(dtype=wp.int64),
+                        roots: wp.array(dtype=wp.int64), capacities: wp.array(dtype=wp.int64),
+                        lower: wp.array(dtype=wp.vec3d), upper: wp.array(dtype=wp.vec3d),
+                        node_faces: wp.array(dtype=wp.int64), vertices: wp.array(dtype=wp.vec3d),
+                        faces: wp.array(dtype=vec3l), normals: wp.array(dtype=wp.vec3d),
+                        thin: wp.array(dtype=wp.bool), distance_limit_squared: wp.float64,
+                        cosine: wp.float64, tolerance: wp.float64,
+                        check_distance: bool, check_normal: bool,
+                        valid: wp.array(dtype=wp.bool), resolved: wp.array(dtype=wp.bool)):
+    # Successful final validation needs the same mask and resolved-normal
+    # count as _validate, but does not consume seven exact nearest distances.
+    i = wp.tid()
+    a = triangles[3 * i]
+    b = triangles[3 * i + 1]
+    c = triangles[3 * i + 2]
+    center = (a + b + c) / wp.float64(3.0)
+    root = roots[labels[i]]
+    capacity = capacities[labels[i]]
+    q, center_distance, center_id = _nearest(
+        center, root, capacity, lower, upper, node_faces, vertices, faces)
+    cross = wp.cross(b - a, c - a)
+    area = wp.length(cross)
+    normal_ok = True
+    tie_resolved = False
+    if check_normal:
+        alignment = wp.float64(-1.0)
+        if area > wp.float64(0.0) and center_id >= wp.int64(0):
+            unit_normal = cross / area
+            alignment = wp.dot(unit_normal, normals[center_id])
+            if alignment < cosine:
+                support = _normal_support(
+                    center, unit_normal, cosine, tolerance,
+                    center_distance > tolerance * tolerance,
+                    root, capacity, lower, upper, node_faces, vertices,
+                    faces, normals, thin, False)
+                if support >= wp.int64(0):
+                    center_id = support
+                    alignment = wp.dot(unit_normal, normals[support])
+                    tie_resolved = True
+        normal_ok = alignment >= cosine and area > wp.float64(0.0)
+    # Resolve normals even when distance validation fails: the public summary
+    # promises the complete details path's tie flags for every input row.
+    resolved[i] = tie_resolved
+    distance_ok = center_id >= wp.int64(0)
+    if check_distance:
+        distance_ok = distance_ok and center_distance <= distance_limit_squared
+        if distance_ok and normal_ok:
+            for sample in range(6):
+                p = a
+                if sample == 1:
+                    p = b
+                elif sample == 2:
+                    p = c
+                elif sample == 3:
+                    p = (a + b) * wp.float64(0.5)
+                elif sample == 4:
+                    p = (b + c) * wp.float64(0.5)
+                elif sample == 5:
+                    p = (c + a) * wp.float64(0.5)
+                if not _within_distance(p, distance_limit_squared, center_id,
+                        root, capacity, lower, upper, node_faces, vertices, faces):
+                    distance_ok = False
+                    break
+    valid[i] = distance_ok and normal_ok
 
 
 class CudaReferencePatchProjector(_ReferencePatchProjector):
@@ -382,9 +650,15 @@ class CudaReferencePatchProjector(_ReferencePatchProjector):
             wp.from_torch(self.lower,dtype=wp.vec3d), wp.from_torch(self.upper,dtype=wp.vec3d),
             wp.from_torch(self.node_faces), wp.from_torch(self.gpu_vertices,dtype=wp.vec3d),
             wp.from_torch(self.gpu_faces,dtype=vec3l)]
+        self._normal_args = [wp.from_torch(self.gpu_normals, dtype=wp.vec3d), wp.from_torch(self.thin)]
 
     def make_triangle_cache(self, vertices, maximum_deviation, normal_degrees):
         return _CudaTriangleValidationCache(vertices, self, maximum_deviation, normal_degrees)
+
+    def _validation_limits(self, maximum_deviation, normal_degrees):
+        cosine = -1. if normal_degrees is None else float(np.cos(np.deg2rad(normal_degrees))-1e-12)
+        limit = 0. if maximum_deviation is None else (float(maximum_deviation)+self.numeric_tolerance)**2
+        return cosine, limit
 
     def _labels(self, labels, size):
         if labels.shape != (size,) or labels.device != self.gpu_vertices.device or labels.dtype != torch.long:
@@ -424,24 +698,71 @@ class CudaReferencePatchProjector(_ReferencePatchProjector):
         positions, _, ids = self.query_torch(points,patch_ids)
         return positions, ids
 
-    def valid_triangles(self, triangles, patch_ids, maximum_deviation,
-                        maximum_normal_deviation_degrees, return_details=False):
-        if triangles.ndim != 3 or triangles.shape[1:] != (3,3) or triangles.dtype != torch.float64 or triangles.device != self.gpu_vertices.device:
-            raise ValueError('CUDA validation needs float64 (n,3,3) triangles on the reference device.')
+    def _triangle_validation_labels(self, triangles, patch_ids):
+        if triangles.ndim != 3 or triangles.shape[1:] != (3, 3):
+            raise ValueError(
+                f"CUDA validation needs (n,3,3) triangles, got shape={tuple(triangles.shape)}."
+            )
+        if triangles.dtype != torch.float64:
+            raise ValueError(
+                f"CUDA validation needs float64 triangles, got dtype={triangles.dtype}."
+            )
+        if triangles.device != self.gpu_vertices.device:
+            raise ValueError(
+                f"CUDA validation device mismatch: triangles={triangles.device}, "
+                f"reference={self.gpu_vertices.device}."
+            )
         labels = self._labels(patch_ids,len(triangles))
         if not bool(torch.isfinite(triangles).all()):
             raise ValueError('Patch projection points must be finite.')
+        return labels
+
+    def valid_triangles_with_ties(self, triangles, patch_ids, maximum_deviation,
+                                  maximum_normal_deviation_degrees):
+        """Return exact validity and normal-tie flags without distance metrics.
+
+        Both results stay on the query CUDA device. Call ``valid_triangles``
+        with ``return_details=True`` when exact distance/angle metrics are
+        required, such as reporting the reason for a validation failure.
+        """
+        labels = self._triangle_validation_labels(triangles, patch_ids)
         count = len(triangles)
-        mask, distance_mask, normal_mask, ties = [torch.empty(count,device=self.device,dtype=torch.bool) for _ in range(4)]
+        mask = torch.empty(count, device=self.device, dtype=torch.bool)
+        ties = torch.empty_like(mask)
+        if count:
+            cosine, limit = self._validation_limits(maximum_deviation, maximum_normal_deviation_degrees)
+            with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(triangles.device))):
+                wp.launch(_validate_with_ties, dim=count, inputs=[
+                    wp.from_torch(triangles.reshape(-1, 3).contiguous(), dtype=wp.vec3d),
+                    wp.from_torch(labels), *self._reference_args, *self._normal_args,
+                    limit, cosine, self.normal_tie_tolerance,
+                    maximum_deviation is not None, maximum_normal_deviation_degrees is not None,
+                    wp.from_torch(mask), wp.from_torch(ties)])
+        return mask, ties
+
+    def valid_triangles(self, triangles, patch_ids, maximum_deviation,
+                        maximum_normal_deviation_degrees, return_details=False):
+        labels = self._triangle_validation_labels(triangles, patch_ids)
+        count = len(triangles)
+        mask = torch.empty(count, device=self.device, dtype=torch.bool)
+        cosine, limit = self._validation_limits(maximum_deviation, maximum_normal_deviation_degrees)
+        if not return_details:
+            if count:
+                with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(triangles.device))):
+                    wp.launch(_validate_mask, dim=count, inputs=[
+                        wp.from_torch(triangles.reshape(-1, 3).contiguous(), dtype=wp.vec3d),
+                        wp.from_torch(labels), *self._reference_args, *self._normal_args,
+                        limit, cosine, self.normal_tie_tolerance,
+                        maximum_deviation is not None, maximum_normal_deviation_degrees is not None,
+                        wp.from_torch(mask)])
+            return mask
+        distance_mask, normal_mask, ties = [torch.empty(count,device=self.device,dtype=torch.bool) for _ in range(3)]
         squared, alignment, area = [torch.empty(count,device=self.device,dtype=torch.float64) for _ in range(3)]
         ids = torch.empty(count,device=self.device,dtype=torch.long)
-        cosine = -1. if maximum_normal_deviation_degrees is None else float(np.cos(np.deg2rad(maximum_normal_deviation_degrees))-1e-12)
-        limit = 0. if maximum_deviation is None else (float(maximum_deviation)+self.numeric_tolerance)**2
         if count:
             with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(triangles.device))):
                 wp.launch(_validate,dim=count,inputs=[wp.from_torch(triangles.reshape(-1,3).contiguous(),dtype=wp.vec3d),
-                    wp.from_torch(labels),*self._reference_args,wp.from_torch(self.gpu_normals,dtype=wp.vec3d),
-                    wp.from_torch(self.thin),limit,cosine,self.normal_tie_tolerance,
+                    wp.from_torch(labels),*self._reference_args,*self._normal_args,limit,cosine,self.normal_tie_tolerance,
                     maximum_deviation is not None,maximum_normal_deviation_degrees is not None,
                     wp.from_torch(mask),wp.from_torch(distance_mask),wp.from_torch(normal_mask),
                     wp.from_torch(squared),wp.from_torch(alignment),wp.from_torch(area),wp.from_torch(ids),wp.from_torch(ties)])

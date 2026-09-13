@@ -402,6 +402,29 @@ class RemeshWriterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.write_remesh_result(self.directory / 'source', self.result, self.source)
 
+    def test_main_ply_only_is_identical_and_does_not_serialize_diagnostics(self):
+        full = self.write_remesh_result(self.directory / 'full', self.result, self.source)
+        # Optional report content must not be consumed by the geometry path.
+        self.result.stats['unused_report_object'] = object()
+        main = self.write_remesh_result(self.directory / 'main', self.result, self.source,
+                                        full_output=False)
+        self.assertEqual(set(main), {'remesh_result_ply'})
+        self.assertEqual([p.name for p in (self.directory / 'main').iterdir()], ['remesh_result.ply'])
+        self.assertEqual(main['remesh_result_ply'].read_bytes(), full['remesh_result_ply'].read_bytes())
+
+    def test_main_ply_only_keeps_corner_and_lineage_guards(self):
+        self.result.vertices[self.source.corner_vertex_ids[0], 2] += 0.1
+        with self.assertRaises(ValueError):
+            self.write_remesh_result(self.directory / 'bad_corner', self.result, self.source,
+                                      full_output=False)
+        self.result.vertices[:] = self.source.vertices
+        self.result.source_constraint_edge_ids[-1] = len(self.source.constraint_edges)
+        with self.assertRaises(ValueError):
+            self.write_remesh_result(self.directory / 'bad_lineage', self.result, self.source,
+                                      full_output=False)
+        self.assertFalse((self.directory / 'bad_corner').exists())
+        self.assertFalse((self.directory / 'bad_lineage').exists())
+
     def test_writer_rejects_nonfinite_quality_report_before_creating_output(self):
         self.result.stats['invalid'] = float('nan')
         with self.assertRaises(ValueError):

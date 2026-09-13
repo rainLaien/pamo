@@ -855,7 +855,7 @@ std::size_t SplitLongEdges(std::vector<Point3> &vertices,
   (void)patches;
   if(!onlyConstraints)
     return SplitLocalLongEdges(vertices,faces,labels,constraints,config,rebuiltPatches,error);
-  struct CylinderBoundaryMetric {Vec3 Origin{},Axis{};double Radius=0,Circumferential=0;};
+  struct CylinderBoundaryMetric {Vec3 Origin{},Axis{};double Radius=0,Circumferential=0,SlantScale=1;};
   std::vector<CylinderBoundaryMetric> cylinderMetrics(patches.size());
   const char *planesSetting=std::getenv("CADMESH_REMESH_SIMPLE_PLANES_ONLY");
   const bool planesOnly=planesSetting && std::string(planesSetting)=="1";
@@ -875,12 +875,41 @@ std::size_t SplitLongEdges(std::vector<Point3> &vertices,
           std::sin(config.MaximumNormalDeviationDegrees*std::acos(-1.0)/360));
     cylinderMetrics[id]={ToVec(p->Axis.Origin),Normalize(ToVec(p->Axis.Direction)),p->Radius,circumferential};
   }
+  // Cone charts and shared boundaries must use the same angular/slant metric.
+  for(std::size_t id=0;id<patches.size();++id){
+    if(!config.SelectedSourcePatches.empty() && !config.SelectedSourcePatches[id])continue;
+    const auto &patch=patches[id];const auto *p=std::get_if<ConeParameters>(&patch.Parameters);
+    if(patch.SurfaceType!=PatchSurfaceType::Cone || !p || !(p->SemiAngle>0 && p->SemiAngle<std::acos(-1.0)/2))continue;
+    const Vec3 axis=Normalize(ToVec(p->Axis.Direction)),origin=ToVec(p->Axis.Origin);
+    double radius=0;
+    for(int f:patch.TriangleIds)for(int v:faces[f]){
+      const auto d=Sub(ToVec(vertices[v]),origin);radius=std::max(radius,Norm(Sub(d,Mul(axis,Dot(d,axis)))));
+    }
+    double spacing=config.TargetEdgeLength;
+    if(config.MaximumNormalDeviationDegrees>0 && config.MaximumNormalDeviationDegrees<180)
+      spacing=std::min(spacing,1.8*radius*std::sin(config.MaximumNormalDeviationDegrees*std::acos(-1.0)/360));
+    cylinderMetrics[id]={origin,axis,radius,spacing,1/std::cos(p->SemiAngle)};
+  }
   std::size_t total = 0;
   for (int pass = 0; pass < config.SplitPasses; ++pass) {
     auto edges = BuildEdges(faces, &labels, &rebuiltPatches);
     if (onlyConstraints) {
       edges.erase(std::remove_if(edges.begin(), edges.end(), [&](const EdgeRecord &edge) {
-        return !constraints.count(Key(edge.A, edge.B));
+        if(!constraints.count(Key(edge.A, edge.B)))return true;
+        if(config.DeferRuledBoundarySampling){
+          for(int i=0;i<edge.FaceCount && i<2;++i){const int id=labels[edge.Faces[i]];
+            if(id>=0 && std::size_t(id)<patches.size() &&
+               (patches[id].SurfaceType==PatchSurfaceType::Cylinder || patches[id].SurfaceType==PatchSurfaceType::Cone))return true;
+          }
+        }
+        if(!config.SelectedSourcePatches.empty()){
+          for(int i=0;i<edge.FaceCount && i<2;++i){
+            const int id=labels[edge.Faces[i]];
+            if(id>=0 && std::size_t(id)<config.SelectedSourcePatches.size() && config.SelectedSourcePatches[id])return false;
+          }
+          return true;
+        }
+        return false;
       }), edges.end());
     }
     if (edges.empty()) break;
@@ -920,7 +949,7 @@ std::size_t SplitLongEdges(std::vector<Point3> &vertices,
         const Vec3 ra=Sub(a,Mul(metric.Axis,za)),rb=Sub(b,Mul(metric.Axis,zb));
         if(!(Norm(ra)>0)||!(Norm(rb)>0))continue;
         const double arc=metric.Radius*std::atan2(Norm(Cross(ra,rb)),Dot(ra,rb));
-        const double scaledHeight=(zb-za)*metric.Circumferential/config.TargetEdgeLength;
+        const double scaledHeight=(zb-za)*metric.SlantScale*metric.Circumferential/config.TargetEdgeLength;
         if(std::hypot(arc,scaledHeight)>metric.Circumferential*(1+1e-6)){
           selected[i]=1;++metricSplits;break;
         }
@@ -1553,8 +1582,25 @@ bool NativeRemesher::genericRemesh(const TriangleSoup &soup,const NativeRemeshCo
 }
 
 bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
-                            const NativeRemeshConfig &config,
+                            const NativeRemeshConfig &requestedConfig,
                             NativeRemeshResult &result, std::string &error) {
+  auto config=requestedConfig;
+  if(config.ConePatchLimit>0){
+    const auto &patches=segmenter.getPatches();
+    std::vector<int> candidates;
+    for(std::size_t id=0;id<patches.size();++id)
+      if(patches[id].SurfaceType==PatchSurfaceType::Cone && !patches[id].TriangleIds.empty())candidates.push_back(int(id));
+    std::sort(candidates.begin(),candidates.end(),[&](int a,int b){
+      const auto na=patches[a].TriangleIds.size(),nb=patches[b].TriangleIds.size();
+      return na!=nb?na>nb:a<b;
+    });
+    if(candidates.size()>std::size_t(config.ConePatchLimit))candidates.resize(config.ConePatchLimit);
+    config.SelectedSourcePatches.assign(patches.size(),0);
+    std::clog << "[CadMesh] cone preview: selected=" << candidates.size() << ", limit=" << config.ConePatchLimit << std::endl;
+    for(int id:candidates){config.SelectedSourcePatches[id]=1;
+      std::clog << "[CadMesh] cone preview source_patch_id=" << id << ", source_faces=" << patches[id].TriangleIds.size() << std::endl;}
+    if(candidates.empty()){error="cone preview found no cone patches";return false;}
+  }
   if (!(config.TargetEdgeLength > 0) || !(config.MaximumDeviation >= 0) ||
       !(config.MaximumNormalDeviationDegrees >= 0 && config.MaximumNormalDeviationDegrees <= 180) ||
       !(config.TargetMeanTriangleQuality >= 0 && config.TargetMeanTriangleQuality <= 1)) {
@@ -1623,6 +1669,31 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
   if(!RemeshGlobalPatches(result,segmenter,config,constraints,simplePlanesOnly,cylindersOnly,
                          conesOnly,otherFeaturesOnly,error))return false;
   analyticSeconds=std::chrono::duration<double>(Clock::now()-phaseStart).count();
+  if(config.DeferRuledBoundarySampling){
+    auto seamConfig=config;seamConfig.DeferRuledBoundarySampling=false;seamConfig.Verbose=false;
+    seamConfig.SelectedSourcePatches.assign(result.OutputPatches.size(),0);
+    std::vector<unsigned char> status(result.OutputPatches.size(),0);
+    for(std::size_t f=0;f<result.Triangles.size();++f)status[result.PatchIds[f]]=result.FaceRemeshed[f];
+    bool any=false;
+    for(std::size_t id=0;id<result.OutputPatches.size();++id){const auto type=result.OutputPatches[id].SurfaceType;
+      if(result.RequestedPatches[id] && (type==PatchSurfaceType::Cylinder || type==PatchSurfaceType::Cone))
+        any=seamConfig.SelectedSourcePatches[id]=1;
+    }
+    if(any){const auto seamStart=Clock::now();
+      const auto added=SplitLongEdges(result.Vertices,result.Triangles,result.PatchIds,constraints,
+          result.OutputPatches,seamConfig,cuda,stats.UsedCuda,rebuiltPatches,true,error);
+      if(!error.empty())return false;stats.Splits+=added;
+      result.FaceRemeshed.clear();result.FaceReasons.clear();
+      for(auto &patch:result.OutputPatches)patch.TriangleIds.clear();
+      for(std::size_t f=0;f<result.Triangles.size();++f){const int id=result.PatchIds[f];
+        result.OutputPatches[id].TriangleIds.push_back(int(f));
+        result.FaceRemeshed.push_back(status[id]);result.FaceReasons.push_back(result.PatchReasons[id]);
+      }
+      if(config.Verbose)std::clog << "[CadMesh] deferred ruled seams: shared_splits=" << added
+          << ", seconds=" << std::chrono::duration<double>(Clock::now()-seamStart).count()
+          << "; both incident sides updated" << std::endl;
+    }
+  }
   const auto compactStart=Clock::now();Compact(result,constraints);
   stats.OutputVertices=result.Vertices.size();stats.OutputTriangles=result.Triangles.size();
   if(config.Verbose)std::clog << "[CadMesh] global patch remesh complete: boundary_sampling_s=" << boundarySplitSeconds
@@ -1631,6 +1702,20 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
       << ", output_patches=" << result.OutputPatches.size()
       << ", accepted=" << stats.AnalyticPatchesRebuilt << '/' << stats.AnalyticPatchesAttempted
       << "; global postprocessing and rollback skipped" << std::endl;
+  if(config.ComputeWallThickness){
+    if(config.Verbose)std::clog << "[CadMesh] wall thickness: sampling final mesh, workers="
+                              << config.ThicknessOptions.Workers << std::endl;
+    std::vector<std::array<double,3>> thicknessPositions;
+    thicknessPositions.reserve(result.Vertices.size());
+    for(const auto& p:result.Vertices)thicknessPositions.push_back({p[0],p[1],p[2]});
+    if(!WallThicknessCalculator::compute(thicknessPositions,result.Triangles,config.ThicknessOptions,result.Thickness,error))return false;
+    if(config.Verbose){const auto& t=result.Thickness;
+      std::clog << "[CadMesh] wall thickness: valid=" << t.ValidFaces << '/' << result.Triangles.size()
+        << ", valid_area_fraction=" << t.ValidAreaFraction << ", min=" << t.Minimum << ", max=" << t.Maximum
+        << ", area_weighted_mean=" << t.AreaWeightedAverage
+        << ", preparation_s=" << t.PreparationSeconds << ", sampling_s=" << t.SamplingSeconds << std::endl;
+    }
+  }
   return true;
 }
 
@@ -1639,6 +1724,11 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
                               const std::filesystem::path &path,
                               std::string &error) {
   const auto &patches=result.OutputPatches.empty()?inputPatches:result.OutputPatches;
+  const bool hasThickness=!result.Thickness.Values.empty();
+  if(hasThickness && (result.Thickness.Values.size()!=result.Triangles.size() ||
+                      result.Thickness.Status.size()!=result.Triangles.size())){
+    error="wall thickness face count does not match output mesh";return false;
+  }
   std::error_code filesystemError;
   if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), filesystemError);
   if (filesystemError) { error = filesystemError.message(); return false; }
@@ -1649,14 +1739,17 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
          "\ncomment remesh_reason 9=preserved_good_input; post_remesh_collision_rollback_disabled"
          "\ncomment remesh_reason 0=rebuilt 1=unselected 2=unsupported 3=nonanalytic 4=deviation 5=parameterization_or_construction 6=topology 7=collision 8=collision_guard_restore 255=unknown"
          "\ncomment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform"
-         "\ncomment feature_role_ids 0=Ordinary 1=Fillet\nelement vertex "
+         "\ncomment feature_role_ids 0=Ordinary 1=Fillet 2=FilletCandidate\nelement vertex "
       << result.Vertices.size()
       << "\nproperty double x\nproperty double y\nproperty double z\nelement face "
       << result.Triangles.size()
       << "\nproperty list uchar int vertex_indices\nproperty int patch_id"
          "\nproperty int source_patch_id\nproperty int primitive_type\nproperty uchar red\nproperty uchar green"
-         "\nproperty uchar blue\nproperty int feature_role\nproperty uchar remeshed\nproperty uchar remesh_reason\nend_header\n"
-      << std::setprecision(17);
+         "\nproperty uchar blue\nproperty int feature_role\nproperty uchar remeshed\nproperty uchar remesh_reason\n";
+  if(hasThickness)out << "comment wall_thickness is rolling_ball_diameter_in_model_units; invalid=nan\n"
+    "comment thickness_status valid=0_measured_or_9_feature_sample; see WALL_THICKNESS.md\n"
+    "property float wall_thickness\nproperty uchar thickness_valid\nproperty uchar thickness_status\n";
+  out << "end_header\n" << std::setprecision(17);
   for (const auto &vertex : result.Vertices)
     out << vertex.X() << ' ' << vertex.Y() << ' ' << vertex.Z() << '\n';
   for (std::size_t i = 0; i < result.Triangles.size(); ++i) {
@@ -1668,7 +1761,7 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
         << (patchId>=0 && std::size_t(patchId)<result.SourcePatchIds.size()?result.SourcePatchIds[patchId]:patchId) << ' '
         << SurfaceTypeId(patch ? patch->SurfaceType : PatchSurfaceType::Unknown) << ' '
         << color[0] << ' ' << color[1] << ' ' << color[2] << ' '
-        << (patch && patch->FeatureRole == PatchFeatureRole::Fillet ? 1 : 0) << ' '
+        << (patch ? static_cast<int>(patch->FeatureRole) : 0) << ' '
         << (i<result.FaceRemeshed.size() ? int(result.FaceRemeshed[i]) :
             (patchId >= 0 && std::size_t(patchId) < result.RemeshedPatches.size()
                 && result.RemeshedPatches[patchId] ? 2 :
@@ -1676,7 +1769,15 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
                 && result.RequestedPatches[patchId] ? 1 : 0))) << ' '
         << (i<result.FaceReasons.size() ? int(result.FaceReasons[i]) :
             (patchId>=0 && std::size_t(patchId)<result.PatchReasons.size()
-                ? int(result.PatchReasons[patchId]) : int(PatchRemeshReason::Unknown))) << '\n';
+                ? int(result.PatchReasons[patchId]) : int(PatchRemeshReason::Unknown)));
+    if(hasThickness){
+      const auto status=result.Thickness.Status[i];
+      const bool valid=status==ThicknessStatus::Measured || status==ThicknessStatus::FeatureSample;
+      out << ' ';
+      if(valid)out << result.Thickness.Values[i];else out << "nan";
+      out << ' ' << int(valid) << ' ' << int(status);
+    }
+    out << '\n';
   }
   out.flush();
   if (!out) { error = "writing output PLY failed"; return false; }

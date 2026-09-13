@@ -38,7 +38,7 @@ enum class PatchSurfaceType {
   Freeform
 };
 enum class BoundaryConfidence { Weak, Probable, Certain };
-enum class PatchFeatureRole { Ordinary, Fillet };
+enum class PatchFeatureRole { Ordinary, Fillet, FilletCandidate };
 enum class AnalyticSeedBackend { Auto, Cpu, Cuda };
 
 struct MeshResolutionInfo {
@@ -148,6 +148,10 @@ struct RemeshConstraint {
 };
 struct SegmentationConfig {
   bool EnableModelFirst = true;
+  bool ModelCylindersOnly = false;
+  bool ModelConesOnly = false;
+  // Classification distance in input units (0.02 mm for millimeter input).
+  double ModelRuledGrowthDistance = 0.02;
   AnalyticSeedBackend ModelAnalyticSeedBackend = AnalyticSeedBackend::Auto;
   double ModelFitToleranceRatio = 3.0;
   double ModelNormalTolerance = 0.14;

@@ -1,4 +1,8 @@
 param(
+    [switch]$WallThickness,
+    [ValidateRange(1, 128)][int]$ThicknessWorkers = 20,
+    [ValidateRange(0.0, 1000000000.0)][double]$ThicknessMinimum = 0.01,
+    [ValidateRange(0.0, 180.0)][double]$ThicknessContactAngleDegrees = 0.0,
     [string]$InputStl = '',
     [string]$OutputDirectory = '',
     [ValidateRange(0.000001, 1000000000.0)][double]$TargetEdgeLength = 6.0,
@@ -13,7 +17,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($InputStl)) {
-    $InputStl = Join-Path $projectRoot 'examples/111.stl'
+    $InputStl = Join-Path $projectRoot 'examples/2.stl'
 }
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
@@ -52,6 +56,11 @@ if ($Cpu) {
     $nativeArguments += '--cpu'
 } else {
     $nativeArguments += @('--analytic-seed-backend', 'cuda', '--require-remesh-cuda')
+}
+if ($WallThickness) {
+    $nativeArguments += @('--wall-thickness', '--thickness-workers', "$ThicknessWorkers",
+        '--thickness-minimum', $ThicknessMinimum.ToString('R', $culture),
+        '--thickness-contact-angle-deg', $ThicknessContactAngleDegrees.ToString('R', $culture))
 }
 Write-Host "[remesh] Input: $InputStl"
 Write-Host "[remesh] Output directory: $OutputDirectory"

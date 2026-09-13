@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CadMesh/CadMeshPatchSegmenter.h"
+#include "CadMesh/WallThicknessCalculator.h"
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -8,6 +9,10 @@
 namespace CadMesh {
 
 struct NativeRemeshConfig {
+  // Zero keeps normal selection. Positive values select the largest N source cones.
+  int ConePatchLimit = 0;
+  bool DeferRuledBoundarySampling = true;
+  std::vector<unsigned char> SelectedSourcePatches; // resolved before boundary sampling
   double TargetEdgeLength = 0;
   double MaximumDeviation = 0;
   double MaximumNormalDeviationDegrees = 10;
@@ -18,6 +23,8 @@ struct NativeRemeshConfig {
   int RelaxIterations = 3;
   bool RequireCuda = false;
   bool DisableCuda = false;
+  bool ComputeWallThickness = false;
+  WallThicknessOptions ThicknessOptions;
   bool Verbose = true;
   // Secondary Freeform partition only. Zero distance selects 0.0003 * target
   // length, capped by MaximumDeviation; remesh acceptance is unchanged.
@@ -85,6 +92,7 @@ struct NativeRemeshResult {
   // Copies of pre-rollback geometry; IDs refer to that collision attempt.
   std::vector<RemeshCollisionWitness> CollisionWitnesses;
   NativeRemeshStatistics Statistics;
+  WallThicknessResult Thickness;
 };
 
 class NativeRemesher {

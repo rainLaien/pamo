@@ -784,6 +784,7 @@ class PaMO(nn.Module):
         curvature_tolerance=None,
         adaptive_minimum_edge_length=None,
         adaptive_maximum_edge_length=None,
+        trace_surface_validation=False,
     ):
         """
         Remesh from points sampled directly on the original triangle surface.
@@ -828,6 +829,7 @@ class PaMO(nn.Module):
             curvature_tolerance=curvature_tolerance,
             adaptive_minimum_edge_length=adaptive_minimum_edge_length,
             adaptive_maximum_edge_length=adaptive_maximum_edge_length,
+            trace_surface_validation=trace_surface_validation,
         )
         return verts, faces
 

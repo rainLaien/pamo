@@ -11,6 +11,9 @@ import types
 import numpy as np
 
 
+DEFAULT_BATCH_FACE_LIMIT = 75000
+
+
 @dataclass
 class RemeshResult:
     vertices: np.ndarray
@@ -43,9 +46,12 @@ def _pamo_module(name):
 
 def _topology(faces, labels):
     directed = faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2)
-    edges, inverse, counts = np.unique(
-        np.sort(directed, axis=1), axis=0, return_inverse=True, return_counts=True
-    )
+    radix = np.int64(faces.max(initial=0)) + 1
+    sorted_edges = np.sort(directed, axis=1)
+    keys, inverse, counts = np.unique(
+        sorted_edges[:, 0] * radix + sorted_edges[:, 1],
+        return_inverse=True, return_counts=True)
+    edges = np.column_stack((keys // radix, keys % radix))
     minimum = np.full(len(edges), np.iinfo(np.int64).max, dtype=np.int64)
     maximum = np.full(len(edges), -1, dtype=np.int64)
     face_labels = np.repeat(labels, 3)
@@ -66,7 +72,7 @@ def _edge_positions(edges, queries, vertex_count):
 
 
 def _validate_output(vertices, faces, labels, reference_vertices, reference_faces,
-                     reference_labels, constraints, corners, target):
+                     reference_labels, constraints, corners, target, *, return_edges=False):
     if (vertices.ndim != 2 or vertices.shape[1] != 3 or not np.isfinite(vertices).all()
             or faces.ndim != 2 or faces.shape[1] != 3 or not len(faces)
             or faces.min() < 0 or faces.max() >= len(vertices)):
@@ -105,7 +111,7 @@ def _validate_output(vertices, faces, labels, reference_vertices, reference_face
             f"Maximum edge {longest:.9g} exceeds target {target:.9g}; "
             "increase split passes or choose a larger target edge length."
         )
-    return {
+    result = {
         "passed": True, "all_input_patch_ids_preserved": True,
         "fixed_boundary_coordinates_exact": True, "corner_coordinates_exact": True,
         "shared_boundary_incidence_preserved": True, "duplicate_faces": 0,
@@ -114,6 +120,7 @@ def _validate_output(vertices, faces, labels, reference_vertices, reference_face
         "output_open_edges": int(np.count_nonzero(after[1] == 1)),
         "output_nonmanifold_edges": int(np.count_nonzero(after[1] > 2)),
     }
+    return (result, after[0]) if return_edges else result
 
 
 def _sampled_reference_deviation(vertices, faces, reference_vertices, reference_faces):
@@ -142,8 +149,11 @@ def _schedule_batches(faces, labels, maximum_faces):
     graph = None
     if max(map(len, groups)) > maximum_faces:
         from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import breadth_first_order, connected_components
         directed = faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2)
-        _, inverse, counts = np.unique(np.sort(directed, axis=1), axis=0,
+        sorted_edges = np.sort(directed, axis=1)
+        radix = np.int64(faces.max(initial=0)) + 1
+        _, inverse, counts = np.unique(sorted_edges[:, 0] * radix + sorted_edges[:, 1],
                                        return_inverse=True, return_counts=True)
         edge_order = np.argsort(inverse, kind="stable")
         starts = np.r_[0, np.cumsum(counts[:-1])][counts == 2]
@@ -154,7 +164,6 @@ def _schedule_batches(faces, labels, maximum_faces):
         rows, cols = np.r_[left, right], np.r_[right, left]
         graph = coo_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)),
                            shape=(len(faces), len(faces))).tocsr()
-    visited = np.zeros(len(faces), dtype=bool)
     batch_ids = np.full(len(faces), -1, dtype=np.int64)
     batch = 0
     pending = []
@@ -172,18 +181,24 @@ def _schedule_batches(faces, labels, maximum_faces):
             batch_ids[np.concatenate(pending)] = batch
             batch += 1
             pending, pending_size = [], 0
-        traversal = []
-        for seed in group:
-            if visited[seed]:
-                continue
-            queue = [int(seed)]
-            visited[seed] = True
-            for face in queue:
-                traversal.append(face)
-                for neighbor in graph.indices[graph.indptr[face]:graph.indptr[face + 1]]:
-                    if not visited[neighbor]:
-                        visited[neighbor] = True
-                        queue.append(int(neighbor))
+        # Traverse compact components in SciPy, rather than visiting every
+        # face and adjacency through Python. Local indexing keeps disconnected
+        # patches from repeatedly initializing model-sized traversal arrays.
+        patch_graph = graph[group][:, group]
+        component_count, components = connected_components(patch_graph, directed=False)
+        if component_count == 1:
+            traversal = group[breadth_first_order(patch_graph, 0, directed=False,
+                                                 return_predecessors=False)]
+        else:
+            component_order = np.argsort(components, kind="stable")
+            component_offsets = np.r_[0, np.cumsum(np.bincount(components))]
+            traversal_parts = []
+            for first, last in zip(component_offsets[:-1], component_offsets[1:]):
+                local = component_order[first:last]
+                walk = breadth_first_order(patch_graph[local][:, local], 0, directed=False,
+                                           return_predecessors=False)
+                traversal_parts.append(group[local[walk]])
+            traversal = np.concatenate(traversal_parts)
         for start in range(0, len(traversal), maximum_faces):
             batch_ids[traversal[start:start + maximum_faces]] = batch
             batch += 1
@@ -197,8 +212,11 @@ def _schedule_batches(faces, labels, maximum_faces):
 def _run_cuda_batches(surface, torch, trimesh, vertices, faces, labels,
                       batch_ids, constraints, corners, target, sample_count,
                       seed, split_passes, collapse_passes, flip_passes,
-                      relax_iterations, deviation, whole_patch_optimization=False,
-                      whole_patch_reference=None, projection_backend="cuda"):
+                      relax_iterations, deviation, maximum_normal_deviation_degrees=10.0,
+                      whole_patch_optimization=False,
+                      whole_patch_reference=None, projection_backend="cuda",
+                      analytic_patch_models=None, trace_surface_validation=False,
+                      collect_diagnostics=True):
     if whole_patch_optimization and isinstance(whole_patch_reference, tuple):
         whole_patch_reference = surface._make_reference_projector(*whole_patch_reference, backend=projection_backend)
     order = np.argsort(batch_ids, kind="stable")
@@ -226,10 +244,23 @@ def _run_cuda_batches(surface, torch, trimesh, vertices, faces, labels,
         local_map[used] = np.arange(len(used))
         local_vertices = vertices[used]
         local_faces = local_map[faces[group]]
-        group_edges = np.unique(np.sort(faces[group][:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1), axis=0)
-        keys = group_edges[:, 0] * len(vertices) + group_edges[:, 1]
+        group_edges = np.sort(faces[group][:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1)
+        keys = np.unique(group_edges[:, 0] * len(vertices) + group_edges[:, 1])
         constraint_indices = np.flatnonzero(np.isin(constraint_keys, keys))
         local_constraints = local_map[constraints[constraint_indices]]
+        if len(local_constraints):
+            fixed_lengths = np.linalg.norm(
+                local_vertices[local_constraints[:, 1]] - local_vertices[local_constraints[:, 0]],
+                axis=1,
+            )
+            fixed_long = fixed_lengths > target * (1.0 + 1e-6)
+            if np.any(fixed_long):
+                raise RuntimeError(
+                    f"CUDA batch {number + 1} has {np.count_nonzero(fixed_long)} fixed interface "
+                    f"edges over target {target:.9g} (maximum {fixed_lengths.max():.9g}); "
+                    "the shared boundary subdivision must refine them before CUDA remeshing. "
+                    "Increasing --split-passes cannot split fixed interfaces."
+                )
         local_corners = local_map[np.intersect1d(shared_corners, used)]
         count = max(1, int(round(sample_count * float(areas[group].sum()) / total_area)))
         print(f"[remesh] CUDA batch {number + 1}/{len(groups)}: {len(group):,} faces, "
@@ -243,23 +274,57 @@ def _run_cuda_batches(surface, torch, trimesh, vertices, faces, labels,
             fixed_corner_vertex_ids=local_corners, flip_passes=int(flip_passes),
             relax_iterations=int(relax_iterations), split_passes=int(split_passes),
             collapse_passes=int(collapse_passes), maximum_edge_ratio=2,
+            maximum_normal_deviation_degrees=float(maximum_normal_deviation_degrees),
             minimum_edge_ratio=.5, maximum_surface_deviation_ratio=deviation / (target / 2),
             whole_patch_optimization=whole_patch_optimization,
             whole_patch_reference=whole_patch_reference,
             projection_backend=projection_backend,
+            analytic_patch_models=analytic_patch_models,
+            trace_surface_validation=trace_surface_validation,
+            collect_diagnostics=collect_diagnostics,
         )
         output_labels = np.asarray(stats.pop("face_patch_ids"), dtype=np.int64)
         stats.pop("source_face_ids", None)
-        output_edges = np.unique(
-            np.sort(output_f[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1), axis=0,
-        )
-        maximum_length = float(np.linalg.norm(
-            output_v[output_edges[:, 1]] - output_v[output_edges[:, 0]], axis=1,
-        ).max(initial=0))
+        # A maximum over all directed face edges equals the unique-edge
+        # maximum; sorting hundreds of thousands of rows adds no information.
+        triangles = output_v[output_f]
+        maximum_length = float(np.sqrt(np.max(np.sum(
+            (triangles[:, (1, 2, 0)] - triangles) ** 2, axis=2), initial=0)))
+        del triangles
         if maximum_length > target * (1.0 + 1e-6):
+            split_details = stats.get("split_diagnostics", {})
+            reason = split_details.get("stop_reason", "unknown")
+            if reason == "pass_limit":
+                guidance = "The split pass budget was exhausted; increase --split-passes."
+                if any(split_details.get(key, 0) for key in (
+                    "rejected_long_edges", "protected_long_edges", "nonmanifold_long_edges",
+                )):
+                    guidance += (
+                        " Blocked edges also remain; additional passes may process eligible edges "
+                        "but do not resolve all geometric or topology constraints."
+                    )
+            elif reason == "geometric_rejections":
+                guidance = (
+                    "Remaining split candidates failed the surface or orientation constraints; "
+                    "increasing --split-passes alone cannot resolve these rejections."
+                )
+            elif reason == "protected_constraints":
+                guidance = "Fixed interfaces require shared boundary subdivision before CUDA remeshing."
+            elif reason == "nonmanifold_edges":
+                guidance = "Remaining nonmanifold edges require shared topology handling before CUDA remeshing."
+            else:
+                guidance = "Inspect the split diagnostics and the constraints on the remaining long edges."
+            counts = (
+                " Split-stage remaining: eligible={}, rejected={}, fixed={}, nonmanifold={}.".format(
+                    split_details.get("eligible_long_edges", "unknown"),
+                    split_details.get("rejected_long_edges", "unknown"),
+                    split_details.get("protected_long_edges", "unknown"),
+                    split_details.get("nonmanifold_long_edges", "unknown"),
+                ) if split_details else ""
+            )
             raise RuntimeError(
                 f"CUDA batch {number + 1} maximum edge {maximum_length:.9g} exceeds "
-                f"target {target:.9g}; increase --split-passes or choose a larger target."
+                f"target {target:.9g}; split stop reason: {reason}.{counts} {guidance}"
             )
         stats["verified_maximum_edge_length"] = maximum_length
         if not np.array_equal(output_v[local_corners], local_vertices[local_corners]):
@@ -276,27 +341,33 @@ def _run_cuda_batches(surface, torch, trimesh, vertices, faces, labels,
               f"{stats['batch_seconds']:.2f}s", flush=True)
         records.append({"batch": number, "input_faces": len(group),
                         "output_faces": len(output_f), **stats})
-        # Release cached allocations between batches on GPUs with limited VRAM.
-        torch.cuda.empty_cache()
+        # Let PyTorch reuse freed blocks in the next batch. The allocator
+        # releases its cache itself under memory pressure; empty_cache here
+        # forces repeated cudaMalloc/cudaFree and device synchronization.
     output_vertices = np.vstack([output_base, *new_vertices])
     output_faces = np.vstack(all_faces)
     output_labels = np.concatenate(all_labels)
     stats = {"batch_count": len(groups), "batches": records,
-             "final_metrics": surface.mesh_quality_metrics(output_vertices, output_faces),
              "sample_count": sum(r["sample_count"] for r in records),
              "splits": sum(r["splits"] for r in records),
              "collapses": sum(r["collapses"] for r in records),
              "flips": sum(r["flips"] for r in records),
              "remaining_long_edges": sum(r["remaining_long_edges"] for r in records),
              "external_partition": True}
+    # Whole-surface mode measures the complete mesh after adding its analytic
+    # charts; a second residual-only full-mesh measurement is discarded there.
+    if not whole_patch_optimization and collect_diagnostics:
+        stats["final_metrics"] = surface.mesh_quality_metrics(output_vertices, output_faces)
     return output_vertices, output_faces, output_labels, stats
 
 
 def remesh_partition(source, *, target_edge_length, sample_count=2000,
                      split_passes=128, collapse_passes=12, flip_passes=8,
                      relax_iterations=3, seed=0, maximum_boundary_splits=1000000,
-                     maximum_deviation=None, batch_face_limit=40000, method="surface",
-                     projection_backend="cuda"):
+                     maximum_deviation=None, maximum_normal_deviation_degrees=10.0,
+                     batch_face_limit=DEFAULT_BATCH_FACE_LIMIT, method="surface",
+                     projection_backend="cuda", trace_surface_validation=False,
+                     collect_diagnostics=True):
     """Remesh one shared mesh; preserve labels and both kinds of interfaces.
 
     The target edge length is in source units. Surface sampling/projection uses
@@ -310,8 +381,11 @@ def remesh_partition(source, *, target_edge_length, sample_count=2000,
             split_passes=split_passes, collapse_passes=collapse_passes,
             flip_passes=flip_passes, relax_iterations=relax_iterations, seed=seed,
             maximum_boundary_splits=maximum_boundary_splits,
-            maximum_deviation=maximum_deviation, batch_face_limit=batch_face_limit,
+            maximum_deviation=maximum_deviation, maximum_normal_deviation_degrees=maximum_normal_deviation_degrees,
+            batch_face_limit=batch_face_limit,
             projection_backend=projection_backend,
+            trace_surface_validation=trace_surface_validation,
+            collect_diagnostics=collect_diagnostics,
         )
     if method != "legacy":
         raise ValueError("method must be 'surface' or 'legacy'.")
@@ -371,6 +445,9 @@ def remesh_partition(source, *, target_edge_length, sample_count=2000,
         surface, torch, trimesh, vertices, faces, labels, batch_ids,
         all_constraints, source.corner_vertex_ids, target, sample_count, seed,
         split_passes, collapse_passes, flip_passes, relax_iterations, deviation,
+        maximum_normal_deviation_degrees=maximum_normal_deviation_degrees,
+        trace_surface_validation=trace_surface_validation,
+        collect_diagnostics=collect_diagnostics,
     )
     gpu_seconds = time.perf_counter() - gpu_begin
     print("[remesh] Checking shared boundaries, corners, topology and edge lengths...", flush=True)
@@ -379,13 +456,15 @@ def remesh_partition(source, *, target_edge_length, sample_count=2000,
                                   source.corner_vertex_ids, target)
     sampled_deviation = _sampled_reference_deviation(
         output_vertices, output_faces, source.vertices, source.faces
-    )
+    ) if collect_diagnostics else None
     # Compact only after all fixed global IDs have been independently verified.
-    used, inverse = np.unique(output_faces, return_inverse=True)
+    referenced = np.zeros(len(output_vertices), dtype=bool)
+    referenced[output_faces.reshape(-1)] = True
+    used = np.flatnonzero(referenced)
     mapping = np.full(len(output_vertices), -1, dtype=np.int64)
     mapping[used] = np.arange(len(used))
     output_vertices = output_vertices[used]
-    output_faces = inverse.reshape(-1, 3)
+    output_faces = mapping[output_faces]
     compact_edges = np.sort(mapping[constraints], axis=1)
     if np.any(compact_edges < 0) or np.any(mapping[source.corner_vertex_ids] < 0):
         raise RuntimeError("Remeshing removed a fixed boundary or corner vertex.")
@@ -404,12 +483,15 @@ def remesh_partition(source, *, target_edge_length, sample_count=2000,
         "computational_interfaces": int(len(all_constraints) - len(constraints)),
         "computational_interfaces_are_output_patch_boundaries": False,
         "cuda_seconds": gpu_seconds, "total_seconds": time.perf_counter() - begin,
-        "source_metrics": surface.mesh_quality_metrics(source.vertices, source.faces),
+        "source_metrics": (surface.mesh_quality_metrics(source.vertices, source.faces)
+                           if collect_diagnostics else None),
         "validation": validation, "sampled_reference_deviation": sampled_deviation,
         "options": {"sample_count": int(sample_count), "split_passes": int(split_passes),
                     "collapse_passes": int(collapse_passes), "flip_passes": int(flip_passes),
                     "relax_iterations": int(relax_iterations), "seed": int(seed),
-                    "batch_face_limit": int(batch_face_limit)},
+                    "batch_face_limit": int(batch_face_limit),
+                    "trace_surface_validation": bool(trace_surface_validation),
+                    "maximum_normal_deviation_degrees": float(maximum_normal_deviation_degrees)},
     })
     return RemeshResult(output_vertices, output_faces, output_labels,
                         compact_edges[compact_hard], compact_edges[~compact_hard],

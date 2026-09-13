@@ -179,7 +179,8 @@ void IdentifySurfaceRoles(const MeshTopology &mesh,
       incident[adj.Patch1].push_back(&adj);
     }
   for (auto &patch : patches) {
-    patch.FeatureRole = PatchFeatureRole::Ordinary;
+    const bool extractedCandidate=patch.FeatureRole==PatchFeatureRole::FilletCandidate;
+    patch.FeatureRole = extractedCandidate?PatchFeatureRole::FilletCandidate:PatchFeatureRole::Ordinary;
     patch.SupportPatchIds.clear();
     if (patch.SurfaceType != PatchSurfaceType::Cylinder &&
         patch.SurfaceType != PatchSurfaceType::Torus &&

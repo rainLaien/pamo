@@ -1,8 +1,11 @@
 """Index-preserving I/O for the CadMesh partition to PaMO remeshing handoff."""
 
 from dataclasses import dataclass
+from contextlib import ExitStack
+from itertools import islice
 import json
 from pathlib import Path
+import re
 
 import numpy as np
 
@@ -11,12 +14,24 @@ SURFACE_TYPES = {
     "Unknown": 0, "Plane": 1, "Cylinder": 2, "Cone": 3,
     "Sphere": 4, "Torus": 5, "Freeform": 6,
 }
-FEATURE_ROLES = {"Ordinary": 0, "Fillet": 1}
+FEATURE_ROLES = {"Ordinary": 0, "Fillet": 1, "FilletCandidate": 2}
 SURFACE_COLORS = np.array([
     [74, 79, 86], [74, 144, 226], [53, 183, 121], [239, 155, 56],
     [160, 108, 213], [230, 105, 158], [145, 153, 164],
 ], dtype=np.int64)
 ROLE_COLORS = np.array([[150, 161, 177], [245, 145, 45]], dtype=np.int64)
+_PLY_BLOCK_ROWS = 16384
+_PLY_INTEGER_TEXT = re.compile(r"[+\-0-9\s]*\Z", re.ASCII)
+_PLY_WIDE_INTEGER = re.compile(r"[0-9]{19}")
+
+
+def _unique_edge_rows(edges):
+    """Lexicographic edge order without NumPy's structured-row unique sort."""
+    if not len(edges):
+        return np.empty((0, 2), dtype=np.int64)
+    ordered = edges[np.lexsort((edges[:, 1], edges[:, 0]))]
+    keep = np.concatenate(([True], np.any(ordered[1:] != ordered[:-1], axis=1)))
+    return ordered[keep]
 
 
 def _edges(values, name):
@@ -45,7 +60,7 @@ class PartitionInput:
 
     @property
     def constraint_edges(self):
-        return np.unique(np.vstack((self.hard_edges, self.smooth_edges)), axis=0)
+        return _unique_edge_rows(np.vstack((self.hard_edges, self.smooth_edges)))
 
 
 def _integer(value, name):
@@ -60,7 +75,10 @@ def _ids(values, name, upper_bound=None, allow_empty=True):
     values = np.asarray([_integer(value, name) for value in values], dtype=np.int64)
     if values.ndim != 1 or (not allow_empty and not len(values)):
         raise ValueError(f"{name} must be a nonempty one-dimensional list.")
-    if len(np.unique(values)) != len(values):
+    # Exported memberships and incident IDs are normally already sorted. Avoid
+    # sorting hundreds of thousands of IDs again just to establish uniqueness.
+    if (len(values) > 1 and not np.all(values[1:] > values[:-1])
+            and len(np.unique(values)) != len(values)):
         raise ValueError(f"{name} contains duplicate IDs.")
     if np.any(values < 0) or (upper_bound is not None and np.any(values >= upper_bound)):
         raise ValueError(f"{name} contains an out-of-range ID.")
@@ -85,8 +103,105 @@ def _validate_json_numbers(value):
                 raise ValueError("Partition report contains a non-finite number.")
 
 
+def _ply_blocks(stream, count, name):
+    # Keep record boundaries so a missing/blank line cannot be silently filled
+    # using the next element's data by a bulk whitespace parser.
+    for start in range(0, count, _PLY_BLOCK_ROWS):
+        size = min(_PLY_BLOCK_ROWS, count - start)
+        lines = list(islice(stream, size))
+        if len(lines) != size:
+            raise ValueError(f"Short PLY {name} records starting at {start}.")
+        yield start, lines
+
+
+def _read_vertex_block(lines, properties, columns, start):
+    if len(properties) == 3:
+        try:
+            values = np.loadtxt(lines, dtype=np.float64, comments=None, ndmin=2)
+        except ValueError:
+            # Python float accepts some spellings NumPy does not. Keep the
+            # original parser for these and for files with extra properties.
+            pass
+        else:
+            if values.shape != (len(lines), 3):
+                raise ValueError(f"Invalid PLY vertex records starting at {start}.")
+            return values[:, columns]
+    values = np.empty((len(lines), 3), dtype=np.float64)
+    for local_row, line in enumerate(lines):
+        tokens = line.split()
+        if len(tokens) != len(properties):
+            raise ValueError(f"Invalid PLY vertex record {start + local_row}.")
+        values[local_row] = [float(tokens[column]) for column in columns]
+    return values
+
+
+def _read_face_block(lines, properties, index_name, start):
+    scalar_names = {"patch_id", "primitive_type", "feature_role", "red", "green", "blue"}
+    canonical = all((prop == index_name and is_list)
+                    or (prop in scalar_names and not is_list)
+                    for prop, is_list in properties)
+    text = "".join(lines) if canonical else ""
+    if (canonical and _PLY_INTEGER_TEXT.fullmatch(text) is not None
+            and _PLY_WIDE_INTEGER.search(text) is None):
+        # The lexical guard prevents loadtxt's compatibility conversion from
+        # accepting floating-point spellings for integer mesh indices.
+        try:
+            values = np.loadtxt(lines, dtype=np.int64, comments=None, ndmin=2)
+        except ValueError:
+            pass
+        else:
+            if values.shape != (len(lines), len(properties) + 3):
+                raise ValueError(f"Invalid PLY face records starting at {start}.")
+            columns, cursor = {}, 0
+            for prop, is_list in properties:
+                columns[prop] = cursor
+                cursor += 4 if is_list else 1
+            index_column = columns[index_name]
+            if np.any(values[:, index_column] != 3):
+                raise ValueError("Remeshing requires triangle faces; PLY contains a polygon.")
+            roles = (values[:, columns["feature_role"]] if "feature_role" in columns
+                     else np.zeros(len(lines), dtype=np.int64))
+            return (values[:, index_column + 1:index_column + 4],
+                    values[:, columns["patch_id"]], values[:, columns["primitive_type"]], roles)
+    # Preserve arbitrary scalar properties and additional list properties in
+    # external handoff files, including the original per-record validation.
+    faces = np.empty((len(lines), 3), dtype=np.int64)
+    labels = np.empty(len(lines), dtype=np.int64)
+    types = np.empty(len(lines), dtype=np.int64)
+    roles = np.empty(len(lines), dtype=np.int64)
+    for local_row, line in enumerate(lines):
+        row = start + local_row
+        tokens = line.split()
+        values, cursor = {}, 0
+        for prop, is_list in properties:
+            if cursor >= len(tokens):
+                raise ValueError(f"Short PLY face record {row}.")
+            if is_list:
+                size = int(tokens[cursor])
+                if size < 0 or cursor + size >= len(tokens):
+                    raise ValueError(f"Invalid PLY list in face {row}.")
+                values[prop] = tokens[cursor + 1:cursor + 1 + size]
+                cursor += size + 1
+            else:
+                values[prop] = tokens[cursor]
+                cursor += 1
+        if cursor != len(tokens):
+            raise ValueError(f"Excess PLY properties in face {row}.")
+        if len(values[index_name]) != 3:
+            raise ValueError("Remeshing requires triangle faces; PLY contains a polygon.")
+        faces[local_row] = [int(value) for value in values[index_name]]
+        labels[local_row] = int(values["patch_id"])
+        types[local_row] = int(values["primitive_type"])
+        roles[local_row] = int(values.get("feature_role", 0))
+    return faces, labels, types, roles
+
+
 def _read_ply(path):
     """Read bounded records into arrays; never weld or reorder any geometry."""
+    from .partition_ply import read_binary_partition_ply
+    binary = read_binary_partition_ply(path)
+    if binary is not None:
+        return binary
     with path.open("r", encoding="ascii") as stream:
         if stream.readline().strip() != "ply":
             raise ValueError("Expected a PLY header.")
@@ -121,6 +236,10 @@ def _read_ply(path):
         if [name for name, _, _ in elements] != ["vertex", "face"]:
             raise ValueError("Partition PLY must contain vertex then face elements.")
         vertex_count, face_count = elements[0][1], elements[1][1]
+        # Even an ASCII record needs at least one byte. Reject impossible
+        # header counts before allocating arrays from an untrusted header.
+        if vertex_count + face_count > path.stat().st_size:
+            raise ValueError("PLY element counts exceed the available payload.")
         vertices = np.empty((vertex_count, 3), dtype=np.float64)
         faces = np.empty((face_count, 3), dtype=np.int64)
         labels = np.empty(face_count, dtype=np.int64)
@@ -137,11 +256,9 @@ def _read_ply(path):
                 if not all(axis in property_names for axis in ("x", "y", "z")):
                     raise ValueError("PLY vertices need x, y, and z properties.")
                 columns = [property_names.index(axis) for axis in ("x", "y", "z")]
-                for row in range(count):
-                    tokens = stream.readline().split()
-                    if len(tokens) != len(properties):
-                        raise ValueError(f"Invalid PLY vertex record {row}.")
-                    vertices[row] = [float(tokens[column]) for column in columns]
+                for start, lines in _ply_blocks(stream, count, name):
+                    vertices[start:start + len(lines)] = _read_vertex_block(
+                        lines, properties, columns, start)
                 continue
             if not all(prop in property_names for prop in ("patch_id", "primitive_type")):
                 raise ValueError("PLY faces need patch_id and primitive_type properties.")
@@ -150,29 +267,14 @@ def _read_ply(path):
             if (index_name, True) not in properties:
                 raise ValueError("PLY faces need a vertex_indices list property.")
             has_roles = "feature_role" in property_names
-            for row in range(count):
-                tokens = stream.readline().split()
-                values, cursor = {}, 0
-                for prop, is_list in properties:
-                    if cursor >= len(tokens):
-                        raise ValueError(f"Short PLY face record {row}.")
-                    if is_list:
-                        size = int(tokens[cursor])
-                        if size < 0 or cursor + size >= len(tokens):
-                            raise ValueError(f"Invalid PLY list in face {row}.")
-                        values[prop] = tokens[cursor + 1:cursor + 1 + size]
-                        cursor += size + 1
-                    else:
-                        values[prop] = tokens[cursor]
-                        cursor += 1
-                if cursor != len(tokens):
-                    raise ValueError(f"Excess PLY properties in face {row}.")
-                if len(values[index_name]) != 3:
-                    raise ValueError("Remeshing requires triangle faces; PLY contains a polygon.")
-                faces[row] = [int(value) for value in values[index_name]]
-                labels[row] = int(values["patch_id"])
-                types[row] = int(values["primitive_type"])
-                roles[row] = int(values.get("feature_role", 0))
+            for start, lines in _ply_blocks(stream, count, name):
+                block_faces, block_labels, block_types, block_roles = _read_face_block(
+                    lines, properties, index_name, start)
+                end = start + len(lines)
+                faces[start:end] = block_faces
+                labels[start:end] = block_labels
+                types[start:end] = block_types
+                roles[start:end] = block_roles
         if any(line.strip() for line in stream):
             raise ValueError("PLY contains trailing records beyond its declared counts.")
     return vertices, faces, labels, types, roles, has_roles
@@ -209,14 +311,17 @@ def _topology(faces, labels, vertex_count):
         raise ValueError("Mesh exceeds the supported 64-bit packed edge range.")
     occurrences = np.sort(faces[:, ((0, 1), (1, 2), (2, 0))], axis=2).reshape(-1, 2)
     keys = occurrences[:, 0] * vertex_count + occurrences[:, 1]
-    unique, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
-    edge_labels = np.repeat(labels, 3)
-    minimum = np.full(len(unique), np.iinfo(np.int64).max, dtype=np.int64)
-    maximum = np.full(len(unique), -1, dtype=np.int64)
-    np.minimum.at(minimum, inverse, edge_labels)
-    np.maximum.at(maximum, inverse, edge_labels)
-    order = np.argsort(inverse, kind="stable")
-    offsets = np.concatenate(([0], np.cumsum(counts)))
+    # One stable packed-key sort supplies both incidence order and label
+    # reductions; unique(return_inverse) followed by argsort sorted twice.
+    order = np.argsort(keys, kind="stable")
+    sorted_keys = keys[order]
+    starts = np.flatnonzero(np.concatenate(([True], sorted_keys[1:] != sorted_keys[:-1])))
+    unique = sorted_keys[starts]
+    offsets = np.concatenate((starts, [len(keys)]))
+    counts = np.diff(offsets)
+    edge_labels = labels[order // 3]
+    minimum = np.minimum.reduceat(edge_labels, starts)
+    maximum = np.maximum.reduceat(edge_labels, starts)
     return {
         "keys": unique, "counts": counts, "minimum_labels": minimum,
         "maximum_labels": maximum, "order": order, "offsets": offsets,
@@ -415,7 +520,7 @@ def load_partition(path):
     if len(corners) and not np.all(np.isin(corners, edge_pairs)):
         raise ValueError("Corner vertices must belong to the constraint graph.")
     return PartitionInput(directory, vertices, faces, labels, report,
-                          np.unique(hard, axis=0), np.unique(smooth, axis=0), corners)
+                          _unique_edge_rows(hard), _unique_edge_rows(smooth), corners)
 
 
 def _json_default(value):
@@ -428,7 +533,7 @@ def _json_default(value):
     raise TypeError(f"Cannot serialize {type(value).__name__} to JSON.")
 
 
-def _write_ply(path, vertices, faces, labels, type_ids, role_ids, color_mode):
+def _ply_palette(type_ids, role_ids, color_mode):
     patch_count = len(type_ids)
     if color_mode == "surface_type":
         palette = SURFACE_COLORS[type_ids]
@@ -440,29 +545,52 @@ def _write_ply(path, vertices, faces, labels, type_ids, role_ids, color_mode):
         palette = np.column_stack((64 + (values & 127),
                                    64 + ((values >> 8) & 127),
                                    64 + ((values >> 16) & 127))).astype(np.int64)
-    with path.open("w", encoding="ascii", newline="\n") as stream:
-        stream.write(
-            f"ply\nformat ascii 1.0\ncomment color_by {color_mode}\n"
-            "comment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform\n"
-            "comment feature_role_ids 0=Ordinary 1=Fillet\n"
-            f"element vertex {len(vertices)}\nproperty double x\nproperty double y\nproperty double z\n"
-            f"element face {len(faces)}\nproperty list uchar int vertex_indices\n"
-            "property int patch_id\nproperty int primitive_type\nproperty uchar red\n"
-            "property uchar green\nproperty uchar blue\nproperty int feature_role\nend_header\n"
-        )
-        for start in range(0, len(vertices), 8192):
-            np.savetxt(stream, vertices[start:start + 8192], fmt="%.17g")
-        for start in range(0, len(faces), 8192):
-            local_labels = labels[start:start + 8192]
-            rows = np.column_stack((
-                np.full(len(local_labels), 3), faces[start:start + 8192],
-                local_labels, type_ids[local_labels], palette[local_labels],
-                role_ids[local_labels],
-            ))
-            np.savetxt(stream, rows, fmt="%d")
+    return palette
 
 
-def write_remesh_result(output_directory, result, source):
+def _write_ply_files(targets, vertices, faces, labels, type_ids, role_ids):
+    """Write ASCII views in blocks and format their shared vertices only once."""
+    with ExitStack() as stack:
+        streams = []
+        for path, color_mode in targets:
+            palette = _ply_palette(type_ids, role_ids, color_mode)
+            stream = stack.enter_context(path.open(
+                "w", encoding="ascii", newline="\n", buffering=1024 * 1024))
+            stream.write(
+                f"ply\nformat ascii 1.0\ncomment color_by {color_mode}\n"
+                "comment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform\n"
+                "comment feature_role_ids 0=Ordinary 1=Fillet 2=FilletCandidate\n"
+                f"element vertex {len(vertices)}\nproperty double x\nproperty double y\nproperty double z\n"
+                f"element face {len(faces)}\nproperty list uchar int vertex_indices\n"
+                "property int patch_id\nproperty int primitive_type\nproperty uchar red\n"
+                "property uchar green\nproperty uchar blue\nproperty int feature_role\nend_header\n"
+            )
+            streams.append((stream, palette))
+        for start in range(0, len(vertices), _PLY_BLOCK_ROWS):
+            local_vertices = vertices[start:start + _PLY_BLOCK_ROWS]
+            # NumPy's tolist and Python's complete-block format execute in C;
+            # savetxt dispatches a Python formatting/write operation per row.
+            text = ("%.17g %.17g %.17g\n" * len(local_vertices)) % tuple(local_vertices.ravel().tolist())
+            for stream, _ in streams:
+                stream.write(text)
+        for start in range(0, len(faces), _PLY_BLOCK_ROWS):
+            local_labels = labels[start:start + _PLY_BLOCK_ROWS]
+            rows = np.empty((len(local_labels), 9), dtype=np.int64)
+            rows[:, :3] = faces[start:start + _PLY_BLOCK_ROWS]
+            rows[:, 3] = local_labels
+            rows[:, 4] = type_ids[local_labels]
+            rows[:, 8] = role_ids[local_labels]
+            record_format = "3 %d %d %d %d %d %d %d %d %d\n" * len(local_labels)
+            for stream, palette in streams:
+                rows[:, 5:8] = palette[local_labels]
+                stream.write(record_format % tuple(rows.ravel().tolist()))
+
+
+def _write_ply(path, vertices, faces, labels, type_ids, role_ids, color_mode):
+    _write_ply_files([(path, color_mode)], vertices, faces, labels, type_ids, role_ids)
+
+
+def write_remesh_result(output_directory, result, source, *, full_output=True):
     """Write remeshed geometry and fresh memberships, preserving source provenance."""
     original_source = source
     prepared = getattr(result, "prepared_source", None)
@@ -478,11 +606,14 @@ def write_remesh_result(output_directory, result, source):
         raise ValueError("Remesh output must not overwrite the source partition directory.")
     paths = {
         "remesh_result_ply": directory / "remesh_result.ply",
+    }
+    if full_output:
+        paths.update({
         "surface_types_ply": directory / "surface_types.ply",
         "feature_roles_ply": directory / "feature_roles.ply",
         "remesh_result_stl": directory / "remesh_result.stl",
         "remesh_report_json": directory / "remesh_report.json",
-    }
+        })
     for path in paths.values():
         resolved = path.resolve()
         if resolved.parent != directory or resolved.parent == source_directory:
@@ -499,7 +630,7 @@ def write_remesh_result(output_directory, result, source):
     topology = _topology(faces, labels, len(vertices))
     _validate_constraint_classes(hard, smooth, topology, len(vertices))
     corners = _ids(result.corner_vertex_ids, "Output corner vertices", len(vertices))
-    constraints = np.unique(np.vstack((hard, smooth)), axis=0)
+    constraints = _unique_edge_rows(np.vstack((hard, smooth)))
     if len(corners) and not np.all(np.isin(corners, constraints)):
         raise ValueError("Output corners must belong to the constraint graph.")
     original_corners = source.vertices[source.corner_vertex_ids]
@@ -511,13 +642,21 @@ def write_remesh_result(output_directory, result, source):
     if not np.array_equal(original_corners[original_order], output_corners[output_order]):
         raise ValueError("Remesh output changed the position of an original corner.")
     lineage = np.asarray(result.source_constraint_edge_ids)
+    source_constraints = source.constraint_edges
     if (lineage.shape != (len(constraints),)
             or not np.issubdtype(lineage.dtype, np.integer)
-            or np.any(lineage < 0) or np.any(lineage >= len(source.constraint_edges))):
+            or np.any(lineage < 0) or np.any(lineage >= len(source_constraints))):
         raise ValueError("Output constraint lineage must align with the sorted constraint edges.")
-    _validate_output_lineage(vertices, constraints, hard, lineage, source)
+    _validate_output_lineage(vertices, constraints, hard, lineage, source, source_constraints)
     type_ids = np.array([SURFACE_TYPES[patch["type"]] for patch in patches])
     role_ids = np.array([FEATURE_ROLES[patch.get("feature_role", "Ordinary")] for patch in patches])
+    if not full_output:
+        # The shared validation above is required even when memberships,
+        # diagnostic statistics and alternate mesh views are not exported.
+        directory.mkdir(parents=True, exist_ok=True)
+        _write_ply_files([(paths["remesh_result_ply"], "surface_instance")],
+                         vertices, faces, labels, type_ids, role_ids)
+        return paths
     ordered_faces = np.argsort(labels, kind="stable")
     member_offsets = np.concatenate(([0], np.cumsum(np.bincount(labels, minlength=len(patches)))))
     output_patches = []
@@ -591,7 +730,7 @@ def write_remesh_result(output_directory, result, source):
         "boundary_policy": result.stats.get("boundary_policy", {
             "semantics": "legacy: every source label interface is fixed"}),
         "constraint_edges": edge_records,
-        "source_constraint_edges": source.constraint_edges,
+        "source_constraint_edges": source_constraints,
         "source_constraint_edge_indices": lineage,
         "fitting_error_semantics": "source_fit_diagnostics_are_not_output_geometry_error",
         "stl_coordinate_precision": "float32; PLY retains float64 shared indexed geometry",
@@ -605,10 +744,11 @@ def write_remesh_result(output_directory, result, source):
     encoded_report = json.dumps(report, default=_json_default, allow_nan=False,
                                 separators=(",", ":"))
     directory.mkdir(parents=True, exist_ok=True)
-    for key, color in (("remesh_result_ply", "surface_instance"),
-                       ("surface_types_ply", "surface_type"),
-                       ("feature_roles_ply", "feature_role")):
-        _write_ply(paths[key], vertices, faces, labels, type_ids, role_ids, color)
+    _write_ply_files([
+        (paths["remesh_result_ply"], "surface_instance"),
+        (paths["surface_types_ply"], "surface_type"),
+        (paths["feature_roles_ply"], "feature_role"),
+    ], vertices, faces, labels, type_ids, role_ids)
     import trimesh
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     paths["remesh_result_stl"].write_bytes(trimesh.exchange.stl.export_stl(mesh))
@@ -618,9 +758,10 @@ def write_remesh_result(output_directory, result, source):
     return paths
 
 
-def _validate_output_lineage(vertices, edges, hard_edges, lineage, source):
+def _validate_output_lineage(vertices, edges, hard_edges, lineage, source, parents=None):
     """Check every original constraint survives as one continuous child chain."""
-    parents = source.constraint_edges
+    if parents is None:
+        parents = source.constraint_edges
     if not np.array_equal(np.unique(lineage), np.arange(len(parents))):
         raise ValueError("Output lineage omits an original constraint edge.")
     if not len(parents):

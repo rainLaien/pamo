@@ -50,6 +50,35 @@ ctest --test-dir cad_mesh/build --output-on-failure
 .\cad_mesh\build\cad_mesh_segment.exe .\examples\Unnamed-Body.stl .\cad_mesh\debug\my_run
 ```
 
+直接在 C++ 程序内完成分区、保型 remesh 和最终 PLY 输出：
+
+```powershell
+.\cad_mesh\build\cad_mesh_segment.exe `
+  .\examples\3.stl .\examples\native_remesh `
+  --remesh --target-edge-length 12 `
+  --max-normal-deviation-degrees 10 `
+  --target-mean-quality 0.8 --require-remesh-cuda
+```
+
+该路径只写入 `native_remesh/remesh_result.ply`，不生成
+`patch_result.ply`、JSON 或 Python 交接文件。第二个参数也可以直接指定一个
+`.ply` 文件。未指定目标边长时使用包围盒对角线的 5%；未指定最大几何偏差时
+使用目标边长的 0.5%。折叠点和松弛点始终受同 Patch 原始参考面约束；解析
+曲面投影只有在与原 STL 的距离不超过该偏差时才接受。拆分点保持在当前边上，
+共享分区边界保持同一组顶点。每批修改通过 BVH 和空间哈希拒绝自相交候选。
+
+解析 Patch 在共享边界完成统一采样后进入独立的整块参数域重建。Plane 使用平面
+坐标，Cylinder/Cone 使用展开后的周期坐标，闭合 Sphere 使用球面细分，闭合
+Torus 使用双周期参数网格；参数缝映射回三维时焊接为同一顶点。成功重建的解析
+Patch 会被冻结，不再进入局部拓扑优化。无法形成合法参数图、拟合误差超过几何
+偏差或重建质量下降的 Patch 才进入 Freeform 使用的保型局部回退路径。
+
+Remesh CUDA 内核以源码嵌入可执行程序，并复用解析拟合已有的 CUDA Driver +
+NVRTC 运行时动态编译。构建阶段不调用 `nvcc`，因此 MinGW 构建不要求 MSVC
+`cl.exe`。默认优先使用 CUDA 批量筛选拆分边；CUDA 运行时不可用时回退到原生
+CPU，`--require-remesh-cuda` 可改为直接报错。拓扑修改由 C++ 执行，因此运行阶段
+不依赖 Python、PyTorch 或 LibTorch。
+
 默认模式的 CLI 参数：
 
 | 参数 | 默认值 | 含义 |
@@ -59,9 +88,24 @@ ctest --test-dir cad_mesh/build --output-on-failure
 | `--sharp-angle-deg` | 约 37.24 | 阻止初始跨边扩展的二面角阈值 |
 | `--seed-radius-factor` | 8 | 局部种子物理半径相对于中位边长的倍率 |
 | `--max-model-seeds` | 2500 | 局部候选种子的计算预算；耗尽后未解释区域保留为连续 Freeform |
+| `--analytic-seed-backend` | 原生 CLI 为 `auto`，脚本为 `cuda` | 非线性解析种子拟合后端；`cuda` 不可用时明确报错，`auto` 可回退 CPU |
 | `--legacy` | 关闭 | 使用旧边界分数、热扩散和闭合流程 |
 
 `--strong`、`--weak`、`--rings` 仅影响 legacy 模式。长度容差由包围盒和边长统计派生，API 配置见 `include/CadMesh/Types.h`。提高容差可能将真实细小特征归入邻面；应结合输出误差和可视化验收，而不是只追求 Patch 数更少。
+
+### CUDA analytic seeds
+
+`--analytic-seed-backend cuda` 将 Cylinder、Cone、Sphere、Torus 的非线性拟合移到 GPU：同一曲面的多个初值一起提交，每个初值由一个 128 线程块完成残差、有限差分、Hessian、阻尼求解和回溯迭代，避免每轮 CPU/GPU 往返。仍使用 double、原采样预算和迭代上限；初始小矩阵拟合、全成员误差、模型选择、区域扩展和最终认证保持 CPU 原有流程。GPU 数值求解失败的单个初值从原初值重试原 CPU 求解器。
+
+原生库通过 CUDA Driver + NVRTC 动态加载，不引入 nvcc/MSVC 构建要求，也不依赖 Warp。运行需要 NVIDIA 驱动和 NVRTC（可来自 `CUDA_PATH/bin` 或项目 PyTorch 的 `torch/lib`）。`run_segmentation.ps1 -AnalyticSeedBackend cuda` 会构建后运行；`remesh_file.py` / `remsh.ps1` 默认为 `cuda`，发现原生源码更新时会先对已有 CMake 配置增量构建 `cad_mesh_segment`，不运行测试。编译耗时与模型处理耗时需分开观察。
+
+日志增加 `analytic seed search`、`residual seed search` 等分区子阶段耗时，以及 CUDA 初始化和种子批次统计；可以确认实际调用了 GPU。`--analytic-seed-backend cpu` 保留原 CPU 非线性求解，`auto` 在运行时不可用时记录原因并回退。CUDA 使用最多 8 个候选的前瞻窗口合并独立拟合，非线性种子数达到 256 后停止继续收集。实际候选仍根据当前面归属重新生成支持面，按原顺序评估和提交；仅复用完全相同的求解输入。718,710 面模型的局部对照中，原生分区从上一轮的 43.40 秒降到 30.65–30.87 秒，五个导出文件逐字节一致，原生测试通过。
+
+CUDA 日志同时统计上传/回传字节数、样本上传缓存命中、CPU 打包与缓存耗时、上传耗时以及回读等待时间。回读等待包含内核执行和传输，不能视为纯 CPU 调度成本。设置 `CADMESH_CUDA_PROFILE=1` 并开启详细日志可额外记录 CUDA event 内核时间；默认不记录事件，计时利用已有阻塞回读完成后读取结果，不增加设备同步。
+
+`remesh_file.py` 和 `remsh.ps1` 默认直接调用原生 `--remesh`：STL 导入、分区、参数域重建和最终 PLY 导出在同一个 C++ 进程内完成，只复制 `remesh_result.ply`，不再启动 `remesh_partition.py`，也不生成或读取 PLY/JSON 交接文件。显式使用 `--full-output` 时才保留旧的 Python 诊断流程。
+
+分区缓存和 `--no-partition-cache` 只用于 `--full-output` 诊断流程。默认原生单文件流程不序列化分区，因此不需要缓存。末尾的 `[remesh-file] total wall time` 包含分区、重网格化及最终 PLY 复制。
 
 默认模型优先流程在初始种子预算之外，增加 `ModelResidualSeedBudget=1250` 的空间轮询残余搜索；随后执行最多 `ModelMaximumMergePasses=4` 轮邻接归并。归并对整个合并组重拟合并认证，共享硬边会否决合并；小 Freeform 或局部平面残片仅在面积、法向和完整拟合检查通过时吸附到解析母面。两项配置可由 C++ `SegmentationConfig` 调整。
 
@@ -147,7 +191,7 @@ Python 入口支持已有目录或其中的 `patch_result.ply`：
 ```powershell
 .\.venv\Scripts\python.exe .\cad_mesh\remesh_partition.py `
   .\cad_mesh\debug\111_model_first_final_20260907\patch_result.ply `
-  --target-edge-length 5 --sample-count 2000 --batch-face-limit 40000
+  --target-edge-length 5 --sample-count 2000 --batch-face-limit 200000
 ```
 
 运行环境沿用 PaMO 的 Python 环境；默认选择项目 `.venv/Scripts/python.exe`，依赖 NumPy、SciPy、trimesh、libigl、支持 CUDA 的 PyTorch 和 NVIDIA GPU。可用 `-PythonExecutable` 指定现有环境，不需要创建 PaMO 的 SDF/DMC 对象。
@@ -158,23 +202,39 @@ Python 入口支持已有目录或其中的 `patch_result.ply`：
 
 先将通过整个合并组几何检查的同类曲面标签归入同一求解区域，其内部标签边不再固定。真实硬边、不同曲面的平滑交界、开口和非流形边保留为几何约束；同一共享边只生成一次新采样点，内部求解固定这些点和几何角点。当前共享采样保留原折线并补足过长边，不擅自删除曲线的原始折点。输出仍使用单一全局顶点表。
 
-三维路径默认每批最多 40,000 个源三角形（边界预细分后可能略多）。小分区合批，过大曲面按连通遍历安排计算分块；投影查询仍使用该曲面的完整参考网格。分块接缝顶点暂时固定后在全局拼接，仍会限制接缝附近的优化自由度，但不会成为新的 `patch_id` 或语义硬边。已接受的解析参数图按完整曲面处理。可用 `-BatchFaceLimit` / `--batch-face-limit` 调节显存与批次成本。
+三维路径默认每批最多 75,000 个源三角形（边界预细分后可能略多）。小分区合批，过大曲面按连通遍历安排计算分块；投影查询仍使用该曲面的完整参考网格。分块接缝顶点暂时固定后在全局拼接，仍会限制接缝附近的优化自由度，但不会成为新的 `patch_id` 或语义硬边。已接受的解析参数图按完整曲面处理。可用 `-BatchFaceLimit` / `--batch-face-limit` 调节显存与批次成本；`remesh_file.py` 同样支持该参数。
 
 `TargetEdgeLength` 是输出边长上限，省略时沿用 PaMO 原曲面约束模式的默认值：模型包围盒对角线的 5%。它不是最终面数目标，细化后面数可能增加。`SampleCount` 控制表面采样预算；各批按面积分配。`--max-deviation` 在默认模式下控制对所属完整参考曲面的采样偏差，默认输入模型包围盒对角线的 0.025%，与目标边长独立（legacy 模式仍为目标边长的 0.5%）；它不等价于经过证明的全局 Hausdorff 上界。
 
+长边拆分优先使用解析曲面中点；若拟合曲面上的投影使任一侧子三角形违反约束，则依次尝试参考网格投影和原边中点。候选优先保留法向余量，必要时在用户指定的最终法向上限内重试；显式设置的候选法向限制仍然有效，方向及曲面距离检查始终保留。共享固定边仍由全局边界细分处理。报告中的 `stats.batches[].split_diagnostics` 记录拆分轮数、回退成功数及停止原因，区分轮数耗尽、几何拒绝和固定边阻塞；只有轮数耗尽才提示增加 `--split-passes`。
+
+输出相对参考网格的法向偏差上限现默认 **10°**，由 `--max-normal-deviation-degrees` 或 PowerShell 的 `-MaxNormalDeviationDegrees` 控制；Python API 对应 `maximum_normal_deviation_degrees`。需要原来的严格上限时，显式传入 `5`。该选项传递到解析曲面检查和三维 remesh，几何距离上限与边长上限独立设置。调整法向上限会重新执行 remesh，但不使原生分区缓存失效。
+
+完整曲面模式的预折叠和预翻边要求替换三角形的全部边已经满足目标边长，避免提前改变长三角形覆盖的参考曲面区域，造成后续子三角形无法满足法向约束。超长区域保留原始三角形进行细分，再执行后续质量优化；最终边长、曲面和拓扑校验不变。
+
 ### remesh 性能与耗时
+
+2026-09-09 针对 718,710 面、目标边长 12 的日志继续优化：合并短边折叠重复的曲面检查，修复大模型缓存键溢出失效，布尔距离查询使用阈值内支撑搜索；CPU 分组、约束索引、边界细分、解析图映射及 PLY 读写减少重复扫描。每批保留 PyTorch 分配缓存，当前默认批次为 75,000 面。后续加入不可能参数图的提前判定、增大 CUDA 校验缓存及 CPU 边集合复用，并完成全部 13 个批次和全模型验证；实测范围及结果见 [性能验证记录](REMESH_PERFORMANCE_VERIFIED_20260909.md)。40 秒目标尚未达到。
+
+最近一轮最小交接、单 PLY 输出和纯诊断计算裁剪后，同模型默认入口首次全流程从 144.46 秒降到 116.56 秒，命中分区缓存时从 95.63 秒降到 80.95 秒。两次均通过完整验证；输出面索引和标签完全一致，顶点坐标仅有约 10⁻¹² 的浮点差异，未改变质量策略。
 
 默认 `surface` 路径启用以下计算复用，原有 `run_remesh.ps1` 命令直接生效：
 
-- 短边折叠期间坐标固定，相同曲面标签和有序顶点组合复用完整曲面检查，包括被拒绝的组合；缓存最多 1,000,000 项，每次折叠调用独立持有，坐标变化时失效。
+- 短边折叠期间坐标固定，相同曲面标签和有序顶点组合复用完整曲面检查，包括被拒绝的组合；CUDA 缓存最多 2^22 个槽（约 148 MiB），CPU 缓存最多 1,000,000 项，每次折叠调用独立持有，坐标变化时失效。
+- CUDA 将缓存未命中的查询集中到连续队列后检查，队列计数保留在 GPU。双向均被拒绝的折叠边在其相邻面未变化时复用结果；任何相关面修改或删除后立即重新评估。
 - 顶点优化回退后，仅重查坐标实际变化的三角形。极细三角形的法向歧义通过按尺寸分组的空间索引筛选附近参考面，再执行原有严格几何判断。
 - 锁定端点的无效折叠方向在曲面查询前排除；报告使用 C JSON 编码器批量写出。
+- 局部细分使用整数边键进行保护边匹配；每批仅加载自身涉及的解析投影模型，纯自由曲面批次省去无用的解析投影计算。
+- 最终 CUDA 曲面检查保留中心点最近面和法向歧义判定，其余六个采样点只查询是否存在误差阈值内的参考支撑。成功时返回相同的有效性及歧义标记；失败诊断和详细 tracing 仍计算精确距离、角度，检查规则不变。
 
-采样预算、优化轮数、误差阈值、共享边保护和最终完整验证不变。日志新增每个 CUDA 批次及读取、计算、导出的耗时，批次耗时也记录在报告的 `stats.batches[].batch_seconds`。性能对照见 [加速验证记录](debug/111_remesh_speed_20260908/RESULTS.md)。
+采样预算、优化轮数、误差阈值、共享边保护和最终完整验证不变。默认跳过只用于报告的质量统计、全局采样偏差诊断，以及上层不使用的最终最近源面查询及专用局部索引；算法过程中的源面归属与曲面校验保持完整。解析参数图保留同一均值质量接受条件。日志保留每个 CUDA 批次及读取、计算、导出的耗时；完整报告模式还记录 `stats.batches[].batch_seconds`。性能对照见 [性能验证记录](REMESH_PERFORMANCE_VERIFIED_20260909.md)。
 
 ### remesh 输出
 
-- `remesh_result.ply`：完整共享索引网格，保留 `patch_id`、`primitive_type`、`feature_role`。
+默认 CLI 和 PowerShell 入口仅生成 `remesh_result.ply`：完整共享索引网格，维持原 ASCII 格式、float64 坐标、颜色及 `patch_id`、`primitive_type`、`feature_role`。完整文件入口的位置为 `OUTPUT/remesh/remesh_result.ply`；已有分区入口则写到指定输出目录。
+
+需要诊断时，添加 `--full-output`，或对 `remsh.ps1` / `run_remesh.ps1` 使用 `-FullOutput`，额外生成以下文件；完整文件入口同时保留两份内部交接文件：
+
 - `surface_types.ply`、`feature_roles.ply`：相同几何及索引，仅改变颜色。
 - `remesh_result.stl`：便于常规网格工具打开；STL 不携带分区标签，坐标按格式为 float32。
 - `remesh_report.json`：新三角形成员和 `source_patch_ids`、原曲面参数来源、必要几何约束、已解除的标签边界、角点、几何约束到子边的连续来源映射、参数图接受/拒绝原因、质量和验证统计。schema 为 `cadmesh.partition_remesh`，与原始分区报告区分。
@@ -183,7 +243,7 @@ Python 入口支持已有目录或其中的 `patch_result.ply`：
 
 合并区域的 `source_fit_diagnostics` 仅属于 `representative_source_patch_id`，不是整个合并区域的重拟合误差；`source_fit_diagnostics_by_patch` 逐项保留全部原分区的诊断。共享几何边的来源映射以报告显式列出的 `source_constraint_edges` 为准，已解除的标签边单独记入 `boundary_policy`。
 
-导入读取 PLY 属性名称及 JSON 成员，不进行隐式焊接或重排。原输入不会被覆盖，文件不匹配或约束失效会明确报错。
+导入支持原 ASCII 和内部 binary little-endian 三角 PLY，按属性名称读取，不进行隐式焊接或重排。二进制输入先核对实际文件尺寸与声明记录数，再分配数组；成员、拓扑、角点和约束验证与 ASCII 一致。原输入不会被覆盖，文件不匹配或约束失效会明确报错。Python 库函数仍默认收集诊断并完整导出，可显式设置 `collect_diagnostics=False` / `full_output=False` 使用精简路径。
 
 ### remesh 回归
 
