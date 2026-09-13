@@ -1,0 +1,45 @@
+[18:47:08] [info] RXMesh: Total number of device: 1
+[18:47:08] [info] RXMesh: Using device Number: 0
+[18:47:08] [info] RXMesh: Device name: NVIDIA GeForce RTX 4060 Laptop GPU
+[18:47:08] [info] RXMesh: Compute Capability: 8.9
+[18:47:08] [info] RXMesh: Total amount of global memory (MB): 8187.5
+[18:47:08] [info] RXMesh: 24 Multiprocessors, 128 CUDA Cores/MP: 3072 CUDA Cores
+[18:47:08] [info] RXMesh: Maximum # blocks per SM: 24
+[18:47:08] [info] RXMesh: ECC support: Disabled
+[18:47:08] [info] RXMesh: GPU Max Clock rate: 1890.0 MHz (1.89 GHz)
+[18:47:08] [info] RXMesh: Memory Clock rate: 8001.0 Mhz
+[18:47:08] [info] RXMesh: Memory Bus Width:  128-bit
+[18:47:08] [info] RXMesh: Peak Memory Bandwidth: 256.032000(GB/s)
+[18:47:08] [info] RXMesh: Kernels compiled for compute capability: 890
+[18:47:08] [info] RXMesh: Using cuSolver Version 11.6.4
+[18:47:08] [info] RXMesh: Using cuSparse Version 12.7.3
+[18:47:08] [info] RXMesh: Using cuBlas Version 12.6.0
+[18:47:08] [info] RXMesh: Patcher: num_patches = 12
+[18:47:08] [info] RXMesh: Patcher: patches_size = 256
+[18:47:08] [info] RXMesh: Patcher: num_components = 1
+[18:47:08] [info] RXMesh: Patcher: Num lloyd run = 20
+[18:47:08] [info] RXMesh: Patcher: Parallel patches construction time = 37.190655 (ms) and 1.8595327 (ms/lloyd_run)
+[18:47:08] [info] RXMesh: Patcher: max_patch_size= 695, min_patch_size= 192, avg_patch_size= 382
+[18:47:08] [info] RXMesh: Patcher: number external ribbon elements = 3226 (235.82%)
+[18:47:08] [info] RXMesh: RXMesh: Num colors = 12
+[18:47:08] [info] RXMesh: RXMesh: #Vertices = 686, #Faces= 1368, #Edges= 2052, #Patches = 12
+[18:47:08] [info] RXMesh: RXMesh: Input is edge manifold
+[18:47:08] [info] RXMesh: RXMesh: Input is closed
+[18:47:08] [info] RXMesh: RXMesh: Input max valence = 149
+[18:47:08] [info] RXMesh: RXMesh: max edge incident faces = 2
+[18:47:08] [info] RXMesh: RXMesh: max face adjacent faces = 3
+[18:47:08] [info] RXMesh: RXMesh: per-patch maximum face count = 695
+[18:47:08] [info] RXMesh: RXMesh: per-patch maximum edge count = 1188
+[18:47:08] [info] RXMesh: RXMesh: per-patch maximum vertex count = 493
+[18:47:08] [info] RXMesh: RXMesh::init timings:
+[18:47:08] [info] RXMesh:   total = 75.0356 (ms)
+[18:47:08] [info] RXMesh:   build = 53.7317 (ms)
+[18:47:08] [info] RXMesh:   populate_patch_stash = 0.2345 (ms)
+[18:47:08] [info] RXMesh:   coloring = 0.0793 (ms)
+[18:47:08] [info] RXMesh:   build_device = 20.088 (ms)
+[18:47:08] [info] RXMesh:   PatchScheduler = 0.1506 (ms)
+[18:47:08] [info] RXMesh:   compute_max_lp_capacity = 0.0036 (ms)
+[18:47:08] [info] RXMesh:   create_handles = 0.1283 (ms)
+[18:47:08] [info] RXMesh:   context.init = 0.0781 (ms)
+[18:47:08] [error] RXMesh: Line 371 File D:\opensource\pamo\cad_mesh\build_rxmesh_deps\RXMesh\include\rxmesh\attribute.cu
+[18:47:08] [error] RXMesh: CUDA ERROR: an illegal memory access was encountered

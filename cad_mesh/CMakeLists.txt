@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(CadMeshPatchSegmentation VERSION 0.1 LANGUAGES CXX)
 find_package(Threads REQUIRED)
+find_package(OpenMP REQUIRED)
 
 option(CADMESH_BUILD_TESTS "Build CadMesh tests" ON)
+option(CADMESH_BUILD_RXMESH "Build the GPU reference-surface remesher" OFF)
 set(VCGLIB_ROOT "d:/openSourceInstall/vcglib" CACHE PATH "VCGLib root")
 
 if(NOT EXISTS "${VCGLIB_ROOT}/vcg/complex/complex.h")
@@ -50,6 +52,10 @@ add_executable(cad_mesh_generic app/cad_mesh_generic.cpp)
 target_link_libraries(cad_mesh_generic PRIVATE CadMesh)
 add_executable(cad_mesh_quality app/cad_mesh_quality.cpp)
 target_compile_features(cad_mesh_quality PRIVATE cxx_std_17)
+
+if(CADMESH_BUILD_RXMESH)
+    add_subdirectory(rxmesh)
+endif()
 
 if(CADMESH_BUILD_TESTS)
     enable_testing()
