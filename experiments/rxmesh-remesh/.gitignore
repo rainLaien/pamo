@@ -1,0 +1,18 @@
+﻿# Local build/output/test artifacts
+build/
+build_rx/
+results/
+fixtures/
+tests/
+
+# One-off development patch scripts and scratch files
+patch_*.py
+*.tmp
+*.log
+__pycache__/
+*.pyc
+
+# Local analysis/debug helpers
+tools/check_cad_output.py
+tools/patch_global_flip.py
+tools/plot_cad_comparison.py
