@@ -84,7 +84,12 @@ bool validatePartitionOutput(const SemanticMesh &source, const SemanticMesh &out
     auto a=output.facePoint(f,0),b=output.facePoint(f,1),c=output.facePoint(f,2);
     auto mid=centroid3(a,b,c);
     const float orientationScore=dot(cross(b-a,c-a),projector.analyticNormal(pid,mid))*orientation[pid];
-    if(!(orientationScore>0)) {
+    const Vec3 faceNormal=cross(b-a,c-a);
+    const Vec3 analyticNormal=projector.analyticNormal(pid,mid);
+    const float normalScale=length(faceNormal)*length(analyticNormal);
+    const float signedDot=dot(faceNormal,analyticNormal)*(orientation[pid]<0 ? -1.0f : 1.0f);
+    const float minCos=std::cos(config.normalDegrees*0.017453292519943295f);
+    if(!(orientationScore>0) || !(normalScale>0) || signedDot<minCos*normalScale) {
       normalsValid=false;
       if(normalsError.empty()) normalsError="orientation mismatch face=" + std::to_string(f) + " patch=" + std::to_string(pid) + " score=" + std::to_string(orientationScore) + " patch_orientation=" + std::to_string(orientation[pid]);
     }
@@ -131,7 +136,7 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
       double p[3]; read(p);
       for (double x : p) if (!std::isfinite(x) || std::abs(x) > 1e30)
         throw std::runtime_error("invalid partition coordinate");
-      result.addVertex({float(p[0]),float(p[1]),float(p[2])}, 0, VertexConstraint::Surface);
+      result.addVertex({float(p[0]),float(p[1]),float(p[2])}, kInvalidId, VertexConstraint::Surface);
     }
     std::vector<uint32_t> counts(np, 0);
     for (uint32_t f=0; f<nf; ++f) {
@@ -140,7 +145,9 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
           t[0]==t[1] || t[1]==t[2] || t[2]==t[0]) throw std::runtime_error("invalid partition face");
       result.addFace(t[0],t[1],t[2],t[3],PatchType::Unknown);
       ++counts[t[3]];
-      for (int k=0;k<3;++k) result.vertexPatchId[t[k]]=t[3];
+      // Representative only. Boundary vertices can support several patches.
+      for (int k=0;k<3;++k)
+        result.vertexPatchId[t[k]]=std::min(result.vertexPatchId[t[k]],t[3]);
     }
     for (uint32_t p=0;p<np;++p) {
       uint32_t h[5]; read(h);

@@ -495,13 +495,14 @@ bool SemanticMesh::savePly(const std::string &path, std::string *error) const {
       << "property float z\n"
       << "element face " << liveFaces << "\n"
       << "property list uchar int vertex_indices\n"
+      << "property uint patch_id\n"
       << "end_header\n";
   out << std::setprecision(9);
   for (int v = 0; v < vertexCount(); ++v)
     out << px[v] << ' ' << py[v] << ' ' << pz[v] << '\n';
   for (int f = 0; f < faceCount(); ++f) {
     if (!faceAlive[f]) continue;
-    out << "3 " << i0[f] << ' ' << i1[f] << ' ' << i2[f] << '\n';
+    out << "3 " << i0[f] << ' ' << i1[f] << ' ' << i2[f] << ' ' << facePatchId[f] << '\n';
   }
   return true;
 }

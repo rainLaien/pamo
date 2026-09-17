@@ -71,6 +71,11 @@ if(CAD_ADAPTIVE_RXMESH)
     target_compile_options(cad_adaptive_global PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
+    # Same CLI and same global remesher, without unrelated RXMesh solver DLLs.
+    # Keep the original multi-backend executable for explicit --gpu users.
+    add_executable(cad_adaptive_global_cli tools/remesh_cli.cpp)
+    target_link_libraries(cad_adaptive_global_cli PRIVATE cad_adaptive_global)
+
     # VS CudaLink does not rebuild cad_adaptive_rx.device-link.obj when
     # RxMeshBackend.obj changes (LNK2001 fatbinwrap hash mismatch).
     set(_rx_dlink_stamp "${CMAKE_CURRENT_BINARY_DIR}/rxmesh_backend.dlink.stamp")

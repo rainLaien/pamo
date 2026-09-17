@@ -89,6 +89,22 @@ struct GlobalCollapseReport {
   size_t dynamicSharedMemoryBytes = 0;
 };
 
+struct GlobalSmoothReport {
+  uint32_t candidateCount = 0;
+  uint32_t acceptedCount = 0;
+  uint32_t staleRejected = 0;
+  uint32_t semanticRejected = 0;
+  uint32_t qualityRejected = 0;
+  uint32_t schedulerRounds = 0;
+  uint64_t activeItemsScanned = 0;
+  double adjacencyMs = 0;
+  double candidateMs = 0;
+  double claimMs = 0;
+  double executeMs = 0;
+  double totalMs = 0;
+  size_t globalMemoryBytes = 0;
+};
+
 struct GlobalFlipReport {
   uint32_t candidateCount = 0;
   uint32_t acceptedCount = 0;
@@ -106,6 +122,17 @@ struct GlobalFlipReport {
   size_t dynamicSharedMemoryBytes = 0;
 };
 
+struct GlobalCycleMetrics {
+  uint32_t FaceCount = 0;
+  uint32_t EdgeCount = 0;
+  uint32_t EditableCount = 0;
+  uint32_t EditableAboveSplit = 0;
+  uint32_t EditableBelowCollapse = 0;
+  float QualityMean = 0;
+  float QualityP05 = 0;
+  float QualityMin = 0;
+};
+
 class GlobalSplitBackend {
 public:
   GlobalSplitBackend();
@@ -114,15 +141,22 @@ public:
   GlobalSplitBackend &operator=(const GlobalSplitBackend &) = delete;
 
   bool Initialize(const SemanticMesh &mesh, float capacityFactor, std::string *error = nullptr);
+  // Call after Initialize: absolute tolerances against immutable CAD patches.
+  bool configure(const RemeshConfig &config, std::string *error = nullptr);
   bool RunTriangleRefinePass(float refineRatio, GlobalTriangleRefineReport &report, std::string *error = nullptr);
   bool RunSplitPass(float splitRatio, GlobalSplitReport &report,
                     std::string *error = nullptr,
                     float maxRatio = std::numeric_limits<float>::infinity());
   bool RunCollapsePass(float collapseRatio, GlobalCollapseReport &report,
                        std::string *error = nullptr);
-  bool RunFlipPass(float minQualityGain, GlobalFlipReport &report, std::string *error = nullptr);
+  bool RunFlipPass(float minQualityGain, float collapseRatio,
+                   GlobalFlipReport &report, std::string *error = nullptr);
+  bool RunSmoothPass(float lambda, GlobalSmoothReport &report,
+                     std::string *error = nullptr);
   bool Validate(GlobalTopologyValidation &validation, std::string *error = nullptr) const;
   bool Export(SemanticMesh &mesh, std::string *error = nullptr) const;
+  bool collectCycleMetrics(float targetLength, float splitRatio, float collapseRatio,
+                           GlobalCycleMetrics &metrics, std::string *error = nullptr) const;
 
   uint32_t VertexCount() const;
   uint32_t EdgeCount() const;

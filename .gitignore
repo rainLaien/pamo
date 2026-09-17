@@ -29,3 +29,5 @@ make.sh
 /__pycache__
 /examples
 /examples
+/cad_mesh/win_rx
+/cad_mesh/win_rxre

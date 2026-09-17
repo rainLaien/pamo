@@ -24,6 +24,10 @@ struct GPatch {
   float orientationSign;
   uint8_t type;
   uint8_t padding[3]{};
+  float MaxGeometryError = std::numeric_limits<float>::infinity();
+  float NormalCosThreshold = 0.0f;
+  float SplitRatio = 4.0f / 3.0f;
+  float MinQuality = 1.0e-5f;
 };
 
 struct GVertex {
@@ -72,6 +76,16 @@ struct CollapseCandidate {
   uint32_t edgeId, edgeGeneration;
   uint32_t keep, remove, c, d;
   uint32_t f0, f1;
+  float destinationX, destinationY, destinationZ;
+  float priority;
+  uint8_t moveKeep;
+  uint8_t accepted;
+  uint8_t padding[2]{};
+};
+
+struct SmoothCandidate {
+  uint32_t vertexId, vertexGeneration;
+  float x, y, z;
   float priority;
   uint8_t accepted;
   uint8_t padding[3]{};
@@ -201,6 +215,9 @@ __device__ inline float3 AnalyticNormalGpu(const GPatch &p, const GVertex &a,
   return make_float3(0,0,0);
 }
 
+__device__ inline float TriangleGeometryErrorGpu(const GPatch &p,
+    const GVertex &a, const GVertex &b, const GVertex &c);
+
 __device__ inline bool PatchOrientationSafe(const GPatch *patches, uint32_t patchCount,
                                              uint32_t patchId, const GVertex &a,
                                              const GVertex &b, const GVertex &c) {
@@ -209,7 +226,13 @@ __device__ inline bool PatchOrientationSafe(const GPatch *patches, uint32_t patc
   const float3 an=AnalyticNormalGpu(p,a,b,c);
   const float an2=Dot3(an,an);
   if (!(an2>1e-20f)) return true;
-  return Dot3(TriangleCross(a,b,c),an)*p.orientationSign > 0.0f;
+  const float3 faceNormal = TriangleCross(a,b,c);
+  const float scale2 = Dot3(faceNormal,faceNormal) * an2;
+  const float orientedDot = Dot3(faceNormal,an) * p.orientationSign;
+  if (!(scale2 > 0.0f) || !(orientedDot > 0.0f) ||
+      orientedDot < p.NormalCosThreshold * sqrtf(scale2)) return false;
+  // Fixed reference budget; evaluated after projection on the child triangle.
+  return TriangleGeometryErrorGpu(p,a,b,c) <= p.MaxGeometryError;
 }
 
 __device__ inline bool FaceHasDirectedEdge(const GFace &f, uint32_t a, uint32_t b) {
@@ -326,14 +349,19 @@ __device__ inline bool SegmentedSplitQualitySafe(const GVertex &a, const GVertex
                                                   const GVertex &c, const GVertex &d,
                                                   uint32_t segments, uint32_t patchId,
                                                   const GPatch *patches, uint32_t patchCount) {
-  constexpr float qMin = 1.0e-6f;
+  constexpr float qAbs = 1.0e-5f;
+  constexpr float qRetain = 0.50f;
+  const float parentC = TriangleQualityGpu(a,b,c);
+  const float parentD = TriangleQualityGpu(b,a,d);
+  const float qFloorC = fmaxf(qAbs, parentC * qRetain);
+  const float qFloorD = fmaxf(qAbs, parentD * qRetain);
   for (uint32_t i=0;i<segments;++i) {
     const float t0=float(i)/float(segments), t1=float(i+1u)/float(segments);
     GVertex p0=LerpSplitVertex(a,b,t0); p0.patchId=patchId;
     GVertex p1=LerpSplitVertex(a,b,t1); p1.patchId=patchId;
     p0=ProjectCandidateVertex(p0,patches,patchCount);
     p1=ProjectCandidateVertex(p1,patches,patchCount);
-    if (!(TriangleQualityGpu(p0,p1,c)>qMin) || !(TriangleQualityGpu(p1,p0,d)>qMin) ||
+    if (!(TriangleQualityGpu(p0,p1,c)>=qFloorC) || !(TriangleQualityGpu(p1,p0,d)>=qFloorD) ||
         !SameHemisphere(a,b,c,p0,p1,c) || !SameHemisphere(b,a,d,p1,p0,d) ||
         !PatchOrientationSafe(patches,patchCount,patchId,p0,p1,c) ||
         !PatchOrientationSafe(patches,patchCount,patchId,p1,p0,d)) return false;
@@ -550,7 +578,7 @@ __global__ void SumAcceptedTriangleCost(const TriangleRefineCandidate *candidate
 __device__ inline unsigned long long TriangleWinnerKey(const TriangleRefineCandidate &c,
                                                         uint32_t id) {
   const uint32_t bits = __float_as_uint(c.priority);
-  return (unsigned long long(bits) << 32) | unsigned long long(0xffffffffu - id);
+  return (unsigned long long(bits) << 32) | unsigned long long(0xffffffffu - c.faceId);
 }
 
 __device__ inline void ClaimTriangleMutationEdges(const TriangleRefineCandidate &c,
@@ -588,8 +616,9 @@ __device__ inline bool AnyTriangleMutationEdgeBlocked(const TriangleRefineCandid
 
 __global__ void ClaimTriangleCandidates(
     const TriangleRefineCandidate *candidates, const GFace *faces,
-    const uint32_t *active, uint32_t activeCount, unsigned long long *edgeWinner,
+    const uint32_t *active, const uint32_t *activeCountPtr, unsigned long long *edgeWinner,
     unsigned long long *faceWinner, unsigned long long *vertexWinner) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x;
   if (slot>=activeCount) return;
   const uint32_t id=active[slot];
@@ -604,10 +633,11 @@ __global__ void ClaimTriangleCandidates(
 
 __global__ void ResolveTriangleCandidates(
     TriangleRefineCandidate *candidates, const GFace *faces, const uint32_t *active,
-    uint32_t activeCount, const unsigned long long *edgeWinner,
+    const uint32_t *activeCountPtr, const unsigned long long *edgeWinner,
     const unsigned long long *faceWinner, const unsigned long long *vertexWinner,
     uint8_t *edgeBlocked, uint8_t *faceBlocked, uint8_t *vertexBlocked,
     uint32_t *acceptedCount, uint32_t *roundAccepted) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x;
   if (slot>=activeCount) return;
   const uint32_t id=active[slot];
@@ -630,8 +660,9 @@ __global__ void ResolveTriangleCandidates(
 
 __global__ void CompactTriangleCandidates(
     TriangleRefineCandidate *candidates, const GFace *faces, const uint32_t *active,
-    uint32_t activeCount, const uint8_t *edgeBlocked, const uint8_t *faceBlocked,
+    const uint32_t *activeCountPtr, const uint8_t *edgeBlocked, const uint8_t *faceBlocked,
     const uint8_t *vertexBlocked, uint32_t *nextActive, uint32_t *nextCount) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x;
   if (slot>=activeCount) return;
   const uint32_t id=active[slot];
@@ -855,7 +886,14 @@ __global__ void GenerateSplitCandidates(const GVertex *vertices, const GEdge *ed
     return;
   }
   if (e.v0 == e.v1 || e.v0 == kInvalid || e.v1 == kInvalid) return;
-  const GVertex a = vertices[e.v0], b = vertices[e.v1];
+  uint32_t aId=e.v0,bId=e.v1;
+  // Candidate and execution checks must use the same face winding.
+  if(!FaceHasDirectedEdge(f0,aId,bId)) {
+    if(!FaceHasDirectedEdge(f0,bId,aId)) return;
+    const uint32_t tmp=aId; aId=bId; bId=tmp;
+  }
+  if(!FaceHasDirectedEdge(f1,bId,aId)) return;
+  const GVertex a = vertices[aId], b = vertices[bId];
   if (!a.alive || !b.alive) return;
   const float h = 0.5f * (a.targetLength + b.targetLength);
   if (!(h > 0.0f)) return;
@@ -870,7 +908,7 @@ __global__ void GenerateSplitCandidates(const GVertex *vertices, const GEdge *ed
   const uint32_t d = ThirdVertex(f1, e.v0, e.v1);
   if (c == kInvalid || d == kInvalid || c == d) return;
   const float len = sqrtf(len2);
-  // Residual cleanup only: coarse refinement belongs to the triangle/cavity stage.
+  // Midpoint fallback covers all long editable edges, including coarse input.
   constexpr uint32_t segmentCount = 2u;
   const GVertex vc = vertices[c], vd = vertices[d];
   if (!SegmentedSplitQualitySafe(a, b, vc, vd, segmentCount, f0.patchId, patches, patchCount)) return;
@@ -879,7 +917,7 @@ __global__ void GenerateSplitCandidates(const GVertex *vertices, const GEdge *ed
     if (capacityRejected) atomicAdd(capacityRejected, 1u);
     return;
   }
-  candidates[slot] = {id, e.generation, e.v0, e.v1, c, d,
+  candidates[slot] = {id, e.generation, aId, bId, c, d,
                       uint32_t(e.f0), uint32_t(e.f1), len / h,
                       uint8_t(segmentCount), 0, {0, 0}};
 }
@@ -922,7 +960,7 @@ __device__ inline void BlockFaceEdges(const GFace &f, uint8_t *edgeBlocked) {
 
 __device__ inline unsigned long long SplitWinnerKey(const SplitCandidate &c, uint32_t id) {
   const uint32_t priorityBits = __float_as_uint(c.priority);
-  return (unsigned long long(priorityBits) << 32) | unsigned long long(0xffffffffu - id);
+  return (unsigned long long(priorityBits) << 32) | unsigned long long(0xffffffffu - c.edgeId);
 }
 
 __device__ inline void ClaimFaceEdgesPriority(const GFace &f, unsigned long long key,
@@ -938,10 +976,11 @@ __device__ inline bool OwnFaceEdgesPriority(const GFace &f, unsigned long long k
 }
 
 __global__ void ClaimCandidatesActive(const SplitCandidate *candidates, const GFace *faces,
-                                      const uint32_t *active, uint32_t activeCount,
+                                      const uint32_t *active, const uint32_t *activeCountPtr,
                                       unsigned long long *edgeWinner,
                                       unsigned long long *faceWinner,
                                       unsigned long long *vertexWinner) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
   if (slot >= activeCount) return;
   const uint32_t id = active[slot];
@@ -958,13 +997,14 @@ __global__ void ClaimCandidatesActive(const SplitCandidate *candidates, const GF
 }
 
 __global__ void ResolveCandidatesActive(SplitCandidate *candidates, const GFace *faces,
-                                        const uint32_t *active, uint32_t activeCount,
+                                        const uint32_t *active, const uint32_t *activeCountPtr,
                                         const unsigned long long *edgeWinner,
                                         const unsigned long long *faceWinner,
                                         const unsigned long long *vertexWinner,
                                         uint8_t *edgeBlocked, uint8_t *faceBlocked,
                                         uint8_t *vertexBlocked, uint32_t *acceptedCount,
                                         uint32_t *roundAccepted) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
   if (slot >= activeCount) return;
   const uint32_t id = active[slot];
@@ -988,10 +1028,11 @@ __global__ void ResolveCandidatesActive(SplitCandidate *candidates, const GFace 
 }
 
 __global__ void CompactActiveCandidates(SplitCandidate *candidates, const GFace *faces,
-                                        const uint32_t *active, uint32_t activeCount,
+                                        const uint32_t *active, const uint32_t *activeCountPtr,
                                         const uint8_t *edgeBlocked, const uint8_t *faceBlocked,
                                         const uint8_t *vertexBlocked, uint32_t *nextActive,
                                         uint32_t *nextCount) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
   if (slot >= activeCount) return;
   const uint32_t id = active[slot];
@@ -1010,11 +1051,16 @@ __global__ void CompactActiveCandidates(SplitCandidate *candidates, const GFace 
 }
 
 
+__device__ inline float AnalyticPointErrorGpu(const GPatch &p, float3 x);
+__device__ inline float TriangleGeometryErrorGpu(const GPatch &p,
+    const GVertex &a,const GVertex &b,const GVertex &c);
+
 __global__ void GenerateFlipCandidates(const GVertex *vertices, const GEdge *edges,
                                        const GFace *faces, uint32_t edgeCount,
                                        uint32_t faceCount, const unsigned long long *edgeHash,
-                                       uint32_t edgeHashMask, float minQualityGain,
-                                       FlipCandidate *candidates,
+                                       uint32_t edgeHashMask, const uint32_t *offsets, float minQualityGain,
+                                       float collapseRatio, const GPatch *patches,
+                                       uint32_t patchCount, FlipCandidate *candidates,
                                        uint32_t candidateCapacity, uint32_t *candidateCount,
                                        uint32_t *semanticRejected,
                                        uint32_t *capacityRejected) {
@@ -1047,7 +1093,40 @@ __global__ void GenerateFlipCandidates(const GVertex *vertices, const GEdge *edg
   if (!va.alive || !vb.alive || !vc.alive || !vd.alive) return;
   const float oldQ = fminf(TriangleQualityGpu(va, vb, vc), TriangleQualityGpu(vb, va, vd));
   const float newQ = fminf(TriangleQualityGpu(vc, vd, vb), TriangleQualityGpu(vd, vc, va));
-  if (!(newQ > oldQ + minQualityGain)) return;
+  int oldDeviation=0,newDeviation=0;
+  const uint32_t ids[4]={a,b,c,d};
+  for (int k=0;k<4;++k) {
+    const GVertex v=vertices[ids[k]];
+    if(v.constraint!=kSurfaceConstraint && v.constraint!=uint8_t(VertexConstraint::Free)) continue;
+    const int degree=int(offsets[ids[k]+1u]-offsets[ids[k]]);
+    const int after=degree+(k<2 ? -1 : 1);
+    oldDeviation+=abs(degree-6); newDeviation+=abs(after-6);
+  }
+  const float gain=fmaxf(1.0e-7f,minQualityGain*fmaxf(oldQ,1.0e-3f));
+  const bool betterValence=newDeviation<oldDeviation && newQ>=0.5f*oldQ;
+  const bool betterShape=newQ>oldQ+gain && (newDeviation<=oldDeviation || newQ>1.5f*oldQ);
+  if (!(newQ>=1.0e-5f) || !(betterValence || betterShape)) return;
+  const float hDiag = 0.5f * (vc.targetLength + vd.targetLength);
+  if (!(hDiag > 0.0f)) return;
+  const float minDiag = collapseRatio * hDiag;
+  const float newDiag2=Dist2(vc,vd);
+  if (!(newDiag2 >= minDiag * minDiag)) return;
+  const float splitRatio=patches && f0.patchId<patchCount ? patches[f0.patchId].SplitRatio : 4.0f/3.0f;
+  const float maxDiag=splitRatio*hDiag;
+  // During coarse sizing, allow an already long diagonal to get shorter.
+  // Never introduce a longer over-target diagonal; the next macro cycle splits it.
+  if(newDiag2>fmaxf(maxDiag*maxDiag,Dist2(va,vb))) return;
+  const uint32_t patchId = f0.patchId;
+  if (!PatchOrientationSafe(patches, patchCount, patchId, vc, vd, vb) ||
+      !PatchOrientationSafe(patches, patchCount, patchId, vd, vc, va)) return;
+  if (patches && patchId < patchCount) {
+    const GPatch p = patches[patchId];
+    const float oldGeom = fmaxf(TriangleGeometryErrorGpu(p, va, vb, vc),
+                                TriangleGeometryErrorGpu(p, vb, va, vd));
+    const float newGeom = fmaxf(TriangleGeometryErrorGpu(p, vc, vd, vb),
+                                TriangleGeometryErrorGpu(p, vd, vc, va));
+    if (newGeom > p.MaxGeometryError) return;
+  }
   const float3 oldN0 = TriangleCross(va, vb, vc);
   const float3 oldN1 = TriangleCross(vb, va, vd);
   const float3 sumN = make_float3(oldN0.x + oldN1.x, oldN0.y + oldN1.y, oldN0.z + oldN1.z);
@@ -1064,8 +1143,9 @@ __global__ void GenerateFlipCandidates(const GVertex *vertices, const GEdge *edg
 }
 
 __global__ void ClaimFlipCandidatesActive(const FlipCandidate *candidates, const GFace *faces,
-                                          const uint32_t *active, uint32_t activeCount,
-                                          uint32_t *edgeOwner, uint32_t *faceOwner) {
+                                          const uint32_t *active, const uint32_t *activeCountPtr,
+                                          uint32_t *edgeOwner, uint32_t *faceOwner, uint32_t *vertexOwner) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
   if (slot >= activeCount) return;
   const uint32_t id = active[slot];
@@ -1074,25 +1154,32 @@ __global__ void ClaimFlipCandidatesActive(const FlipCandidate *candidates, const
   atomicMin(faceOwner + c.f1, id);
   ClaimFaceEdges(faces[c.f0], id, edgeOwner);
   ClaimFaceEdges(faces[c.f1], id, edgeOwner);
+  atomicMin(vertexOwner+c.a,id); atomicMin(vertexOwner+c.b,id);
+  atomicMin(vertexOwner+c.c,id); atomicMin(vertexOwner+c.d,id);
 }
 
 
 __global__ void ResolveFlipCandidatesActive(FlipCandidate *candidates, const GFace *faces,
-                                            const uint32_t *active, uint32_t activeCount,
+                                            const uint32_t *active, const uint32_t *activeCountPtr,
                                             const uint32_t *edgeOwner,
-                                            const uint32_t *faceOwner,
-                                            uint8_t *edgeBlocked, uint8_t *faceBlocked,
+                                            const uint32_t *faceOwner, const uint32_t *vertexOwner,
+                                            uint8_t *edgeBlocked, uint8_t *faceBlocked, uint8_t *vertexBlocked,
                                             uint32_t *acceptedCount,
                                             uint32_t *roundAccepted) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
   if (slot >= activeCount) return;
   const uint32_t id = active[slot];
   FlipCandidate &c = candidates[id];
   const bool won = faceOwner[c.f0] == id && faceOwner[c.f1] == id &&
                    OwnFaceEdges(faces[c.f0], id, edgeOwner) &&
-                   OwnFaceEdges(faces[c.f1], id, edgeOwner);
+                   OwnFaceEdges(faces[c.f1], id, edgeOwner) &&
+                   vertexOwner[c.a]==id && vertexOwner[c.b]==id &&
+                   vertexOwner[c.c]==id && vertexOwner[c.d]==id;
   if (!won) return;
   c.accepted = 1;
+  vertexBlocked[c.a]=1; vertexBlocked[c.b]=1;
+  vertexBlocked[c.c]=1; vertexBlocked[c.d]=1;
   faceBlocked[c.f0] = 1;
   faceBlocked[c.f1] = 1;
   BlockFaceEdges(faces[c.f0], edgeBlocked);
@@ -1102,16 +1189,18 @@ __global__ void ResolveFlipCandidatesActive(FlipCandidate *candidates, const GFa
 }
 
 __global__ void CompactFlipCandidates(FlipCandidate *candidates, const GFace *faces,
-                                      const uint32_t *active, uint32_t activeCount,
+                                      const uint32_t *active, const uint32_t *activeCountPtr,
                                       const uint8_t *edgeBlocked,
-                                      const uint8_t *faceBlocked,
+                                      const uint8_t *faceBlocked, const uint8_t *vertexBlocked,
                                       uint32_t *nextActive, uint32_t *nextCount) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
   if (slot >= activeCount) return;
   const uint32_t id = active[slot];
   FlipCandidate &c = candidates[id];
   if (c.accepted != 0) return;
-  if (faceBlocked[c.f0] || faceBlocked[c.f1] ||
+  if (vertexBlocked[c.a] || vertexBlocked[c.b] || vertexBlocked[c.c] || vertexBlocked[c.d] ||
+      faceBlocked[c.f0] || faceBlocked[c.f1] ||
       AnyFaceEdgeBlocked(faces[c.f0], edgeBlocked) ||
       AnyFaceEdgeBlocked(faces[c.f1], edgeBlocked)) {
     c.accepted = 2;
@@ -1291,6 +1380,202 @@ __device__ inline void ReplaceFaceEdgeId(GFace &f, uint32_t from, uint32_t to) {
   if (f.e2==from) f.e2=to;
 }
 
+__device__ inline float AnalyticPointErrorGpu(const GPatch &p, float3 x) {
+  const float3 o=make_float3(p.ox,p.oy,p.oz);
+  const float3 a=make_float3(p.ax,p.ay,p.az);
+  const float3 off=Sub3(x,o);
+  const float axial=Dot3(off,a);
+  if(p.type==uint8_t(PatchType::Plane)) return fabsf(axial);
+  if(p.type==uint8_t(PatchType::Cylinder)) {
+    const float3 r=make_float3(off.x-a.x*axial,off.y-a.y*axial,off.z-a.z*axial);
+    return fabsf(sqrtf(Dot3(r,r))-p.radius);
+  }
+  return 0.0f;
+}
+
+__device__ inline float TriangleGeometryErrorGpu(const GPatch &p,
+    const GVertex &a,const GVertex &b,const GVertex &c) {
+  const float3 pa=ToFloat3(a),pb=ToFloat3(b),pc=ToFloat3(c);
+  const float3 samples[7]={pa,pb,pc,
+    make_float3((pa.x+pb.x+pc.x)/3.0f,(pa.y+pb.y+pc.y)/3.0f,(pa.z+pb.z+pc.z)/3.0f),
+    make_float3((pa.x+pb.x)*0.5f,(pa.y+pb.y)*0.5f,(pa.z+pb.z)*0.5f),
+    make_float3((pb.x+pc.x)*0.5f,(pb.y+pc.y)*0.5f,(pb.z+pc.z)*0.5f),
+    make_float3((pc.x+pa.x)*0.5f,(pc.y+pa.y)*0.5f,(pc.z+pa.z)*0.5f)};
+  float err=0.0f;
+  for(int i=0;i<7;++i) err=fmaxf(err,AnalyticPointErrorGpu(p,samples[i]));
+  return err;
+}
+
+enum CollapseEndpointReject : uint8_t {
+  CollapseEndpointOk = 0,
+  CollapseEndpointTopology = 1,
+  CollapseEndpointSemantic = 2,
+  CollapseEndpointQuality = 4
+};
+
+__device__ inline uint8_t EvaluateCollapseEndpointCad(
+    uint32_t keep,uint32_t remove,uint32_t c,uint32_t d,
+    const GVertex *vertices,const GEdge *edges,const GFace *faces,
+    uint32_t faceCount,const unsigned long long *edgeHashKeys,uint32_t hashMask,
+    const uint32_t *vertexEdgeOffsets,const uint32_t *vertexEdgeIds,
+    const GPatch *patches,uint32_t patchCount,uint32_t patchId,
+    float &minChildQuality,float &maxGeometryError) {
+  uint32_t common=0;
+  for(uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]]; if(!x.alive) continue;
+    if(x.flags & uint8_t(EdgeProtected|EdgePatchBoundary|EdgeMeshBoundary)) return CollapseEndpointSemantic;
+    uint32_t other=kInvalid;
+    if(x.v0==remove) other=x.v1; else if(x.v1==remove) other=x.v0;
+    if(other==kInvalid || other==keep) continue;
+    if(EdgeHashContains(edgeHashKeys,hashMask,keep,other)) ++common;
+  }
+  if(common!=2u) return CollapseEndpointTopology;
+  for(uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]]; if(!x.alive) continue;
+    uint32_t other=kInvalid;
+    if(x.v0==remove) other=x.v1; else if(x.v1==remove) other=x.v0;
+    if(other==kInvalid || other==keep || other==c || other==d) continue;
+    if(EdgeHashContains(edgeHashKeys,hashMask,keep,other)) return CollapseEndpointTopology;
+  }
+  constexpr float qAbs=1.0e-5f;
+  constexpr float qRetain=0.50f;
+  minChildQuality=1.0f;
+  float oldLocalMinQuality=1.0f;
+  maxGeometryError=0.0f;
+  for(uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]]; if(!x.alive) continue;
+    const int32_t localFaces[2]={x.f0,x.f1};
+    for(int k=0;k<2;++k) {
+      if(localFaces[k]<0 || uint32_t(localFaces[k])>=faceCount) continue;
+      const GFace oldF=faces[uint32_t(localFaces[k])];
+      if(!oldF.alive || !FaceContainsVertex(oldF,remove)) continue;
+      if(FaceContainsVertex(oldF,keep)) continue;
+      if(oldF.patchId!=patchId) return CollapseEndpointSemantic;
+      oldLocalMinQuality=fminf(oldLocalMinQuality,
+          TriangleQualityGpu(vertices[oldF.v0],vertices[oldF.v1],vertices[oldF.v2]));
+      GFace nf=oldF; ReplaceFaceVertex(nf,remove,keep);
+      if(nf.v0==nf.v1 || nf.v1==nf.v2 || nf.v0==nf.v2) return CollapseEndpointQuality;
+      const float q=TriangleQualityGpu(vertices[nf.v0],vertices[nf.v1],vertices[nf.v2]);
+      if(!(q>0.0f) ||
+         !SameHemisphere(vertices[oldF.v0],vertices[oldF.v1],vertices[oldF.v2],
+                         vertices[nf.v0],vertices[nf.v1],vertices[nf.v2]) ||
+         !PatchOrientationSafe(patches,patchCount,nf.patchId,
+                               vertices[nf.v0],vertices[nf.v1],vertices[nf.v2]))
+        return CollapseEndpointQuality;
+      const float previousQ=TriangleQualityGpu(vertices[oldF.v0],vertices[oldF.v1],vertices[oldF.v2]);
+      if (q < fmaxf(qAbs,0.5f*previousQ)) return CollapseEndpointQuality;
+      const float splitRatio=patches && patchId<patchCount ? patches[patchId].SplitRatio : 4.0f/3.0f;
+      const uint32_t ids[3]={nf.v0,nf.v1,nf.v2};
+      for (int k=0;k<3;++k) if (ids[k]!=keep) {
+        const float limit=splitRatio*0.5f*(vertices[keep].targetLength+vertices[ids[k]].targetLength);
+        if (Dist2(vertices[keep],vertices[ids[k]]) > limit*limit) return CollapseEndpointQuality;
+      }
+      minChildQuality=fminf(minChildQuality,q);
+      if(patches && patchId<patchCount)
+        maxGeometryError=fmaxf(maxGeometryError,TriangleGeometryErrorGpu(
+            patches[patchId],vertices[nf.v0],vertices[nf.v1],vertices[nf.v2]));
+    }
+  }
+  // Compare destinations over the same local CAD region.  The keep one-ring
+  // is unchanged for endpoint collapse, but its existing geometry error still
+  // participates in the local max used against a moved midpoint destination.
+  for(uint32_t j=vertexEdgeOffsets[keep];j<vertexEdgeOffsets[keep+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]]; if(!x.alive) continue;
+    const int32_t localFaces[2]={x.f0,x.f1};
+    for(int k=0;k<2;++k) {
+      if(localFaces[k]<0 || uint32_t(localFaces[k])>=faceCount) continue;
+      const GFace f=faces[uint32_t(localFaces[k])];
+      if(!f.alive || FaceContainsVertex(f,remove)) continue;
+      if(patches && f.patchId<patchCount)
+        maxGeometryError=fmaxf(maxGeometryError,TriangleGeometryErrorGpu(
+            patches[f.patchId],vertices[f.v0],vertices[f.v1],vertices[f.v2]));
+    }
+  }
+  const float qualityFloor=fmaxf(qAbs,oldLocalMinQuality*qRetain);
+  if(!(minChildQuality>=qualityFloor)) return CollapseEndpointQuality;
+  return CollapseEndpointOk;
+}
+
+__device__ inline GVertex CollapseVirtualVertex(
+    uint32_t id,uint32_t keep,const GVertex &destination,const GVertex *vertices) {
+  return id==keep ? destination : vertices[id];
+}
+
+__device__ inline uint8_t EvaluateCollapseMovedCad(
+    uint32_t keep,uint32_t remove,uint32_t c,uint32_t d,const GVertex &destination,
+    const GVertex *vertices,const GEdge *edges,const GFace *faces,uint32_t faceCount,
+    const unsigned long long *edgeHashKeys,uint32_t hashMask,
+    const uint32_t *vertexEdgeOffsets,const uint32_t *vertexEdgeIds,
+    const GPatch *patches,uint32_t patchCount,uint32_t patchId,
+    float &minChildQuality,float &maxGeometryError) {
+  uint32_t common=0;
+  for(uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]]; if(!x.alive) continue;
+    if(x.flags & uint8_t(EdgeProtected|EdgePatchBoundary|EdgeMeshBoundary)) return CollapseEndpointSemantic;
+    uint32_t other=kInvalid;
+    if(x.v0==remove) other=x.v1; else if(x.v1==remove) other=x.v0;
+    if(other==kInvalid || other==keep) continue;
+    if(EdgeHashContains(edgeHashKeys,hashMask,keep,other)) ++common;
+  }
+  if(common!=2u) return CollapseEndpointTopology;
+  for(uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]]; if(!x.alive) continue;
+    uint32_t other=kInvalid;
+    if(x.v0==remove) other=x.v1; else if(x.v1==remove) other=x.v0;
+    if(other==kInvalid || other==keep || other==c || other==d) continue;
+    if(EdgeHashContains(edgeHashKeys,hashMask,keep,other)) return CollapseEndpointTopology;
+  }
+  constexpr float qAbs=1.0e-5f;
+  constexpr float qRetain=0.50f;
+  minChildQuality=1.0f;
+  float oldLocalMinQuality=1.0f;
+  maxGeometryError=0.0f;
+  const uint32_t roots[2]={keep,remove};
+  for(int r=0;r<2;++r) {
+    const uint32_t root=roots[r];
+    for(uint32_t j=vertexEdgeOffsets[root];j<vertexEdgeOffsets[root+1u];++j) {
+      const GEdge x=edges[vertexEdgeIds[j]]; if(!x.alive) continue;
+      const int32_t localFaces[2]={x.f0,x.f1};
+      for(int k=0;k<2;++k) {
+        if(localFaces[k]<0 || uint32_t(localFaces[k])>=faceCount) continue;
+        const uint32_t fi=uint32_t(localFaces[k]);
+        const GFace oldF=faces[fi];
+        if(!oldF.alive) continue;
+        if(FaceContainsVertex(oldF,keep) && FaceContainsVertex(oldF,remove)) continue;
+        if(!FaceContainsVertex(oldF,keep) && !FaceContainsVertex(oldF,remove)) continue;
+        if(oldF.patchId!=patchId) return CollapseEndpointSemantic;
+        oldLocalMinQuality=fminf(oldLocalMinQuality,
+            TriangleQualityGpu(vertices[oldF.v0],vertices[oldF.v1],vertices[oldF.v2]));
+        GFace nf=oldF;
+        if(FaceContainsVertex(nf,remove)) ReplaceFaceVertex(nf,remove,keep);
+        if(nf.v0==nf.v1 || nf.v1==nf.v2 || nf.v0==nf.v2) return CollapseEndpointQuality;
+        const GVertex a=CollapseVirtualVertex(nf.v0,keep,destination,vertices);
+        const GVertex b=CollapseVirtualVertex(nf.v1,keep,destination,vertices);
+        const GVertex cc=CollapseVirtualVertex(nf.v2,keep,destination,vertices);
+        const float q=TriangleQualityGpu(a,b,cc);
+        if(!(q>0.0f) ||
+           !SameHemisphere(vertices[oldF.v0],vertices[oldF.v1],vertices[oldF.v2],a,b,cc) ||
+           !PatchOrientationSafe(patches,patchCount,nf.patchId,a,b,cc))
+          return CollapseEndpointQuality;
+        const float previousQ=TriangleQualityGpu(vertices[oldF.v0],vertices[oldF.v1],vertices[oldF.v2]);
+        if (q < fmaxf(qAbs,0.5f*previousQ)) return CollapseEndpointQuality;
+        const float splitRatio=patches && patchId<patchCount ? patches[patchId].SplitRatio : 4.0f/3.0f;
+        const uint32_t ids[3]={nf.v0,nf.v1,nf.v2};
+        for (int k=0;k<3;++k) if (ids[k]!=keep) {
+          const float limit=splitRatio*0.5f*(destination.targetLength+vertices[ids[k]].targetLength);
+          if (Dist2(destination,vertices[ids[k]]) > limit*limit) return CollapseEndpointQuality;
+        }
+        minChildQuality=fminf(minChildQuality,q);
+        if(patches && patchId<patchCount)
+          maxGeometryError=fmaxf(maxGeometryError,TriangleGeometryErrorGpu(patches[patchId],a,b,cc));
+      }
+    }
+  }
+  const float qualityFloor=fmaxf(qAbs,oldLocalMinQuality*qRetain);
+  if(!(minChildQuality>=qualityFloor)) return CollapseEndpointQuality;
+  return CollapseEndpointOk;
+}
+
 __global__ void GenerateCollapseCandidates(
     const GVertex *vertices, const GEdge *edges, const GFace *faces,
     uint32_t edgeCount, uint32_t faceCount, float collapseRatio,
@@ -1317,81 +1602,67 @@ __global__ void GenerateCollapseCandidates(
                           va.constraint==kSurfaceConstraint;
   const bool vbEditable = vb.constraint==uint8_t(VertexConstraint::Free) ||
                           vb.constraint==kSurfaceConstraint;
-  if (!vaEditable || !vbEditable || va.patchId!=vb.patchId) {
+  if (!vaEditable && !vbEditable) {
     if (semanticRejected) atomicAdd(semanticRejected,1u);
     return;
   }
   const GFace f0=faces[e.f0], f1=faces[e.f1];
-  if (!f0.alive || !f1.alive || f0.patchId!=f1.patchId || f0.patchId!=va.patchId) {
+  if (!f0.alive || !f1.alive || f0.patchId!=f1.patchId || (vaEditable && f0.patchId!=va.patchId) || (vbEditable && f0.patchId!=vb.patchId)) {
     if (semanticRejected) atomicAdd(semanticRejected,1u);
     return;
   }
-  const uint32_t keep=min(e.v0,e.v1), remove=max(e.v0,e.v1);
-  const uint32_t c=ThirdVertex(f0,keep,remove), d=ThirdVertex(f1,keep,remove);
-  if (c==kInvalid || d==kInvalid || c==d) {
-    if (topologyRejected) atomicAdd(topologyRejected,1u);
+  const uint32_t c=ThirdVertex(f0,e.v0,e.v1), d=ThirdVertex(f1,e.v0,e.v1);
+  if(c==kInvalid || d==kInvalid || c==d) {
+    if(topologyRejected) atomicAdd(topologyRejected,1u);
     return;
   }
-  uint32_t common=0;
-  for (uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
-    const GEdge x=edges[vertexEdgeIds[j]];
-    if (!x.alive) continue;
-    uint32_t other=kInvalid;
-    if (x.v0==remove) other=x.v1; else if (x.v1==remove) other=x.v0;
-    if (other==kInvalid || other==keep) continue;
-    if (EdgeHashContains(edgeHashKeys,hashMask,keep,other)) ++common;
-  }
-  if (common!=2u) { if(topologyRejected) atomicAdd(topologyRejected,1u); return; }
-  // Link-condition extension: any remove-neighbor other than the two opposite
-  // vertices must not already be adjacent to keep, otherwise the collapse
-  // would create a duplicate edge / non-manifold one-ring.
-  for (uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
-    const GEdge x=edges[vertexEdgeIds[j]];
-    if (!x.alive) continue;
-    uint32_t other=kInvalid;
-    if (x.v0==remove) other=x.v1; else if (x.v1==remove) other=x.v0;
-    if (other==kInvalid || other==keep || other==c || other==d) continue;
-    if (EdgeHashContains(edgeHashKeys,hashMask,keep,other)) {
-      if(topologyRejected) atomicAdd(topologyRejected,1u);
-      return;
+  float q01=0.0f,q10=0.0f,g01=0.0f,g10=0.0f;
+  const uint8_t r01=!vbEditable ? CollapseEndpointSemantic : EvaluateCollapseEndpointCad(
+      e.v0,e.v1,c,d,vertices,edges,faces,faceCount,edgeHashKeys,hashMask,
+      vertexEdgeOffsets,vertexEdgeIds,patches,patchCount,f0.patchId,q01,g01);
+  const uint8_t r10=!vaEditable ? CollapseEndpointSemantic : EvaluateCollapseEndpointCad(
+      e.v1,e.v0,c,d,vertices,edges,faces,faceCount,edgeHashKeys,hashMask,
+      vertexEdgeOffsets,vertexEdgeIds,patches,patchCount,f0.patchId,q10,g10);
+  const bool choose01=r01==CollapseEndpointOk &&
+      (r10!=CollapseEndpointOk || q01>q10 || (q01==q10 && g01<=g10));
+  const uint32_t keep=choose01 || r10!=CollapseEndpointOk ? e.v0 : e.v1;
+  const uint32_t remove=keep==e.v0 ? e.v1 : e.v0;
+  const float endpointQ=keep==e.v0 ? q01 : q10;
+  bool found=r01==CollapseEndpointOk || r10==CollapseEndpointOk;
+  GVertex destination=vertices[keep];
+  bool moveKeep=false;
+  uint8_t midResult=CollapseEndpointQuality;
+  if(vaEditable && vbEditable && patches && va.patchId<patchCount &&
+     (patches[va.patchId].type==uint8_t(PatchType::Plane) ||
+      patches[va.patchId].type==uint8_t(PatchType::Cylinder))) {
+    GVertex mid=ProjectCandidateVertex(MidVertex(va,vb,va.patchId),patches,patchCount);
+    float midQ=0.0f,midGeom=0.0f;
+    midResult=EvaluateCollapseMovedCad(
+        keep,remove,c,d,mid,vertices,edges,faces,faceCount,edgeHashKeys,hashMask,
+        vertexEdgeOffsets,vertexEdgeIds,patches,patchCount,f0.patchId,midQ,midGeom);
+    if(midResult==CollapseEndpointOk && (!found || midQ>endpointQ)) {
+      destination=mid; moveKeep=true; found=true;
     }
+  }
+  if(!found) {
+    const uint8_t reasons=uint8_t(r01|r10|midResult);
+    if((reasons&CollapseEndpointSemantic) && semanticRejected) atomicAdd(semanticRejected,1u);
+    else if((reasons&CollapseEndpointTopology) && topologyRejected) atomicAdd(topologyRejected,1u);
+    else if(qualityRejected) atomicAdd(qualityRejected,1u);
+    return;
   }
 
-  constexpr float qMin=1.0e-6f;
-  for (uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
-    const GEdge x=edges[vertexEdgeIds[j]];
-    if(!x.alive) continue;
-    const int32_t localFaces[2]={x.f0,x.f1};
-    for(int k=0;k<2;++k) {
-      if(localFaces[k]<0 || uint32_t(localFaces[k])>=faceCount) continue;
-      const uint32_t fi=uint32_t(localFaces[k]);
-      const GFace oldF=faces[fi];
-      if (!oldF.alive || !FaceContainsVertex(oldF,remove)) continue;
-      if (FaceContainsVertex(oldF,keep)) continue;
-      if (oldF.patchId!=va.patchId) { if(semanticRejected) atomicAdd(semanticRejected,1u); return; }
-      GFace nf=oldF;
-      ReplaceFaceVertex(nf,remove,keep);
-      if (nf.v0==nf.v1 || nf.v1==nf.v2 || nf.v0==nf.v2 ||
-          !(TriangleQualityGpu(vertices[nf.v0],vertices[nf.v1],vertices[nf.v2])>qMin) ||
-          !SameHemisphere(vertices[oldF.v0],vertices[oldF.v1],vertices[oldF.v2],
-                          vertices[nf.v0],vertices[nf.v1],vertices[nf.v2]) ||
-          !PatchOrientationSafe(patches, patchCount, nf.patchId,
-                                vertices[nf.v0],vertices[nf.v1],vertices[nf.v2])) {
-        if (qualityRejected) atomicAdd(qualityRejected,1u);
-        return;
-      }
-    }
-  }
   const uint32_t slot=atomicAdd(candidateCount,1u);
-  if (slot>=candidateCapacity) return;
+  if(slot>=candidateCapacity) return;
   const float len=sqrtf(len2);
   candidates[slot]={id,e.generation,keep,remove,c,d,uint32_t(e.f0),uint32_t(e.f1),
-                    h/fmaxf(len,1e-12f),0u,{0,0,0}};
+                    destination.x,destination.y,destination.z,
+                    h/fmaxf(len,1e-12f),uint8_t(moveKeep?1u:0u),0u,{0,0}};
 }
 
 __device__ inline unsigned long long CollapseWinnerKey(const CollapseCandidate &c,uint32_t id) {
   const uint32_t bits=__float_as_uint(c.priority);
-  return (unsigned long long(bits)<<32)|unsigned long long(0xffffffffu-id);
+  return (unsigned long long(bits)<<32)|unsigned long long(0xffffffffu-c.edgeId);
 }
 
 __device__ inline void ClaimCollapseVertexRing(uint32_t v,const GEdge *edges,
@@ -1435,8 +1706,9 @@ __device__ inline bool CollapseVertexRingBlocked(uint32_t v,const GEdge *edges,
 }
 
 __global__ void ClaimCollapseCandidates(const CollapseCandidate *candidates,const uint32_t *active,
-    uint32_t activeCount,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    const uint32_t *activeCountPtr,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
     unsigned long long *vertexWinner) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
   const uint32_t id=active[slot]; const CollapseCandidate c=candidates[id];
   const unsigned long long key=CollapseWinnerKey(c,id);
@@ -1445,9 +1717,10 @@ __global__ void ClaimCollapseCandidates(const CollapseCandidate *candidates,cons
 }
 
 __global__ void ResolveCollapseCandidates(CollapseCandidate *candidates,const uint32_t *active,
-    uint32_t activeCount,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    const uint32_t *activeCountPtr,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
     const unsigned long long *vertexWinner,uint8_t *vertexBlocked,
     uint32_t *acceptedCount,uint32_t *roundAccepted) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
   const uint32_t id=active[slot]; CollapseCandidate &c=candidates[id];
   const unsigned long long key=CollapseWinnerKey(c,id);
@@ -1460,8 +1733,9 @@ __global__ void ResolveCollapseCandidates(CollapseCandidate *candidates,const ui
 }
 
 __global__ void CompactCollapseCandidates(CollapseCandidate *candidates,const uint32_t *active,
-    uint32_t activeCount,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    const uint32_t *activeCountPtr,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
     const uint8_t *vertexBlocked,uint32_t *nextActive,uint32_t *nextCount) {
+  const uint32_t activeCount = *activeCountPtr;
   const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
   const uint32_t id=active[slot]; CollapseCandidate &c=candidates[id];
   if(c.accepted!=0) return;
@@ -1470,6 +1744,212 @@ __global__ void CompactCollapseCandidates(CollapseCandidate *candidates,const ui
     c.accepted=2; return;
   }
   nextActive[atomicAdd(nextCount,1u)]=id;
+}
+
+__global__ void GenerateSmoothCandidates(
+    const GVertex *vertices,const GEdge *edges,const GFace *faces,
+    uint32_t vertexCount,uint32_t faceCount,float lambda,
+    const uint32_t *offsets,const uint32_t *edgeIds,
+    const GPatch *patches,uint32_t patchCount,
+    SmoothCandidate *candidates,uint32_t candidateCapacity,uint32_t *candidateCount,
+    uint32_t *semanticRejected,uint32_t *qualityRejected) {
+  const uint32_t vId=blockIdx.x*blockDim.x+threadIdx.x;
+  if(vId>=vertexCount) return;
+  const GVertex oldV=vertices[vId];
+  if(!oldV.alive || oldV.constraint!=kSurfaceConstraint || oldV.patchId>=patchCount) return;
+  const GPatch patch=patches[oldV.patchId];
+  if(patch.type!=uint8_t(PatchType::Plane) && patch.type!=uint8_t(PatchType::Cylinder)) return;
+  float sx=0,sy=0,sz=0; uint32_t degree=0;
+  for(uint32_t i=offsets[vId];i<offsets[vId+1u];++i) {
+    const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+    if(e.flags & uint8_t(EdgeProtected|EdgeMeshBoundary|EdgePatchBoundary)) {
+      if(semanticRejected) atomicAdd(semanticRejected,1u); return;
+    }
+    const uint32_t n=e.v0==vId?e.v1:e.v0;
+    if(n>=vertexCount || !vertices[n].alive) {
+      if(semanticRejected) atomicAdd(semanticRejected,1u); return;
+    }
+    // Shared locked neighbors can have several supports. Their representative
+    // patch id is not exclusive: the moving vertex's incident faces decide.
+    const int32_t incident[2]={e.f0,e.f1};
+    for (int side=0;side<2;++side) {
+      const int32_t fi=incident[side];
+      if (fi < 0 || uint32_t(fi) >= faceCount || !faces[fi].alive ||
+          faces[fi].patchId != oldV.patchId) {
+        if(semanticRejected) atomicAdd(semanticRejected,1u); return;
+      }
+    }
+    sx+=vertices[n].x; sy+=vertices[n].y; sz+=vertices[n].z; ++degree;
+  }
+  if(degree<3u) return;
+  const float inv=1.0f/float(degree);
+  const float cx=sx*inv, cy=sy*inv, cz=sz*inv;
+  float oldMin=1.0f,oldGeom=0.0f,oldSizing=0.0f,oldSum=0.0f;
+  uint32_t faceVisits=0;
+  uint32_t worstFaceId=kInvalid;
+  const float qAbs=patch.MinQuality;
+  for(uint32_t i=offsets[vId];i<offsets[vId+1u];++i) {
+    const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+    const uint32_t n=e.v0==vId?e.v1:e.v0;
+    const GVertex vn=vertices[n];
+    const float h=0.5f*(oldV.targetLength+vn.targetLength);
+    if(h>0.0f) {
+      const float oldLen=sqrtf(Dist2(oldV,vn));
+      oldSizing=fmaxf(oldSizing,fabsf(oldLen/h-1.0f));
+    }
+    const int32_t fs[2]={e.f0,e.f1};
+    for(int k=0;k<2;++k) {
+      if(fs[k]<0 || uint32_t(fs[k])>=faceCount) continue;
+      const GFace f=faces[uint32_t(fs[k])];
+      if(!f.alive || !FaceContainsVertex(f,vId) || f.patchId!=oldV.patchId) continue;
+      const GVertex a0=vertices[f.v0],b0=vertices[f.v1],c0=vertices[f.v2];
+      const float oldQ=TriangleQualityGpu(a0,b0,c0);
+      oldSum+=oldQ; ++faceVisits;
+      if(oldQ<oldMin){oldMin=oldQ;worstFaceId=uint32_t(fs[k]);}
+      oldGeom=fmaxf(oldGeom,TriangleGeometryErrorGpu(patch,a0,b0,c0));
+    }
+  }
+
+  float rescueX=cx,rescueY=cy,rescueZ=cz;
+  if(worstFaceId!=kInvalid && worstFaceId<faceCount) {
+    const GFace wf=faces[worstFaceId];
+    uint32_t oa=kInvalid,ob=kInvalid;
+    if(wf.v0==vId){oa=wf.v1;ob=wf.v2;}
+    else if(wf.v1==vId){oa=wf.v2;ob=wf.v0;}
+    else if(wf.v2==vId){oa=wf.v0;ob=wf.v1;}
+    if(oa!=kInvalid && ob!=kInvalid) {
+      const GVertex a=vertices[oa],b=vertices[ob];
+      const float mx=0.5f*(a.x+b.x),my=0.5f*(a.y+b.y),mz=0.5f*(a.z+b.z);
+      const float ex=b.x-a.x,ey=b.y-a.y,ez=b.z-a.z;
+      const float e2=ex*ex+ey*ey+ez*ez;
+      float sx0=oldV.x-mx,sy0=oldV.y-my,sz0=oldV.z-mz;
+      if(e2>1.0e-20f) {
+        const float proj=(sx0*ex+sy0*ey+sz0*ez)/e2;
+        sx0-=proj*ex; sy0-=proj*ey; sz0-=proj*ez;
+        const float s2=sx0*sx0+sy0*sy0+sz0*sz0;
+        if(s2>1.0e-20f) {
+          const float scale=0.8660254037844386f*sqrtf(e2/s2);
+          rescueX=mx+sx0*scale; rescueY=my+sy0*scale; rescueZ=mz+sz0*scale;
+        }
+      }
+    }
+  }
+  if(faceVisits==0) return;
+  const float oldMean=oldSum/float(faceVisits);
+  float bestScore=oldMean+0.1f*oldMin;
+  GVertex bestDest=oldV;
+  float bestMin=oldMin;
+  bool found=false;
+  const float rawSteps[4]={0.5f*lambda,lambda,1.5f*lambda,2.0f*lambda};
+  for(int targetId=0;targetId<2;++targetId) for(int stepId=0;stepId<4;++stepId) {
+    const float step=fminf(1.0f,fmaxf(0.0f,rawSteps[stepId]));
+    if(!(step>0.0f)) continue;
+    const float tx=targetId==0?cx:rescueX;
+    const float ty=targetId==0?cy:rescueY;
+    const float tz=targetId==0?cz:rescueZ;
+    GVertex dest=oldV;
+    dest.x=oldV.x+step*(tx-oldV.x);
+    dest.y=oldV.y+step*(ty-oldV.y);
+    dest.z=oldV.z+step*(tz-oldV.z);
+    dest=ProjectCandidateVertex(dest,patches,patchCount);
+    float newMin=1.0f,newGeom=0.0f,newSizing=0.0f,newSum=0.0f;
+    bool valid=true;
+    for(uint32_t i=offsets[vId];i<offsets[vId+1u] && valid;++i) {
+      const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+      const uint32_t n=e.v0==vId?e.v1:e.v0;
+      const GVertex vn=vertices[n];
+      const float h=0.5f*(oldV.targetLength+vn.targetLength);
+      if(h>0.0f) {
+        const float newLen=sqrtf(Dist2(dest,vn));
+        const float allowed=fmaxf(patch.SplitRatio*h,sqrtf(Dist2(oldV,vn)));
+        if(newLen>allowed*(1.0f+1.0e-5f)) {valid=false; break;}
+        newSizing=fmaxf(newSizing,fabsf(newLen/h-1.0f));
+      }
+      const int32_t fs[2]={e.f0,e.f1};
+      for(int k=0;k<2;++k) {
+        if(fs[k]<0 || uint32_t(fs[k])>=faceCount) continue;
+        const GFace f=faces[uint32_t(fs[k])];
+        if(!f.alive || !FaceContainsVertex(f,vId) || f.patchId!=oldV.patchId) continue;
+        const GVertex a0=vertices[f.v0],b0=vertices[f.v1],c0=vertices[f.v2];
+        const GVertex a=f.v0==vId?dest:a0;
+        const GVertex b=f.v1==vId?dest:b0;
+        const GVertex c=f.v2==vId?dest:c0;
+        const float nq=TriangleQualityGpu(a,b,c);
+        newSum+=nq;
+        newMin=fminf(newMin,nq);
+        if(!(nq>=qAbs) || !SameHemisphere(a0,b0,c0,a,b,c) ||
+           !PatchOrientationSafe(patches,patchCount,f.patchId,a,b,c)) {valid=false;break;}
+        newGeom=fmaxf(newGeom,TriangleGeometryErrorGpu(patch,a,b,c));
+      }
+    }
+    if(!valid) continue;
+    if(newGeom>patch.MaxGeometryError) continue;
+    const float newMean=newSum/float(faceVisits);
+    if(newMin<fmaxf(qAbs,0.5f*oldMin)) continue;
+    const bool meanImproved=newMean>oldMean+1.0e-6f;
+    const bool worstImproved=newMin>oldMin*1.01f && newMean>=oldMean*0.99f;
+    const float score=newMean+0.1f*newMin;
+    if(!(meanImproved || worstImproved) || !(score>bestScore+1.0e-7f)) continue;
+    found=true; bestScore=score; bestMin=newMin; bestDest=dest;
+  }
+
+  if(!found) {if(qualityRejected) atomicAdd(qualityRejected,1u); return;}
+  const uint32_t slot=atomicAdd(candidateCount,1u);
+  if(slot>=candidateCapacity) return;
+  const float relativeGain=(bestMin-oldMin)/fmaxf(oldMin,1.0e-6f);
+  const float smoothPriority=(1.0f+fmaxf(0.0f,relativeGain))/fmaxf(oldMin,1.0e-6f);
+  candidates[slot]={vId,oldV.generation,bestDest.x,bestDest.y,bestDest.z,smoothPriority,0u,{0,0,0}};
+}
+
+__device__ inline unsigned long long SmoothWinnerKey(const SmoothCandidate &c) {
+  return (unsigned long long(__float_as_uint(c.priority))<<32) |
+         unsigned long long(0xffffffffu-c.vertexId);
+}
+
+__global__ void ClaimSmoothCandidates(const SmoothCandidate *candidates,const uint32_t *active,
+    const uint32_t *activeCountPtr,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    unsigned long long *vertexWinner) {
+  const uint32_t activeCount = *activeCountPtr;
+  const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
+  const SmoothCandidate c=candidates[active[slot]];
+  atomicMax(vertexWinner+c.vertexId,SmoothWinnerKey(c));
+}
+__global__ void ResolveSmoothCandidates(SmoothCandidate *candidates,const uint32_t *active,
+    const uint32_t *activeCountPtr,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    const unsigned long long *vertexWinner,uint8_t *vertexBlocked,
+    uint32_t *acceptedCount,uint32_t *roundAccepted) {
+  const uint32_t activeCount = *activeCountPtr;
+  const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
+  SmoothCandidate &c=candidates[active[slot]]; const auto key=SmoothWinnerKey(c);
+  if(vertexWinner[c.vertexId]!=key) return;
+  for(uint32_t i=offsets[c.vertexId];i<offsets[c.vertexId+1u];++i) {
+    const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+    const uint32_t n=e.v0==c.vertexId?e.v1:e.v0;
+    if(vertexWinner[n]>key) return;
+  }
+  c.accepted=1; vertexBlocked[c.vertexId]=1;
+  for(uint32_t i=offsets[c.vertexId];i<offsets[c.vertexId+1u];++i) {
+    const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+    const uint32_t n=e.v0==c.vertexId?e.v1:e.v0; vertexBlocked[n]=1;
+  }
+  atomicAdd(acceptedCount,1u); atomicAdd(roundAccepted,1u);
+}
+__global__ void CompactSmoothCandidates(SmoothCandidate *candidates,const uint32_t *active,
+    const uint32_t *activeCountPtr,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    const uint8_t *vertexBlocked,uint32_t *nextActive,uint32_t *nextCount) {
+  const uint32_t activeCount = *activeCountPtr;
+  const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
+  const uint32_t id=active[slot]; SmoothCandidate &c=candidates[id]; if(c.accepted!=0) return;
+  if(vertexBlocked[c.vertexId]) {c.accepted=2;return;}
+  nextActive[atomicAdd(nextCount,1u)]=id;
+}
+__global__ void ExecuteSmoothCandidates(GVertex *vertices,const SmoothCandidate *candidates,
+    uint32_t candidateCount,uint32_t *staleRejected) {
+  const uint32_t id=blockIdx.x*blockDim.x+threadIdx.x;
+  if(id>=candidateCount || candidates[id].accepted!=1) return;
+  const SmoothCandidate c=candidates[id]; GVertex &v=vertices[c.vertexId];
+  if(!v.alive || v.generation!=c.vertexGeneration) {atomicAdd(staleRejected,1u);return;}
+  v.x=c.x; v.y=c.y; v.z=c.z; ++v.generation;
 }
 
 __device__ inline int32_t OtherFace(const GEdge &e,uint32_t faceId) {
@@ -1500,6 +1980,16 @@ __global__ void ExecuteCollapseCandidates(GVertex *vertices,GEdge *edges,GFace *
      uint32_t(outKD)>=faceCount||uint32_t(outRD)>=faceCount||
      !faces[outKC].alive||!faces[outRC].alive||!faces[outKD].alive||!faces[outRD].alive){
     atomicAdd(staleRejected,1u);return;
+  }
+
+  // All stale/topology preconditions have passed.  Only now commit an optional
+  // CAD-projected midpoint destination so a rejected operation never leaves a
+  // partially moved vertex behind.
+  if(c.moveKeep) {
+    vertices[c.keep].x=c.destinationX;
+    vertices[c.keep].y=c.destinationY;
+    vertices[c.keep].z=c.destinationZ;
+    ++vertices[c.keep].generation;
   }
 
   // Update only the remove one-ring faces from the pass-snapshot CSR.
@@ -1607,9 +2097,17 @@ __global__ void ValidateEdgesKernel(const GVertex *vertices, uint32_t vertexCoun
 } // namespace
 
 template <class T>
-static void GrowManagedArray(T *&ptr, size_t preserveCount, size_t newCapacity,
+static T *AllocDevice(size_t count) {
+  T *ptr = nullptr;
+  CheckCuda(cudaMalloc(reinterpret_cast<void **>(&ptr), sizeof(T) * count),
+            "allocate device array");
+  return ptr;
+}
+
+template <class T>
+static void GrowDeviceArray(T *&ptr, size_t preserveCount, size_t newCapacity,
                              const char *where) {
-  T *next = AllocManaged<T>(newCapacity);
+  T *next = AllocDevice<T>(newCapacity);
   if (ptr && preserveCount > 0) {
     CheckCuda(cudaMemcpy(next, ptr, sizeof(T) * preserveCount, cudaMemcpyDefault), where);
   }
@@ -1617,7 +2115,56 @@ static void GrowManagedArray(T *&ptr, size_t preserveCount, size_t newCapacity,
   ptr = next;
 }
 
+struct HostControlBlock {
+  ValidationCounters Validation{};
+  uint32_t VertexCount{};
+  uint32_t EdgeCount{};
+  uint32_t FaceCount{};
+  uint32_t CandidateCount{};
+  uint32_t AcceptedCount{};
+  uint32_t RoundAccepted{};
+  uint32_t ActiveCount{};
+  uint32_t NextActiveCount{};
+  uint32_t StaleRejected{};
+  uint32_t CapacityRejected{};
+  uint32_t SemanticRejected{};
+  uint32_t QualityRejected{};
+  uint32_t CollapseTopologyRejected{};
+  uint32_t ProjectionApplied{};
+  uint32_t ProjectionFailed{};
+  uint32_t TriangleRejectCounters[4]{};
+  uint32_t TriangleEditableHistogram[4]{};
+  uint32_t SplitNewVertexCount{};
+  uint32_t SchedulerRounds{};
+  uint64_t ActiveItemsScanned{};
+};
+
+// Stream-ordered rounds keep candidate counts on the GPU until the sweep ends.
+__global__ void BeginSchedulerRound(HostControlBlock *control) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  control->RoundAccepted = 0;
+  control->NextActiveCount = 0;
+  control->ActiveItemsScanned += control->ActiveCount;
+}
+__global__ void EndSchedulerRound(HostControlBlock *control) {
+  if (blockIdx.x != 0 || threadIdx.x != 0 || control->ActiveCount == 0) return;
+  if (control->RoundAccepted == 0) {
+    control->ActiveCount = 0;
+    return;
+  }
+  control->ActiveCount = control->NextActiveCount;
+  ++control->SchedulerRounds;
+}
+
 struct GlobalSplitBackend::Impl {
+  HostControlBlock *mControl = nullptr;
+  HostControlBlock *mDeviceControl = nullptr;
+  bool mAdjacencyDirty = true;
+  std::vector<GPatch> mHostPatches;
+  std::vector<GVertex> mReadbackVertices;
+  std::vector<GEdge> mReadbackEdges;
+  std::vector<GFace> mReadbackFaces;
+  std::vector<float> mQualityScratch;
   GVertex *vertices = nullptr;
   GEdge *edges = nullptr;
   GFace *faces = nullptr;
@@ -1626,6 +2173,7 @@ struct GlobalSplitBackend::Impl {
   SplitCandidate *candidates = nullptr;
   FlipCandidate *flipCandidates = nullptr;
   CollapseCandidate *collapseCandidates = nullptr;
+  SmoothCandidate *smoothCandidates = nullptr;
   TriangleRefineCandidate *triangleCandidates = nullptr;
   unsigned long long *edgeHashKeys = nullptr;
   uint32_t *edgeOwner = nullptr;
@@ -1675,6 +2223,22 @@ struct GlobalSplitBackend::Impl {
   std::vector<PatchRecord> patches;
 
 
+  // Host policy reads a pinned snapshot; GPU atomics stay in device memory.
+  template <class T> T *DeviceControlAddress(T *hostPointer) const {
+    const auto offset = reinterpret_cast<const char *>(hostPointer) -
+                        reinterpret_cast<const char *>(mControl);
+    return reinterpret_cast<T *>(reinterpret_cast<char *>(mDeviceControl) + offset);
+  }
+  void UploadControl() {
+    CheckCuda(cudaMemcpyAsync(mDeviceControl, mControl, sizeof(HostControlBlock),
+                              cudaMemcpyHostToDevice), "upload control state");
+  }
+  void DownloadControl(const char *where) {
+    CheckCuda(cudaMemcpyAsync(mControl, mDeviceControl, sizeof(HostControlBlock),
+                              cudaMemcpyDeviceToHost), "download control state");
+    CheckCuda(cudaStreamSynchronize(nullptr), where);
+  }
+
   void EnsureAppendCapacity(uint32_t addVertices, uint32_t addEdges, uint32_t addFaces) {
     const uint32_t requiredV = *vertexCount + addVertices;
     const uint32_t requiredE = *edgeCount + addEdges;
@@ -1682,6 +2246,7 @@ struct GlobalSplitBackend::Impl {
     if (requiredV <= vertexCapacity && requiredE <= edgeCapacity && requiredF <= faceCapacity) return;
 
     CheckCuda(cudaDeviceSynchronize(), "EnsureAppendCapacity synchronize");
+    mAdjacencyDirty = true;
     const uint32_t oldV = vertexCapacity, oldE = edgeCapacity, oldF = faceCapacity;
     uint32_t newV = oldV, newE = oldE, newF = oldF;
     while (newV < requiredV) newV = std::max(requiredV, newV * 2u);
@@ -1690,56 +2255,58 @@ struct GlobalSplitBackend::Impl {
     const uint32_t preserveCandidates = std::min(*candidateCount, candidateCapacity);
 
     if (newV != oldV) {
-      GrowManagedArray(vertices, *vertexCount, newV, "grow vertices");
-      GrowManagedArray(vertexOwner, 0, newV, "grow vertex owners");
-      GrowManagedArray(splitVertexWinner, 0, newV, "grow vertex winners");
-      GrowManagedArray(vertexBlocked, 0, newV, "grow vertex blocked");
-      GrowManagedArray(vertexEdgeCounts, 0, size_t(newV)+1u, "grow vertex edge counts");
-      GrowManagedArray(vertexEdgeOffsets, 0, size_t(newV)+1u, "grow vertex edge offsets");
-      GrowManagedArray(vertexEdgeCursor, 0, newV, "grow vertex edge cursor");
+      GrowDeviceArray(vertices, *vertexCount, newV, "grow vertices");
+      GrowDeviceArray(vertexOwner, 0, newV, "grow vertex owners");
+      GrowDeviceArray(splitVertexWinner, 0, newV, "grow vertex winners");
+      GrowDeviceArray(vertexBlocked, 0, newV, "grow vertex blocked");
+      GrowDeviceArray(vertexEdgeCounts, 0, size_t(newV)+1u, "grow vertex edge counts");
+      GrowDeviceArray(vertexEdgeOffsets, 0, size_t(newV)+1u, "grow vertex edge offsets");
+      GrowDeviceArray(vertexEdgeCursor, 0, newV, "grow vertex edge cursor");
       vertexCapacity = newV;
     }
     if (newE != oldE) {
-      GrowManagedArray(edges, *edgeCount, newE, "grow edges");
-      GrowManagedArray(edgeOwner, 0, newE, "grow edge owners");
-      GrowManagedArray(splitEdgeWinner, 0, newE, "grow edge winners");
-      GrowManagedArray(edgeBlocked, 0, newE, "grow edge blocked");
-      GrowManagedArray(candidates, preserveCandidates, newE, "grow split candidates");
-      GrowManagedArray(flipCandidates, preserveCandidates, newE, "grow flip candidates");
-      GrowManagedArray(collapseCandidates, preserveCandidates, newE, "grow collapse candidates");
-      GrowManagedArray(triangleCandidates, preserveCandidates, newE, "grow triangle candidates");
-      GrowManagedArray(activeQueueA, 0, newE, "grow active queue A");
-      GrowManagedArray(activeQueueB, 0, newE, "grow active queue B");
-      GrowManagedArray(vertexEdgeIds, 0, size_t(newE)*2u, "grow vertex edge ids");
+      GrowDeviceArray(edges, *edgeCount, newE, "grow edges");
+      GrowDeviceArray(edgeOwner, 0, newE, "grow edge owners");
+      GrowDeviceArray(splitEdgeWinner, 0, newE, "grow edge winners");
+      GrowDeviceArray(edgeBlocked, 0, newE, "grow edge blocked");
+      GrowDeviceArray(candidates, preserveCandidates, newE, "grow split candidates");
+      GrowDeviceArray(flipCandidates, preserveCandidates, newE, "grow flip candidates");
+      GrowDeviceArray(collapseCandidates, preserveCandidates, newE, "grow collapse candidates");
+      GrowDeviceArray(smoothCandidates, preserveCandidates, newE, "grow smooth candidates");
+      GrowDeviceArray(triangleCandidates, preserveCandidates, newE, "grow triangle candidates");
+      GrowDeviceArray(activeQueueA, 0, newE, "grow active queue A");
+      GrowDeviceArray(activeQueueB, 0, newE, "grow active queue B");
+      GrowDeviceArray(vertexEdgeIds, 0, size_t(newE)*2u, "grow vertex edge ids");
       candidateCapacity = newE;
       edgeCapacity = newE;
 
       uint32_t newHashCapacity = 1u;
       while (newHashCapacity < newE * 2u) newHashCapacity <<= 1u;
       if (newHashCapacity != edgeHashCapacity) {
-        GrowManagedArray(edgeHashKeys, 0, newHashCapacity, "grow edge hash");
+        GrowDeviceArray(edgeHashKeys, 0, newHashCapacity, "grow edge hash");
         edgeHashCapacity = newHashCapacity;
       }
     }
     if (newF != oldF) {
-      GrowManagedArray(faces, *faceCount, newF, "grow faces");
-      GrowManagedArray(faceOwner, 0, newF, "grow face owners");
-      GrowManagedArray(splitFaceWinner, 0, newF, "grow face winners");
-      GrowManagedArray(faceBlocked, 0, newF, "grow face blocked");
+      GrowDeviceArray(faces, *faceCount, newF, "grow faces");
+      GrowDeviceArray(faceOwner, 0, newF, "grow face owners");
+      GrowDeviceArray(splitFaceWinner, 0, newF, "grow face winners");
+      GrowDeviceArray(faceBlocked, 0, newF, "grow face blocked");
       faceCapacity = newF;
     }
   }
 
   void BuildVertexEdgeAdjacency() {
+    if (!mAdjacencyDirty) return;
     const uint32_t nv=*vertexCount, ne=*edgeCount;
     if(nv==0) return;
-    CheckCuda(cudaMemset(vertexEdgeCounts,0,sizeof(uint32_t)*(size_t(nv)+1u)),
+    CheckCuda(cudaMemsetAsync(vertexEdgeCounts,0,sizeof(uint32_t)*(size_t(nv)+1u)),
               "reset vertex edge counts");
     constexpr uint32_t threads=256;
     if(ne>0) {
       const uint32_t blocks=(ne+threads-1u)/threads;
       CountVertexEdges<<<blocks,threads>>>(edges,ne,nv,vertexEdgeCounts);
-      CheckCuda(cudaDeviceSynchronize(),"CountVertexEdges");
+      CheckCuda(cudaGetLastError(),"CountVertexEdges launch");
     }
     size_t requiredBytes=0;
     CheckCuda(cub::DeviceScan::ExclusiveSum(nullptr,requiredBytes,
@@ -1751,16 +2318,20 @@ struct GlobalSplitBackend::Impl {
     }
     CheckCuda(cub::DeviceScan::ExclusiveSum(adjacencyScanTemp,adjacencyScanTempBytes,
               vertexEdgeCounts,vertexEdgeOffsets,nv+1u),"scan vertex edge offsets");
-    CheckCuda(cudaDeviceSynchronize(),"scan vertex edge offsets sync");
-    if(vertexEdgeOffsets[nv] > size_t(edgeCapacity)*2u)
+    CheckCuda(cudaGetLastError(),"scan vertex edge offsets launch");
+    uint32_t adjacencyEntries = 0;
+    CheckCuda(cudaMemcpy(&adjacencyEntries, vertexEdgeOffsets+nv, sizeof(uint32_t),
+                         cudaMemcpyDeviceToHost), "read adjacency size");
+    if(adjacencyEntries > size_t(edgeCapacity)*2u)
       throw std::runtime_error("vertex edge adjacency capacity exhausted");
-    CheckCuda(cudaMemset(vertexEdgeCursor,0,sizeof(uint32_t)*nv),"reset vertex edge cursor");
+    CheckCuda(cudaMemsetAsync(vertexEdgeCursor,0,sizeof(uint32_t)*nv),"reset vertex edge cursor");
     if(ne>0) {
       const uint32_t blocks=(ne+threads-1u)/threads;
       FillVertexEdges<<<blocks,threads>>>(edges,ne,nv,vertexEdgeOffsets,
                                           vertexEdgeCursor,vertexEdgeIds);
-      CheckCuda(cudaDeviceSynchronize(),"FillVertexEdges");
+      CheckCuda(cudaGetLastError(), "FillVertexEdges launch");
     }
+    mAdjacencyDirty = false;
   }
 
   ~Impl() {
@@ -1771,6 +2342,7 @@ struct GlobalSplitBackend::Impl {
     cudaFree(candidates);
     cudaFree(flipCandidates);
     cudaFree(collapseCandidates);
+    cudaFree(smoothCandidates);
     cudaFree(triangleCandidates);
     cudaFree(edgeHashKeys);
     cudaFree(edgeOwner);
@@ -1784,25 +2356,10 @@ struct GlobalSplitBackend::Impl {
     cudaFree(vertexBlocked);
     cudaFree(activeQueueA);
     cudaFree(activeQueueB);
-    cudaFree(validation);
-    cudaFree(vertexCount);
-    cudaFree(edgeCount);
-    cudaFree(faceCount);
-    cudaFree(candidateCount);
-    cudaFree(acceptedCount);
-    cudaFree(roundAccepted);
-    cudaFree(activeCount);
-    cudaFree(nextActiveCount);
-    cudaFree(staleRejected);
-    cudaFree(capacityRejected);
-    cudaFree(semanticRejected);
-    cudaFree(qualityRejected);
-    cudaFree(collapseTopologyRejected);
-    cudaFree(projectionApplied);
-    cudaFree(projectionFailed);
-    cudaFree(triangleRejectCounters);
-    cudaFree(triangleEditableHistogram);
-    cudaFree(splitNewVertexCount);
+    cudaFree(mDeviceControl);
+    cudaFreeHost(mControl);
+
+
     cudaFree(vertexEdgeCounts);
     cudaFree(vertexEdgeOffsets);
     cudaFree(vertexEdgeCursor);
@@ -1812,7 +2369,7 @@ struct GlobalSplitBackend::Impl {
 
   size_t MemoryBytes() const {
     return size_t(vertexCapacity) * sizeof(GVertex) +
-           size_t(edgeCapacity) * (sizeof(GEdge) + sizeof(SplitCandidate) + sizeof(FlipCandidate) + sizeof(CollapseCandidate) + sizeof(TriangleRefineCandidate) + 3 * sizeof(uint32_t) + sizeof(uint8_t)) +
+           size_t(edgeCapacity) * (sizeof(GEdge) + sizeof(SplitCandidate) + sizeof(FlipCandidate) + sizeof(CollapseCandidate) + sizeof(SmoothCandidate) + sizeof(TriangleRefineCandidate) + 3 * sizeof(uint32_t) + sizeof(uint8_t)) +
            size_t(faceCapacity) * (sizeof(GFace) + sizeof(uint32_t) + sizeof(uint8_t)) +
            size_t(vertexCapacity) * (sizeof(uint32_t) + sizeof(uint8_t) + sizeof(unsigned long long)) +
            size_t(edgeCapacity) * sizeof(unsigned long long) +
@@ -1851,50 +2408,54 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
     mImpl->fallbackTargetLength = std::max(1e-6f, src.bboxDiagonal() * 0.01f);
     mImpl->patches = src.patches;
 
-    mImpl->vertices = AllocManaged<GVertex>(mImpl->vertexCapacity);
-    mImpl->edges = AllocManaged<GEdge>(mImpl->edgeCapacity);
-    mImpl->faces = AllocManaged<GFace>(mImpl->faceCapacity);
+    mImpl->vertices = AllocDevice<GVertex>(mImpl->vertexCapacity);
+    mImpl->edges = AllocDevice<GEdge>(mImpl->edgeCapacity);
+    mImpl->faces = AllocDevice<GFace>(mImpl->faceCapacity);
     mImpl->gpuPatchCount = uint32_t(src.patches.size());
-    if (mImpl->gpuPatchCount > 0) mImpl->gpuPatches = AllocManaged<GPatch>(mImpl->gpuPatchCount);
-    mImpl->candidates = AllocManaged<SplitCandidate>(mImpl->candidateCapacity);
-    mImpl->flipCandidates = AllocManaged<FlipCandidate>(mImpl->candidateCapacity);
-    mImpl->collapseCandidates = AllocManaged<CollapseCandidate>(mImpl->candidateCapacity);
-    mImpl->triangleCandidates = AllocManaged<TriangleRefineCandidate>(mImpl->candidateCapacity);
-    mImpl->edgeHashKeys = AllocManaged<unsigned long long>(mImpl->edgeHashCapacity);
-    mImpl->edgeOwner = AllocManaged<uint32_t>(mImpl->edgeCapacity);
-    mImpl->faceOwner = AllocManaged<uint32_t>(mImpl->faceCapacity);
-    mImpl->vertexOwner = AllocManaged<uint32_t>(mImpl->vertexCapacity);
-    mImpl->splitEdgeWinner = AllocManaged<unsigned long long>(mImpl->edgeCapacity);
-    mImpl->splitFaceWinner = AllocManaged<unsigned long long>(mImpl->faceCapacity);
-    mImpl->splitVertexWinner = AllocManaged<unsigned long long>(mImpl->vertexCapacity);
-    mImpl->edgeBlocked = AllocManaged<uint8_t>(mImpl->edgeCapacity);
-    mImpl->faceBlocked = AllocManaged<uint8_t>(mImpl->faceCapacity);
-    mImpl->vertexBlocked = AllocManaged<uint8_t>(mImpl->vertexCapacity);
-    mImpl->activeQueueA = AllocManaged<uint32_t>(mImpl->candidateCapacity);
-    mImpl->activeQueueB = AllocManaged<uint32_t>(mImpl->candidateCapacity);
-    mImpl->validation = AllocManaged<ValidationCounters>(1);
-    mImpl->vertexCount = AllocManaged<uint32_t>(1);
-    mImpl->edgeCount = AllocManaged<uint32_t>(1);
-    mImpl->faceCount = AllocManaged<uint32_t>(1);
-    mImpl->candidateCount = AllocManaged<uint32_t>(1);
-    mImpl->acceptedCount = AllocManaged<uint32_t>(1);
-    mImpl->roundAccepted = AllocManaged<uint32_t>(1);
-    mImpl->activeCount = AllocManaged<uint32_t>(1);
-    mImpl->nextActiveCount = AllocManaged<uint32_t>(1);
-    mImpl->staleRejected = AllocManaged<uint32_t>(1);
-    mImpl->capacityRejected = AllocManaged<uint32_t>(1);
-    mImpl->semanticRejected = AllocManaged<uint32_t>(1);
-    mImpl->qualityRejected = AllocManaged<uint32_t>(1);
-    mImpl->collapseTopologyRejected = AllocManaged<uint32_t>(1);
-    mImpl->projectionApplied = AllocManaged<uint32_t>(1);
-    mImpl->projectionFailed = AllocManaged<uint32_t>(1);
-    mImpl->triangleRejectCounters = AllocManaged<uint32_t>(4);
-    mImpl->triangleEditableHistogram = AllocManaged<uint32_t>(4);
-    mImpl->splitNewVertexCount = AllocManaged<uint32_t>(1);
-    mImpl->vertexEdgeCounts = AllocManaged<uint32_t>(size_t(mImpl->vertexCapacity)+1u);
-    mImpl->vertexEdgeOffsets = AllocManaged<uint32_t>(size_t(mImpl->vertexCapacity)+1u);
-    mImpl->vertexEdgeCursor = AllocManaged<uint32_t>(mImpl->vertexCapacity);
-    mImpl->vertexEdgeIds = AllocManaged<uint32_t>(size_t(mImpl->edgeCapacity)*2u);
+    if (mImpl->gpuPatchCount > 0) mImpl->gpuPatches = AllocDevice<GPatch>(mImpl->gpuPatchCount);
+    mImpl->candidates = AllocDevice<SplitCandidate>(mImpl->candidateCapacity);
+    mImpl->flipCandidates = AllocDevice<FlipCandidate>(mImpl->candidateCapacity);
+    mImpl->collapseCandidates = AllocDevice<CollapseCandidate>(mImpl->candidateCapacity);
+    mImpl->smoothCandidates = AllocDevice<SmoothCandidate>(mImpl->candidateCapacity);
+    mImpl->triangleCandidates = AllocDevice<TriangleRefineCandidate>(mImpl->candidateCapacity);
+    mImpl->edgeHashKeys = AllocDevice<unsigned long long>(mImpl->edgeHashCapacity);
+    mImpl->edgeOwner = AllocDevice<uint32_t>(mImpl->edgeCapacity);
+    mImpl->faceOwner = AllocDevice<uint32_t>(mImpl->faceCapacity);
+    mImpl->vertexOwner = AllocDevice<uint32_t>(mImpl->vertexCapacity);
+    mImpl->splitEdgeWinner = AllocDevice<unsigned long long>(mImpl->edgeCapacity);
+    mImpl->splitFaceWinner = AllocDevice<unsigned long long>(mImpl->faceCapacity);
+    mImpl->splitVertexWinner = AllocDevice<unsigned long long>(mImpl->vertexCapacity);
+    mImpl->edgeBlocked = AllocDevice<uint8_t>(mImpl->edgeCapacity);
+    mImpl->faceBlocked = AllocDevice<uint8_t>(mImpl->faceCapacity);
+    mImpl->vertexBlocked = AllocDevice<uint8_t>(mImpl->vertexCapacity);
+    mImpl->activeQueueA = AllocDevice<uint32_t>(mImpl->candidateCapacity);
+    mImpl->activeQueueB = AllocDevice<uint32_t>(mImpl->candidateCapacity);
+    CheckCuda(cudaMallocHost(reinterpret_cast<void **>(&mImpl->mControl), sizeof(HostControlBlock)), "allocate host control mirror");
+    mImpl->mDeviceControl = AllocDevice<HostControlBlock>(1);
+    *mImpl->mControl = {};
+    mImpl->validation = &mImpl->mControl->Validation;
+    mImpl->vertexCount = &mImpl->mControl->VertexCount;
+    mImpl->edgeCount = &mImpl->mControl->EdgeCount;
+    mImpl->faceCount = &mImpl->mControl->FaceCount;
+    mImpl->candidateCount = &mImpl->mControl->CandidateCount;
+    mImpl->acceptedCount = &mImpl->mControl->AcceptedCount;
+    mImpl->roundAccepted = &mImpl->mControl->RoundAccepted;
+    mImpl->activeCount = &mImpl->mControl->ActiveCount;
+    mImpl->nextActiveCount = &mImpl->mControl->NextActiveCount;
+    mImpl->staleRejected = &mImpl->mControl->StaleRejected;
+    mImpl->capacityRejected = &mImpl->mControl->CapacityRejected;
+    mImpl->semanticRejected = &mImpl->mControl->SemanticRejected;
+    mImpl->qualityRejected = &mImpl->mControl->QualityRejected;
+    mImpl->collapseTopologyRejected = &mImpl->mControl->CollapseTopologyRejected;
+    mImpl->projectionApplied = &mImpl->mControl->ProjectionApplied;
+    mImpl->projectionFailed = &mImpl->mControl->ProjectionFailed;
+    mImpl->triangleRejectCounters = mImpl->mControl->TriangleRejectCounters;
+    mImpl->triangleEditableHistogram = mImpl->mControl->TriangleEditableHistogram;
+    mImpl->splitNewVertexCount = &mImpl->mControl->SplitNewVertexCount;
+    mImpl->vertexEdgeCounts = AllocDevice<uint32_t>(size_t(mImpl->vertexCapacity)+1u);
+    mImpl->vertexEdgeOffsets = AllocDevice<uint32_t>(size_t(mImpl->vertexCapacity)+1u);
+    mImpl->vertexEdgeCursor = AllocDevice<uint32_t>(mImpl->vertexCapacity);
+    mImpl->vertexEdgeIds = AllocDevice<uint32_t>(size_t(mImpl->edgeCapacity)*2u);
 
     *mImpl->vertexCount = nv;
     *mImpl->edgeCount = ne;
@@ -1914,6 +2475,10 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
     for (int i = 0; i < 4; ++i) { mImpl->triangleRejectCounters[i] = 0; mImpl->triangleEditableHistogram[i] = 0; }
     *mImpl->splitNewVertexCount = 0;
 
+    std::vector<GVertex> hostVertices(nv);
+    std::vector<GEdge> hostEdges(ne);
+    std::vector<GFace> hostFaces(nf);
+    mImpl->mHostPatches.resize(mImpl->gpuPatchCount);
     std::vector<float> patchOrientation(mImpl->gpuPatchCount, 0.0f);
     for (uint32_t f = 0; f < uint32_t(src.faceCount()); ++f) {
       if (!src.faceAlive[f]) continue;
@@ -1942,7 +2507,7 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
       const float n=std::sqrt(ax*ax+ay*ay+az*az);
       const float inv=n>1e-20f ? 1.0f/n : 1.0f;
       const float orientationSign = patchOrientation[i] < 0.0f ? -1.0f : 1.0f;
-      mImpl->gpuPatches[i] = {p.origin.x,p.origin.y,p.origin.z,
+      mImpl->mHostPatches[i] = {p.origin.x,p.origin.y,p.origin.z,
                               n>1e-20f?ax*inv:0.0f,
                               n>1e-20f?ay*inv:0.0f,
                               n>1e-20f?az*inv:1.0f,
@@ -1953,7 +2518,7 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
       const float h = v < src.targetLength.size() && src.targetLength[v] > 0
                           ? src.targetLength[v]
                           : mImpl->fallbackTargetLength;
-      mImpl->vertices[v] = {src.px[v], src.py[v], src.pz[v], h,
+      hostVertices[v] = {src.px[v], src.py[v], src.pz[v], h,
                             v < src.vertexPatchId.size() ? src.vertexPatchId[v] : 0u,
                             1u,
                             uint8_t(v < src.vertexConstraint.size() ? src.vertexConstraint[v] : 0u),
@@ -1964,7 +2529,7 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
     edgeMap.reserve(src.edges.size() * 2);
     for (uint32_t e = 0; e < ne; ++e) {
       const EdgeRec &se = src.edges[e];
-      mImpl->edges[e] = {se.v0, se.v1, se.face0, se.face1, 1u, se.flags, 1u, 0u};
+      hostEdges[e] = {se.v0, se.v1, se.face0, se.face1, 1u, se.flags, 1u, 0u};
       edgeMap.emplace(EdgeKey(se.v0, se.v1), e);
     }
 
@@ -1975,17 +2540,56 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
       const auto it2 = edgeMap.find(EdgeKey(c, a));
       if (it0 == edgeMap.end() || it1 == edgeMap.end() || it2 == edgeMap.end())
         throw std::runtime_error("face edge lookup failed");
-      mImpl->faces[f] = {a, b, c, it0->second, it1->second, it2->second,
+      hostFaces[f] = {a, b, c, it0->second, it1->second, it2->second,
                          f < src.facePatchId.size() ? src.facePatchId[f] : 0u,
                          1u,
                          uint8_t(f < src.faceAlive.size() ? src.faceAlive[f] : 1u),
                          {0, 0, 0}};
     }
 
+    CheckCuda(cudaMemcpy(mImpl->vertices, hostVertices.data(), sizeof(GVertex)*nv,
+                         cudaMemcpyHostToDevice), "upload vertices");
+    CheckCuda(cudaMemcpy(mImpl->edges, hostEdges.data(), sizeof(GEdge)*ne,
+                         cudaMemcpyHostToDevice), "upload edges");
+    CheckCuda(cudaMemcpy(mImpl->faces, hostFaces.data(), sizeof(GFace)*nf,
+                         cudaMemcpyHostToDevice), "upload faces");
+    if (mImpl->gpuPatchCount > 0)
+      CheckCuda(cudaMemcpy(mImpl->gpuPatches, mImpl->mHostPatches.data(),
+                           sizeof(GPatch) * mImpl->gpuPatchCount, cudaMemcpyHostToDevice),
+                "upload analytic patches");
+    mImpl->UploadControl();
     CheckCuda(cudaDeviceSynchronize(), "Initialize synchronize");
     return true;
   } catch (const std::exception &e) {
     if (error) *error = e.what();
+    return false;
+  }
+}
+
+bool GlobalSplitBackend::configure(const RemeshConfig &config, std::string *error) {
+  try {
+    if (!mImpl || !mImpl->vertices) throw std::runtime_error("backend not initialized");
+    if (!std::isfinite(config.maxGeometryError) || !(config.maxGeometryError > 0) ||
+        !std::isfinite(config.normalDegrees) || !(config.normalDegrees > 0) ||
+        !(config.normalDegrees < 90) || !std::isfinite(config.splitRatio) ||
+        !(config.splitRatio > 1) || !std::isfinite(config.minQuality) ||
+        !(config.minQuality > 0) || !(config.minQuality < 1))
+      throw std::runtime_error("invalid global remesh constraints");
+    CheckCuda(cudaDeviceSynchronize(), "configure constraints");
+    for (uint32_t i=0; i<mImpl->gpuPatchCount; ++i) {
+      GPatch &p=mImpl->mHostPatches[i];
+      p.MaxGeometryError=config.maxGeometryError;
+      p.NormalCosThreshold=std::cos(config.normalDegrees*0.017453292519943295f);
+      p.SplitRatio=config.splitRatio;
+      p.MinQuality=config.minQuality;
+    }
+    if (mImpl->gpuPatchCount > 0)
+      CheckCuda(cudaMemcpy(mImpl->gpuPatches, mImpl->mHostPatches.data(),
+                           sizeof(GPatch) * mImpl->gpuPatchCount, cudaMemcpyHostToDevice),
+                "upload configured constraints");
+    return true;
+  } catch (const std::exception &e) {
+    if (error) *error=e.what();
     return false;
   }
 }
@@ -2013,12 +2617,13 @@ bool GlobalSplitBackend::RunTriangleRefinePass(float refineRatio,
     constexpr uint32_t threads = 256;
     const uint32_t faceBlocks = (faceCount + threads - 1u) / threads;
     auto mark = std::chrono::steady_clock::now();
+    mImpl->UploadControl();
     GenerateTriangleRefineCandidates<<<faceBlocks, threads>>>(
         mImpl->vertices, mImpl->edges, mImpl->faces, faceCount, refineRatio,
         mImpl->gpuPatches, mImpl->gpuPatchCount, mImpl->triangleCandidates,
-        mImpl->candidateCapacity, mImpl->candidateCount,
-        mImpl->semanticRejected, mImpl->qualityRejected, mImpl->triangleRejectCounters, mImpl->triangleEditableHistogram);
-    CheckCuda(cudaDeviceSynchronize(), "GenerateTriangleRefineCandidates");
+        mImpl->candidateCapacity, mImpl->DeviceControlAddress(mImpl->candidateCount),
+        mImpl->DeviceControlAddress(mImpl->semanticRejected), mImpl->DeviceControlAddress(mImpl->qualityRejected), mImpl->DeviceControlAddress(mImpl->triangleRejectCounters), mImpl->DeviceControlAddress(mImpl->triangleEditableHistogram));
+    mImpl->DownloadControl("GenerateTriangleRefineCandidates");
     report.candidateMs = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - mark).count();
 
@@ -2040,76 +2645,79 @@ bool GlobalSplitBackend::RunTriangleRefinePass(float refineRatio,
 
     mark = std::chrono::steady_clock::now();
     const uint32_t candidateBlocks = (candidates + threads - 1u) / threads;
-    CheckCuda(cudaMemset(mImpl->edgeBlocked, 0, sizeof(uint8_t) * mImpl->edgeCapacity),
+    CheckCuda(cudaMemsetAsync(mImpl->edgeBlocked, 0, sizeof(uint8_t) * mImpl->edgeCapacity),
               "reset triangle blocked edges");
-    CheckCuda(cudaMemset(mImpl->faceBlocked, 0, sizeof(uint8_t) * mImpl->faceCapacity),
+    CheckCuda(cudaMemsetAsync(mImpl->faceBlocked, 0, sizeof(uint8_t) * mImpl->faceCapacity),
               "reset triangle blocked faces");
-    CheckCuda(cudaMemset(mImpl->vertexBlocked, 0, sizeof(uint8_t) * mImpl->vertexCapacity),
+    CheckCuda(cudaMemsetAsync(mImpl->vertexBlocked, 0, sizeof(uint8_t) * mImpl->vertexCapacity),
               "reset triangle blocked vertices");
     InitActiveQueue<<<candidateBlocks, threads>>>(mImpl->activeQueueA, candidates);
-    CheckCuda(cudaDeviceSynchronize(), "InitTriangleActiveQueue");
+    CheckCuda(cudaGetLastError(), "InitTriangleActiveQueue launch");
     *mImpl->activeCount = candidates;
     uint32_t *active = mImpl->activeQueueA;
     uint32_t *next = mImpl->activeQueueB;
     constexpr int kMaxClaimRounds = 4;
-    int claimRounds = 0;
-    for (; claimRounds < kMaxClaimRounds && *mImpl->activeCount > 0; ++claimRounds) {
-      const uint32_t activeNow = *mImpl->activeCount;
-      report.activeItemsScanned += activeNow;
-      const uint32_t activeBlocks = (activeNow + threads - 1u) / threads;
-      CheckCuda(cudaMemset(mImpl->splitEdgeWinner, 0,
+    mImpl->mControl->SchedulerRounds = 0;
+    mImpl->mControl->ActiveItemsScanned = 0;
+    mImpl->UploadControl();
+    for (int round = 0; round < kMaxClaimRounds; ++round) {
+      BeginSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "begin scheduler round");
+      CheckCuda(cudaMemsetAsync(mImpl->splitEdgeWinner, 0,
                            sizeof(unsigned long long) * mImpl->edgeCapacity),
                 "reset triangle edge winners");
-      CheckCuda(cudaMemset(mImpl->splitFaceWinner, 0,
+      CheckCuda(cudaMemsetAsync(mImpl->splitFaceWinner, 0,
                            sizeof(unsigned long long) * mImpl->faceCapacity),
                 "reset triangle face winners");
-      CheckCuda(cudaMemset(mImpl->splitVertexWinner, 0,
+      CheckCuda(cudaMemsetAsync(mImpl->splitVertexWinner, 0,
                            sizeof(unsigned long long) * mImpl->vertexCapacity),
                 "reset triangle vertex winners");
-      *mImpl->roundAccepted = 0;
-      ClaimTriangleCandidates<<<activeBlocks, threads>>>(
-          mImpl->triangleCandidates, mImpl->faces, active, activeNow,
+      ClaimTriangleCandidates<<<candidateBlocks, threads>>>(
+          mImpl->triangleCandidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
           mImpl->splitEdgeWinner, mImpl->splitFaceWinner, mImpl->splitVertexWinner);
-      CheckCuda(cudaDeviceSynchronize(), "ClaimTriangleCandidates");
-      ResolveTriangleCandidates<<<activeBlocks, threads>>>(
-          mImpl->triangleCandidates, mImpl->faces, active, activeNow,
+      CheckCuda(cudaGetLastError(), "ClaimTriangleCandidates launch");
+      ResolveTriangleCandidates<<<candidateBlocks, threads>>>(
+          mImpl->triangleCandidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
           mImpl->splitEdgeWinner, mImpl->splitFaceWinner, mImpl->splitVertexWinner,
           mImpl->edgeBlocked, mImpl->faceBlocked, mImpl->vertexBlocked,
-          mImpl->acceptedCount, mImpl->roundAccepted);
-      CheckCuda(cudaDeviceSynchronize(), "ResolveTriangleCandidates");
-      if (*mImpl->roundAccepted == 0) break;
-      *mImpl->nextActiveCount = 0;
-      CompactTriangleCandidates<<<activeBlocks, threads>>>(
-          mImpl->triangleCandidates, mImpl->faces, active, activeNow,
+          mImpl->DeviceControlAddress(mImpl->acceptedCount), mImpl->DeviceControlAddress(mImpl->roundAccepted));
+      CheckCuda(cudaGetLastError(), "ResolveTriangleCandidates launch");
+      CompactTriangleCandidates<<<candidateBlocks, threads>>>(
+          mImpl->triangleCandidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
           mImpl->edgeBlocked, mImpl->faceBlocked, mImpl->vertexBlocked,
-          next, mImpl->nextActiveCount);
-      CheckCuda(cudaDeviceSynchronize(), "CompactTriangleCandidates");
-      *mImpl->activeCount = *mImpl->nextActiveCount;
+          next, mImpl->DeviceControlAddress(mImpl->nextActiveCount));
+      CheckCuda(cudaGetLastError(), "CompactTriangleCandidates launch");
+      EndSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "end scheduler round");
       std::swap(active, next);
-    }
-    report.schedulerRounds = uint32_t(claimRounds);
+        }
+    mImpl->DownloadControl("complete scheduler sweeps");
+    report.schedulerRounds = mImpl->mControl->SchedulerRounds;
+    report.activeItemsScanned = mImpl->mControl->ActiveItemsScanned;
     report.claimMs = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - mark).count();
 
     const uint32_t accepted = *mImpl->acceptedCount;
     *mImpl->splitNewVertexCount=0;
-    SumAcceptedTriangleCost<<<candidateBlocks,threads>>>(mImpl->triangleCandidates,candidates,mImpl->splitNewVertexCount);
-    CheckCuda(cudaDeviceSynchronize(),"SumAcceptedTriangleCost");
+    mImpl->UploadControl();
+    SumAcceptedTriangleCost<<<candidateBlocks,threads>>>(mImpl->triangleCandidates,candidates,mImpl->DeviceControlAddress(mImpl->splitNewVertexCount));
+    mImpl->DownloadControl("SumAcceptedTriangleCost");
     const uint32_t newVertices=*mImpl->splitNewVertexCount;
     mImpl->EnsureAppendCapacity(newVertices, newVertices * 3u, newVertices * 2u);
     mark = std::chrono::steady_clock::now();
     ExecuteTriangleRefineCandidates<<<candidateBlocks, threads>>>(
         mImpl->vertices, mImpl->edges, mImpl->faces, mImpl->triangleCandidates,
-        candidates, mImpl->vertexCount, mImpl->edgeCount, mImpl->faceCount,
-        mImpl->staleRejected, mImpl->gpuPatches, mImpl->gpuPatchCount,
-        mImpl->projectionApplied, mImpl->projectionFailed);
-    CheckCuda(cudaDeviceSynchronize(), "ExecuteTriangleRefineCandidates");
+        candidates, mImpl->DeviceControlAddress(mImpl->vertexCount), mImpl->DeviceControlAddress(mImpl->edgeCount), mImpl->DeviceControlAddress(mImpl->faceCount),
+        mImpl->DeviceControlAddress(mImpl->staleRejected), mImpl->gpuPatches, mImpl->gpuPatchCount,
+        mImpl->DeviceControlAddress(mImpl->projectionApplied), mImpl->DeviceControlAddress(mImpl->projectionFailed));
+    mImpl->DownloadControl("ExecuteTriangleRefineCandidates");
     report.executeMs = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - mark).count();
     report.staleRejected = *mImpl->staleRejected;
     report.acceptedCount = accepted >= report.staleRejected ? accepted - report.staleRejected : 0;
     report.projectionApplied = *mImpl->projectionApplied;
     report.projectionFailed = *mImpl->projectionFailed;
+    if (report.acceptedCount > 0) mImpl->mAdjacencyDirty = true;
     report.globalMemoryBytes = mImpl->MemoryBytes();
     report.dynamicSharedMemoryBytes = 0;
     report.totalMs = std::chrono::duration<double, std::milli>(
@@ -2144,12 +2752,13 @@ bool GlobalSplitBackend::RunSplitPass(float splitRatio, GlobalSplitReport &repor
     const uint32_t edgeBlocks = (edgeCount + threads - 1u) / threads;
 
     auto mark = std::chrono::steady_clock::now();
+    mImpl->UploadControl();
     GenerateSplitCandidates<<<edgeBlocks, threads>>>(
         mImpl->vertices, mImpl->edges, mImpl->faces, edgeCount, faceCount,
         splitRatio, maxRatio, mImpl->gpuPatches, mImpl->gpuPatchCount,
         mImpl->candidates, mImpl->candidateCapacity,
-        mImpl->candidateCount, mImpl->semanticRejected, mImpl->capacityRejected);
-    CheckCuda(cudaDeviceSynchronize(), "GenerateSplitCandidates");
+        mImpl->DeviceControlAddress(mImpl->candidateCount), mImpl->DeviceControlAddress(mImpl->semanticRejected), mImpl->DeviceControlAddress(mImpl->capacityRejected));
+    mImpl->DownloadControl("GenerateSplitCandidates");
     report.candidateMs = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - mark)
                              .count();
@@ -2168,76 +2777,78 @@ bool GlobalSplitBackend::RunSplitPass(float splitRatio, GlobalSplitReport &repor
 
     mark = std::chrono::steady_clock::now();
     const uint32_t candidateBlocks = (candidates + threads - 1u) / threads;
-    CheckCuda(cudaMemset(mImpl->edgeBlocked, 0,
+    CheckCuda(cudaMemsetAsync(mImpl->edgeBlocked, 0,
                          sizeof(uint8_t) * mImpl->edgeCapacity),
               "reset blocked edges");
-    CheckCuda(cudaMemset(mImpl->faceBlocked, 0,
+    CheckCuda(cudaMemsetAsync(mImpl->faceBlocked, 0,
                          sizeof(uint8_t) * mImpl->faceCapacity),
               "reset blocked faces");
-    CheckCuda(cudaMemset(mImpl->vertexBlocked, 0,
+    CheckCuda(cudaMemsetAsync(mImpl->vertexBlocked, 0,
                          sizeof(uint8_t) * mImpl->vertexCapacity),
               "reset blocked vertices");
     InitActiveQueue<<<candidateBlocks, threads>>>(mImpl->activeQueueA, candidates);
-    CheckCuda(cudaDeviceSynchronize(), "InitActiveQueue");
+    CheckCuda(cudaGetLastError(), "InitActiveQueue launch");
     *mImpl->activeCount = candidates;
     uint32_t *active = mImpl->activeQueueA;
     uint32_t *next = mImpl->activeQueueB;
     constexpr int kMaxClaimRounds = 4;
-    int claimRounds = 0;
-    for (; claimRounds < kMaxClaimRounds && *mImpl->activeCount > 0; ++claimRounds) {
-      const uint32_t activeNow = *mImpl->activeCount;
-      report.activeItemsScanned += activeNow;
-      const uint32_t activeBlocks = (activeNow + threads - 1u) / threads;
-      CheckCuda(cudaMemset(mImpl->splitEdgeWinner, 0,
+    mImpl->mControl->SchedulerRounds = 0;
+    mImpl->mControl->ActiveItemsScanned = 0;
+    mImpl->UploadControl();
+    for (int round = 0; round < kMaxClaimRounds; ++round) {
+      BeginSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "begin scheduler round");
+      CheckCuda(cudaMemsetAsync(mImpl->splitEdgeWinner, 0,
                            sizeof(unsigned long long) * mImpl->edgeCapacity),
                 "reset split edge winners");
-      CheckCuda(cudaMemset(mImpl->splitFaceWinner, 0,
+      CheckCuda(cudaMemsetAsync(mImpl->splitFaceWinner, 0,
                            sizeof(unsigned long long) * mImpl->faceCapacity),
                 "reset split face winners");
-      CheckCuda(cudaMemset(mImpl->splitVertexWinner, 0,
+      CheckCuda(cudaMemsetAsync(mImpl->splitVertexWinner, 0,
                            sizeof(unsigned long long) * mImpl->vertexCapacity),
                 "reset split vertex winners");
-      *mImpl->roundAccepted = 0;
-      ClaimCandidatesActive<<<activeBlocks, threads>>>(
-          mImpl->candidates, mImpl->faces, active, activeNow,
+      ClaimCandidatesActive<<<candidateBlocks, threads>>>(
+          mImpl->candidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
           mImpl->splitEdgeWinner, mImpl->splitFaceWinner, mImpl->splitVertexWinner);
-      CheckCuda(cudaDeviceSynchronize(), "ClaimCandidatesActive");
-      ResolveCandidatesActive<<<activeBlocks, threads>>>(
-          mImpl->candidates, mImpl->faces, active, activeNow,
+      CheckCuda(cudaGetLastError(), "ClaimCandidatesActive launch");
+      ResolveCandidatesActive<<<candidateBlocks, threads>>>(
+          mImpl->candidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
           mImpl->splitEdgeWinner, mImpl->splitFaceWinner, mImpl->splitVertexWinner,
           mImpl->edgeBlocked, mImpl->faceBlocked, mImpl->vertexBlocked,
-          mImpl->acceptedCount, mImpl->roundAccepted);
-      CheckCuda(cudaDeviceSynchronize(), "ResolveCandidatesActive");
-      if (*mImpl->roundAccepted == 0) break;
-      *mImpl->nextActiveCount = 0;
-      CompactActiveCandidates<<<activeBlocks, threads>>>(
-          mImpl->candidates, mImpl->faces, active, activeNow,
+          mImpl->DeviceControlAddress(mImpl->acceptedCount), mImpl->DeviceControlAddress(mImpl->roundAccepted));
+      CheckCuda(cudaGetLastError(), "ResolveCandidatesActive launch");
+      CompactActiveCandidates<<<candidateBlocks, threads>>>(
+          mImpl->candidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
           mImpl->edgeBlocked, mImpl->faceBlocked, mImpl->vertexBlocked,
-          next, mImpl->nextActiveCount);
-      CheckCuda(cudaDeviceSynchronize(), "CompactActiveCandidates");
-      *mImpl->activeCount = *mImpl->nextActiveCount;
+          next, mImpl->DeviceControlAddress(mImpl->nextActiveCount));
+      CheckCuda(cudaGetLastError(), "CompactActiveCandidates launch");
+      EndSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "end scheduler round");
       std::swap(active, next);
-    }
-    report.schedulerRounds = uint32_t(claimRounds);
+        }
+    mImpl->DownloadControl("complete scheduler sweeps");
+    report.schedulerRounds = mImpl->mControl->SchedulerRounds;
+    report.activeItemsScanned = mImpl->mControl->ActiveItemsScanned;
     report.claimMs = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - mark)
                          .count();
 
     const uint32_t acceptedCandidates = *mImpl->acceptedCount;
     *mImpl->splitNewVertexCount = 0;
+    mImpl->UploadControl();
     SumAcceptedSplitCost<<<candidateBlocks, threads>>>(
-        mImpl->candidates, candidates, mImpl->splitNewVertexCount);
-    CheckCuda(cudaDeviceSynchronize(), "SumAcceptedSplitCost");
+        mImpl->candidates, candidates, mImpl->DeviceControlAddress(mImpl->splitNewVertexCount));
+    mImpl->DownloadControl("SumAcceptedSplitCost");
     const uint32_t newVertices = *mImpl->splitNewVertexCount;
     mImpl->EnsureAppendCapacity(newVertices, newVertices * 3u, newVertices * 2u);
     const uint32_t verticesBeforeExecute = *mImpl->vertexCount;
     mark = std::chrono::steady_clock::now();
     ExecuteSplitCandidates<<<candidateBlocks, threads>>>(
         mImpl->vertices, mImpl->edges, mImpl->faces, mImpl->candidates,
-        candidates, mImpl->vertexCount, mImpl->edgeCount, mImpl->faceCount,
-        mImpl->staleRejected, mImpl->gpuPatches, mImpl->gpuPatchCount,
-        mImpl->projectionApplied, mImpl->projectionFailed);
-    CheckCuda(cudaDeviceSynchronize(), "ExecuteSplitCandidates");
+        candidates, mImpl->DeviceControlAddress(mImpl->vertexCount), mImpl->DeviceControlAddress(mImpl->edgeCount), mImpl->DeviceControlAddress(mImpl->faceCount),
+        mImpl->DeviceControlAddress(mImpl->staleRejected), mImpl->gpuPatches, mImpl->gpuPatchCount,
+        mImpl->DeviceControlAddress(mImpl->projectionApplied), mImpl->DeviceControlAddress(mImpl->projectionFailed));
+    mImpl->DownloadControl("ExecuteSplitCandidates");
     report.executeMs = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - mark)
                            .count();
@@ -2248,6 +2859,7 @@ bool GlobalSplitBackend::RunSplitPass(float splitRatio, GlobalSplitReport &repor
     // Keep report.splits semantics stable: count inserted split vertices.
     // For an N-segment MultiSplit this contributes N-1.
     report.acceptedCount = *mImpl->vertexCount - verticesBeforeExecute;
+    if (report.acceptedCount > 0) mImpl->mAdjacencyDirty = true;
     report.globalMemoryBytes = mImpl->MemoryBytes();
     report.dynamicSharedMemoryBytes = 0;
     report.totalMs = std::chrono::duration<double, std::milli>(
@@ -2280,26 +2892,27 @@ bool GlobalSplitBackend::RunCollapsePass(float collapseRatio, GlobalCollapseRepo
     const uint32_t faceCount = *mImpl->faceCount;
     constexpr uint32_t threads = 256;
     const uint32_t edgeBlocks = (edgeCount + threads - 1u) / threads;
-    CheckCuda(cudaMemset(mImpl->edgeHashKeys, 0,
+    CheckCuda(cudaMemsetAsync(mImpl->edgeHashKeys, 0,
                          sizeof(unsigned long long) * mImpl->edgeHashCapacity),
               "reset collapse edge hash");
     BuildEdgeHash<<<edgeBlocks, threads>>>(mImpl->edges, edgeCount, mImpl->edgeHashKeys,
                                            mImpl->edgeHashCapacity - 1u);
-    CheckCuda(cudaDeviceSynchronize(), "BuildEdgeHash collapse");
+    CheckCuda(cudaGetLastError(), "BuildEdgeHash collapse launch");
 
     auto adjacencyMark = std::chrono::steady_clock::now();
     mImpl->BuildVertexEdgeAdjacency();
     report.adjacencyMs = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - adjacencyMark).count();
     auto mark = std::chrono::steady_clock::now();
+    mImpl->UploadControl();
     GenerateCollapseCandidates<<<edgeBlocks, threads>>>(
         mImpl->vertices, mImpl->edges, mImpl->faces, edgeCount, faceCount, collapseRatio,
         mImpl->edgeHashKeys, mImpl->edgeHashCapacity - 1u,
         mImpl->vertexEdgeOffsets, mImpl->vertexEdgeIds,
         mImpl->gpuPatches, mImpl->gpuPatchCount, mImpl->collapseCandidates,
-        mImpl->candidateCapacity, mImpl->candidateCount, mImpl->collapseTopologyRejected,
-        mImpl->semanticRejected, mImpl->qualityRejected);
-    CheckCuda(cudaDeviceSynchronize(), "GenerateCollapseCandidates");
+        mImpl->candidateCapacity, mImpl->DeviceControlAddress(mImpl->candidateCount), mImpl->DeviceControlAddress(mImpl->collapseTopologyRejected),
+        mImpl->DeviceControlAddress(mImpl->semanticRejected), mImpl->DeviceControlAddress(mImpl->qualityRejected));
+    mImpl->DownloadControl("GenerateCollapseCandidates");
     report.candidateMs = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - mark).count();
 
@@ -2316,47 +2929,48 @@ bool GlobalSplitBackend::RunCollapsePass(float collapseRatio, GlobalCollapseRepo
     }
 
     const uint32_t candidateBlocks = (candidates + threads - 1u) / threads;
-    CheckCuda(cudaMemset(mImpl->vertexBlocked, 0,
+    CheckCuda(cudaMemsetAsync(mImpl->vertexBlocked, 0,
                          sizeof(uint8_t) * mImpl->vertexCapacity),
               "reset collapse blocked vertices");
     InitActiveQueue<<<candidateBlocks, threads>>>(mImpl->activeQueueA, candidates);
-    CheckCuda(cudaDeviceSynchronize(), "InitCollapseActiveQueue");
+    CheckCuda(cudaGetLastError(), "InitCollapseActiveQueue launch");
     *mImpl->activeCount = candidates;
     uint32_t *active = mImpl->activeQueueA;
     uint32_t *next = mImpl->activeQueueB;
     mark = std::chrono::steady_clock::now();
     constexpr int kMaxClaimRounds = 4;
-    int claimRounds = 0;
-    for (; claimRounds < kMaxClaimRounds && *mImpl->activeCount > 0; ++claimRounds) {
-      const uint32_t activeNow = *mImpl->activeCount;
-      report.activeItemsScanned += activeNow;
-      const uint32_t activeBlocks = (activeNow + threads - 1u) / threads;
-      CheckCuda(cudaMemset(mImpl->splitVertexWinner, 0,
+    mImpl->mControl->SchedulerRounds = 0;
+    mImpl->mControl->ActiveItemsScanned = 0;
+    mImpl->UploadControl();
+    for (int round = 0; round < kMaxClaimRounds; ++round) {
+      BeginSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "begin scheduler round");
+      CheckCuda(cudaMemsetAsync(mImpl->splitVertexWinner, 0,
                            sizeof(unsigned long long) * mImpl->vertexCapacity),
                 "reset collapse vertex winners");
-      *mImpl->roundAccepted = 0;
-      ClaimCollapseCandidates<<<activeBlocks, threads>>>(
-          mImpl->collapseCandidates, active, activeNow, mImpl->edges,
+      ClaimCollapseCandidates<<<candidateBlocks, threads>>>(
+          mImpl->collapseCandidates, active, mImpl->DeviceControlAddress(mImpl->activeCount), mImpl->edges,
           mImpl->vertexEdgeOffsets, mImpl->vertexEdgeIds,
           mImpl->splitVertexWinner);
-      CheckCuda(cudaDeviceSynchronize(), "ClaimCollapseCandidates");
-      ResolveCollapseCandidates<<<activeBlocks, threads>>>(
-          mImpl->collapseCandidates, active, activeNow, mImpl->edges,
+      CheckCuda(cudaGetLastError(), "ClaimCollapseCandidates launch");
+      ResolveCollapseCandidates<<<candidateBlocks, threads>>>(
+          mImpl->collapseCandidates, active, mImpl->DeviceControlAddress(mImpl->activeCount), mImpl->edges,
           mImpl->vertexEdgeOffsets, mImpl->vertexEdgeIds,
           mImpl->splitVertexWinner, mImpl->vertexBlocked,
-          mImpl->acceptedCount, mImpl->roundAccepted);
-      CheckCuda(cudaDeviceSynchronize(), "ResolveCollapseCandidates");
-      if (*mImpl->roundAccepted == 0) break;
-      *mImpl->nextActiveCount = 0;
-      CompactCollapseCandidates<<<activeBlocks, threads>>>(
-          mImpl->collapseCandidates, active, activeNow, mImpl->edges,
+          mImpl->DeviceControlAddress(mImpl->acceptedCount), mImpl->DeviceControlAddress(mImpl->roundAccepted));
+      CheckCuda(cudaGetLastError(), "ResolveCollapseCandidates launch");
+      CompactCollapseCandidates<<<candidateBlocks, threads>>>(
+          mImpl->collapseCandidates, active, mImpl->DeviceControlAddress(mImpl->activeCount), mImpl->edges,
           mImpl->vertexEdgeOffsets, mImpl->vertexEdgeIds,
-          mImpl->vertexBlocked, next, mImpl->nextActiveCount);
-      CheckCuda(cudaDeviceSynchronize(), "CompactCollapseCandidates");
-      *mImpl->activeCount = *mImpl->nextActiveCount;
+          mImpl->vertexBlocked, next, mImpl->DeviceControlAddress(mImpl->nextActiveCount));
+      CheckCuda(cudaGetLastError(), "CompactCollapseCandidates launch");
+      EndSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "end scheduler round");
       std::swap(active, next);
-    }
-    report.schedulerRounds = uint32_t(claimRounds);
+        }
+    mImpl->DownloadControl("complete scheduler sweeps");
+    report.schedulerRounds = mImpl->mControl->SchedulerRounds;
+    report.activeItemsScanned = mImpl->mControl->ActiveItemsScanned;
     report.claimMs = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - mark).count();
 
@@ -2365,12 +2979,13 @@ bool GlobalSplitBackend::RunCollapsePass(float collapseRatio, GlobalCollapseRepo
     ExecuteCollapseCandidates<<<candidateBlocks, threads>>>(
         mImpl->vertices, mImpl->edges, mImpl->faces, mImpl->collapseCandidates,
         candidates, edgeCount, faceCount, mImpl->vertexEdgeOffsets,
-        mImpl->vertexEdgeIds, mImpl->staleRejected);
-    CheckCuda(cudaDeviceSynchronize(), "ExecuteCollapseCandidates");
+        mImpl->vertexEdgeIds, mImpl->DeviceControlAddress(mImpl->staleRejected));
+    mImpl->DownloadControl("ExecuteCollapseCandidates");
     report.executeMs = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - mark).count();
     report.staleRejected = *mImpl->staleRejected;
     report.acceptedCount = accepted >= report.staleRejected ? accepted - report.staleRejected : 0;
+    if (report.acceptedCount > 0) mImpl->mAdjacencyDirty = true;
     report.globalMemoryBytes = mImpl->MemoryBytes();
     report.dynamicSharedMemoryBytes = 0;
     report.totalMs = std::chrono::duration<double, std::milli>(
@@ -2382,8 +2997,8 @@ bool GlobalSplitBackend::RunCollapsePass(float collapseRatio, GlobalCollapseRepo
   }
 }
 
-bool GlobalSplitBackend::RunFlipPass(float minQualityGain, GlobalFlipReport &report,
-                                     std::string *error) {
+bool GlobalSplitBackend::RunFlipPass(float minQualityGain, float collapseRatio,
+                                     GlobalFlipReport &report, std::string *error) {
   report = {};
   const auto totalStart = std::chrono::steady_clock::now();
   try {
@@ -2402,19 +3017,22 @@ bool GlobalSplitBackend::RunFlipPass(float minQualityGain, GlobalFlipReport &rep
     constexpr uint32_t threads = 256;
     const uint32_t edgeBlocks = (edgeCount + threads - 1u) / threads;
     auto mark = std::chrono::steady_clock::now();
-    CheckCuda(cudaMemset(mImpl->edgeHashKeys, 0,
+    CheckCuda(cudaMemsetAsync(mImpl->edgeHashKeys, 0,
                          sizeof(unsigned long long) * mImpl->edgeHashCapacity),
               "reset edge hash");
     BuildEdgeHash<<<edgeBlocks, threads>>>(mImpl->edges, edgeCount,
                                            mImpl->edgeHashKeys,
                                            mImpl->edgeHashCapacity - 1u);
-    CheckCuda(cudaDeviceSynchronize(), "BuildEdgeHash");
+    CheckCuda(cudaGetLastError(), "BuildEdgeHash launch");
+    mImpl->BuildVertexEdgeAdjacency();
+    mImpl->UploadControl();
     GenerateFlipCandidates<<<edgeBlocks, threads>>>(
         mImpl->vertices, mImpl->edges, mImpl->faces, edgeCount, faceCount,
-        mImpl->edgeHashKeys, mImpl->edgeHashCapacity - 1u, minQualityGain,
+        mImpl->edgeHashKeys, mImpl->edgeHashCapacity - 1u, mImpl->vertexEdgeOffsets, minQualityGain,
+        collapseRatio, mImpl->gpuPatches, mImpl->gpuPatchCount,
         mImpl->flipCandidates, mImpl->candidateCapacity,
-        mImpl->candidateCount, mImpl->semanticRejected, mImpl->capacityRejected);
-    CheckCuda(cudaDeviceSynchronize(), "GenerateFlipCandidates");
+        mImpl->DeviceControlAddress(mImpl->candidateCount), mImpl->DeviceControlAddress(mImpl->semanticRejected), mImpl->DeviceControlAddress(mImpl->capacityRejected));
+    mImpl->DownloadControl("GenerateFlipCandidates");
     report.candidateMs = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - mark).count();
 
@@ -2430,62 +3048,200 @@ bool GlobalSplitBackend::RunFlipPass(float minQualityGain, GlobalFlipReport &rep
 
     mark = std::chrono::steady_clock::now();
     const uint32_t candidateBlocks = (candidates + threads - 1u) / threads;
-    CheckCuda(cudaMemset(mImpl->edgeBlocked, 0, sizeof(uint8_t) * mImpl->edgeCapacity),
+    CheckCuda(cudaMemsetAsync(mImpl->edgeBlocked, 0, sizeof(uint8_t) * mImpl->edgeCapacity),
               "reset flip blocked edges");
-    CheckCuda(cudaMemset(mImpl->faceBlocked, 0, sizeof(uint8_t) * mImpl->faceCapacity),
+    CheckCuda(cudaMemsetAsync(mImpl->faceBlocked, 0, sizeof(uint8_t) * mImpl->faceCapacity),
               "reset flip blocked faces");
+    CheckCuda(cudaMemsetAsync(mImpl->vertexBlocked,0,sizeof(uint8_t) * mImpl->vertexCapacity),"reset flip blocked vertices");
     InitActiveQueue<<<candidateBlocks, threads>>>(mImpl->activeQueueA, candidates);
-    CheckCuda(cudaDeviceSynchronize(), "InitFlipActiveQueue");
+    CheckCuda(cudaGetLastError(), "InitFlipActiveQueue launch");
     *mImpl->activeCount = candidates;
     uint32_t *active = mImpl->activeQueueA;
     uint32_t *next = mImpl->activeQueueB;
     constexpr int kMaxClaimRounds = 4;
-    int claimRounds = 0;
-    for (; claimRounds < kMaxClaimRounds && *mImpl->activeCount > 0; ++claimRounds) {
-      const uint32_t activeNow = *mImpl->activeCount;
-      report.activeItemsScanned += activeNow;
-      const uint32_t activeBlocks = (activeNow + threads - 1u) / threads;
-      CheckCuda(cudaMemset(mImpl->edgeOwner, 0xff, sizeof(uint32_t) * mImpl->edgeCapacity),
+    mImpl->mControl->SchedulerRounds = 0;
+    mImpl->mControl->ActiveItemsScanned = 0;
+    mImpl->UploadControl();
+    for (int round = 0; round < kMaxClaimRounds; ++round) {
+      BeginSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "begin scheduler round");
+      CheckCuda(cudaMemsetAsync(mImpl->edgeOwner, 0xff, sizeof(uint32_t) * mImpl->edgeCapacity),
                 "reset flip edge owners");
-      CheckCuda(cudaMemset(mImpl->faceOwner, 0xff, sizeof(uint32_t) * mImpl->faceCapacity),
+      CheckCuda(cudaMemsetAsync(mImpl->faceOwner, 0xff, sizeof(uint32_t) * mImpl->faceCapacity),
                 "reset flip face owners");
-      *mImpl->roundAccepted = 0;
-      ClaimFlipCandidatesActive<<<activeBlocks, threads>>>(
-          mImpl->flipCandidates, mImpl->faces, active, activeNow,
-          mImpl->edgeOwner, mImpl->faceOwner);
-      CheckCuda(cudaDeviceSynchronize(), "ClaimFlipCandidatesActive");
-      ResolveFlipCandidatesActive<<<activeBlocks, threads>>>(
-          mImpl->flipCandidates, mImpl->faces, active, activeNow,
-          mImpl->edgeOwner, mImpl->faceOwner, mImpl->edgeBlocked, mImpl->faceBlocked,
-          mImpl->acceptedCount, mImpl->roundAccepted);
-      CheckCuda(cudaDeviceSynchronize(), "ResolveFlipCandidatesActive");
-      if (*mImpl->roundAccepted == 0) break;
-      *mImpl->nextActiveCount = 0;
-      CompactFlipCandidates<<<activeBlocks, threads>>>(
-          mImpl->flipCandidates, mImpl->faces, active, activeNow,
-          mImpl->edgeBlocked, mImpl->faceBlocked, next, mImpl->nextActiveCount);
-      CheckCuda(cudaDeviceSynchronize(), "CompactFlipCandidates");
-      *mImpl->activeCount = *mImpl->nextActiveCount;
+      CheckCuda(cudaMemsetAsync(mImpl->vertexOwner,0xff,sizeof(uint32_t) * mImpl->vertexCapacity),"reset flip vertex owners");
+      ClaimFlipCandidatesActive<<<candidateBlocks, threads>>>(
+          mImpl->flipCandidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
+          mImpl->edgeOwner, mImpl->faceOwner, mImpl->vertexOwner);
+      CheckCuda(cudaGetLastError(), "ClaimFlipCandidatesActive launch");
+      ResolveFlipCandidatesActive<<<candidateBlocks, threads>>>(
+          mImpl->flipCandidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
+          mImpl->edgeOwner, mImpl->faceOwner, mImpl->vertexOwner, mImpl->edgeBlocked, mImpl->faceBlocked, mImpl->vertexBlocked,
+          mImpl->DeviceControlAddress(mImpl->acceptedCount), mImpl->DeviceControlAddress(mImpl->roundAccepted));
+      CheckCuda(cudaGetLastError(), "ResolveFlipCandidatesActive launch");
+      CompactFlipCandidates<<<candidateBlocks, threads>>>(
+          mImpl->flipCandidates, mImpl->faces, active, mImpl->DeviceControlAddress(mImpl->activeCount),
+          mImpl->edgeBlocked, mImpl->faceBlocked, mImpl->vertexBlocked, next, mImpl->DeviceControlAddress(mImpl->nextActiveCount));
+      CheckCuda(cudaGetLastError(), "CompactFlipCandidates launch");
+      EndSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "end scheduler round");
       std::swap(active, next);
-    }
-    report.schedulerRounds = uint32_t(claimRounds);
+        }
+    mImpl->DownloadControl("complete scheduler sweeps");
+    report.schedulerRounds = mImpl->mControl->SchedulerRounds;
+    report.activeItemsScanned = mImpl->mControl->ActiveItemsScanned;
     report.claimMs = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - mark).count();
 
     mark = std::chrono::steady_clock::now();
     ExecuteFlipCandidates<<<candidateBlocks, threads>>>(
         mImpl->vertices, mImpl->edges, mImpl->faces, mImpl->flipCandidates,
-        candidates, mImpl->staleRejected);
-    CheckCuda(cudaDeviceSynchronize(), "ExecuteFlipCandidates");
+        candidates, mImpl->DeviceControlAddress(mImpl->staleRejected));
+    mImpl->DownloadControl("ExecuteFlipCandidates");
     report.executeMs = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - mark).count();
     report.staleRejected = *mImpl->staleRejected;
     const uint32_t accepted = *mImpl->acceptedCount;
     report.acceptedCount = accepted >= report.staleRejected ? accepted - report.staleRejected : 0;
+    if (report.acceptedCount > 0) mImpl->mAdjacencyDirty = true;
     report.globalMemoryBytes = mImpl->MemoryBytes();
     report.dynamicSharedMemoryBytes = 0;
     report.totalMs = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - totalStart).count();
+    return true;
+  } catch (const std::exception &e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+bool GlobalSplitBackend::RunSmoothPass(float lambda, GlobalSmoothReport &report,
+                                       std::string *error) {
+  report={}; const auto totalStart=std::chrono::steady_clock::now();
+  try {
+    if(!mImpl->vertices) throw std::runtime_error("backend not initialized");
+    *mImpl->candidateCount=0; *mImpl->acceptedCount=0; *mImpl->roundAccepted=0;
+    *mImpl->activeCount=0; *mImpl->nextActiveCount=0; *mImpl->staleRejected=0;
+    *mImpl->semanticRejected=0; *mImpl->qualityRejected=0;
+    const uint32_t nv=*mImpl->vertexCount;
+    constexpr uint32_t threads=256;
+    auto mark=std::chrono::steady_clock::now();
+    mImpl->BuildVertexEdgeAdjacency();
+    report.adjacencyMs=std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now()-mark).count();
+    const uint32_t vertexBlocks=(nv+threads-1u)/threads;
+    mark=std::chrono::steady_clock::now();
+    mImpl->UploadControl();
+    GenerateSmoothCandidates<<<vertexBlocks,threads>>>(
+        mImpl->vertices,mImpl->edges,mImpl->faces,nv,*mImpl->faceCount,lambda,
+        mImpl->vertexEdgeOffsets,mImpl->vertexEdgeIds,mImpl->gpuPatches,mImpl->gpuPatchCount,
+        mImpl->smoothCandidates,mImpl->candidateCapacity,mImpl->DeviceControlAddress(mImpl->candidateCount),
+        mImpl->DeviceControlAddress(mImpl->semanticRejected),mImpl->DeviceControlAddress(mImpl->qualityRejected));
+    mImpl->DownloadControl("GenerateSmoothCandidates");
+    report.candidateMs=std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now()-mark).count();
+    const uint32_t candidates=std::min(*mImpl->candidateCount,mImpl->candidateCapacity);
+    report.candidateCount=candidates; report.semanticRejected=*mImpl->semanticRejected;
+    report.qualityRejected=*mImpl->qualityRejected;
+    if(candidates==0) { report.globalMemoryBytes=mImpl->MemoryBytes();
+      report.totalMs=std::chrono::duration<double,std::milli>(
+          std::chrono::steady_clock::now()-totalStart).count(); return true; }
+    const uint32_t blocks=(candidates+threads-1u)/threads;
+    CheckCuda(cudaMemsetAsync(mImpl->vertexBlocked,0,sizeof(uint8_t) * mImpl->vertexCapacity),
+              "reset smooth blocked vertices");
+    InitActiveQueue<<<blocks,threads>>>(mImpl->activeQueueA,candidates);
+    CheckCuda(cudaGetLastError(), "InitSmoothActiveQueue launch");
+    *mImpl->activeCount=candidates; uint32_t *active=mImpl->activeQueueA,*next=mImpl->activeQueueB;
+    mark=std::chrono::steady_clock::now(); constexpr int kMaxClaimRounds=2;
+    mImpl->mControl->SchedulerRounds = 0;
+    mImpl->mControl->ActiveItemsScanned = 0;
+    mImpl->UploadControl();
+    for (int round = 0; round < kMaxClaimRounds; ++round) {
+      BeginSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "begin scheduler round");
+      CheckCuda(cudaMemsetAsync(mImpl->splitVertexWinner,0,
+          sizeof(unsigned long long) * mImpl->vertexCapacity),"reset smooth winners");
+      ClaimSmoothCandidates<<<blocks,threads>>>(mImpl->smoothCandidates,active,mImpl->DeviceControlAddress(mImpl->activeCount),mImpl->edges,
+          mImpl->vertexEdgeOffsets,mImpl->vertexEdgeIds,mImpl->splitVertexWinner);
+      CheckCuda(cudaGetLastError(),"ClaimSmoothCandidates launch");
+      ResolveSmoothCandidates<<<blocks,threads>>>(mImpl->smoothCandidates,active,mImpl->DeviceControlAddress(mImpl->activeCount),mImpl->edges,
+          mImpl->vertexEdgeOffsets,mImpl->vertexEdgeIds,mImpl->splitVertexWinner,mImpl->vertexBlocked,
+          mImpl->DeviceControlAddress(mImpl->acceptedCount),mImpl->DeviceControlAddress(mImpl->roundAccepted));
+      CheckCuda(cudaGetLastError(),"ResolveSmoothCandidates launch");
+      CompactSmoothCandidates<<<blocks,threads>>>(mImpl->smoothCandidates,active,mImpl->DeviceControlAddress(mImpl->activeCount),mImpl->edges,
+          mImpl->vertexEdgeOffsets,mImpl->vertexEdgeIds,mImpl->vertexBlocked,next,mImpl->DeviceControlAddress(mImpl->nextActiveCount));
+      CheckCuda(cudaGetLastError(), "CompactSmoothCandidates launch"); EndSchedulerRound<<<1,1>>>(mImpl->DeviceControlAddress(mImpl->mControl));
+      CheckCuda(cudaGetLastError(), "end scheduler round");
+      std::swap(active, next);
+        }
+    mImpl->DownloadControl("complete scheduler sweeps");
+    report.schedulerRounds = mImpl->mControl->SchedulerRounds;
+    report.activeItemsScanned = mImpl->mControl->ActiveItemsScanned;
+    report.claimMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-mark).count();
+    mark=std::chrono::steady_clock::now();
+    ExecuteSmoothCandidates<<<blocks,threads>>>(mImpl->vertices,mImpl->smoothCandidates,candidates,mImpl->DeviceControlAddress(mImpl->staleRejected));
+    mImpl->DownloadControl("ExecuteSmoothCandidates");
+    report.executeMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-mark).count();
+    report.staleRejected=*mImpl->staleRejected;
+    const uint32_t accepted=*mImpl->acceptedCount;
+    report.acceptedCount=accepted>=report.staleRejected?accepted-report.staleRejected:0;
+    report.globalMemoryBytes=mImpl->MemoryBytes();
+    report.totalMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-totalStart).count();
+    return true;
+  } catch(const std::exception &e) { if(error)*error=e.what(); return false; }
+}
+
+bool GlobalSplitBackend::collectCycleMetrics(
+    float targetLength, float splitRatio, float collapseRatio,
+    GlobalCycleMetrics &metrics, std::string *error) const {
+  metrics = {};
+  try {
+    if (!mImpl->vertices) throw std::runtime_error("backend not initialized");
+    if (!(targetLength > 0) || !std::isfinite(targetLength) ||
+        !(collapseRatio > 0) || !(splitRatio > collapseRatio) ||
+        !std::isfinite(splitRatio)) throw std::runtime_error("invalid audit lengths");
+    const uint32_t nv = *mImpl->vertexCount, ne = *mImpl->edgeCount, nf = *mImpl->faceCount;
+    auto &vertices = mImpl->mReadbackVertices;
+    auto &edges = mImpl->mReadbackEdges;
+    auto &faces = mImpl->mReadbackFaces;
+    auto &qualities = mImpl->mQualityScratch;
+    vertices.resize(nv); edges.resize(ne); faces.resize(nf);
+    CheckCuda(cudaMemcpy(vertices.data(), mImpl->vertices, sizeof(GVertex)*nv,
+                         cudaMemcpyDeviceToHost), "audit vertices");
+    CheckCuda(cudaMemcpy(edges.data(), mImpl->edges, sizeof(GEdge)*ne,
+                         cudaMemcpyDeviceToHost), "audit edges");
+    CheckCuda(cudaMemcpy(faces.data(), mImpl->faces, sizeof(GFace)*nf,
+                         cudaMemcpyDeviceToHost), "audit faces");
+    const auto position = [&](uint32_t v) -> Vec3 {
+      if (v >= nv || !vertices[v].alive) throw std::runtime_error("audit dead vertex reference");
+      return {vertices[v].x, vertices[v].y, vertices[v].z};
+    };
+    qualities.clear(); qualities.reserve(nf);
+    for (const GFace &f : faces) {
+      if (!f.alive) continue;
+      const float quality = triangleQuality(position(f.v0), position(f.v1), position(f.v2));
+      if (!std::isfinite(quality)) throw std::runtime_error("non-finite audit quality");
+      qualities.push_back(quality);
+    }
+    if (qualities.empty()) throw std::runtime_error("empty audit mesh");
+    std::sort(qualities.begin(), qualities.end());
+    float sum = 0;
+    for (float quality : qualities) sum += quality;
+    metrics.FaceCount = uint32_t(qualities.size());
+    metrics.QualityMean = sum / float(qualities.size());
+    metrics.QualityP05 = qualities[qualities.size()/20];
+    metrics.QualityMin = qualities.front();
+    const float upper = targetLength*splitRatio, lower = targetLength*collapseRatio;
+    for (const GEdge &e : edges) {
+      if (!e.alive) continue;
+      const float edgeLength = distance(position(e.v0), position(e.v1));
+      if (!std::isfinite(edgeLength)) throw std::runtime_error("non-finite audit edge");
+      ++metrics.EdgeCount;
+      if (e.flags & EdgeProtected) continue;
+      ++metrics.EditableCount;
+      if (edgeLength > upper) ++metrics.EditableAboveSplit;
+      if (edgeLength < lower) ++metrics.EditableBelowCollapse;
+    }
     return true;
   } catch (const std::exception &e) {
     if (error) *error = e.what();
@@ -2498,21 +3254,21 @@ bool GlobalSplitBackend::Validate(GlobalTopologyValidation &validation,
   validation = {};
   try {
     if (!mImpl->vertices) throw std::runtime_error("backend not initialized");
-    CheckCuda(cudaMemset(mImpl->validation, 0, sizeof(ValidationCounters)),
-              "reset validation");
-    constexpr uint32_t threads = 256;
     const uint32_t nv = *mImpl->vertexCount;
     const uint32_t ne = *mImpl->edgeCount;
     const uint32_t nf = *mImpl->faceCount;
+    CheckCuda(cudaMemsetAsync(mImpl->DeviceControlAddress(mImpl->validation), 0, sizeof(ValidationCounters)),
+              "reset validation");
+    constexpr uint32_t threads = 256;
     const uint32_t faceBlocks = (nf + threads - 1u) / threads;
     const uint32_t edgeBlocks = (ne + threads - 1u) / threads;
 
     ValidateFacesKernel<<<faceBlocks, threads>>>(mImpl->vertices, nv, mImpl->edges, ne,
-                                                 mImpl->faces, nf, mImpl->validation);
-    CheckCuda(cudaDeviceSynchronize(), "ValidateFacesKernel");
+                                                 mImpl->faces, nf, mImpl->DeviceControlAddress(mImpl->validation));
+    CheckCuda(cudaGetLastError(), "ValidateFacesKernel launch");
     ValidateEdgesKernel<<<edgeBlocks, threads>>>(mImpl->vertices, nv, mImpl->edges, ne,
-                                                 mImpl->faces, nf, mImpl->validation);
-    CheckCuda(cudaDeviceSynchronize(), "ValidateEdgesKernel");
+                                                 mImpl->faces, nf, mImpl->DeviceControlAddress(mImpl->validation));
+    mImpl->DownloadControl("ValidateEdgesKernel");
 
     const ValidationCounters c = *mImpl->validation;
     validation.invalidVertexReference = c.invalidVertexReference;
@@ -2535,11 +3291,17 @@ bool GlobalSplitBackend::Export(SemanticMesh &mesh, std::string *error) const {
     const uint32_t nv = *mImpl->vertexCount;
     const uint32_t nf = *mImpl->faceCount;
 
+    std::vector<GVertex> hostVertices(nv);
+    std::vector<GFace> hostFaces(nf);
+    CheckCuda(cudaMemcpy(hostVertices.data(), mImpl->vertices, sizeof(GVertex)*nv,
+                         cudaMemcpyDeviceToHost), "download export vertices");
+    CheckCuda(cudaMemcpy(hostFaces.data(), mImpl->faces, sizeof(GFace)*nf,
+                         cudaMemcpyDeviceToHost), "download export faces");
     SemanticMesh out;
     out.patches = mImpl->patches;
     std::vector<uint32_t> vertexMap(nv, kInvalid);
     for (uint32_t v = 0; v < nv; ++v) {
-      const GVertex &gv = mImpl->vertices[v];
+      const GVertex &gv = hostVertices[v];
       if (!gv.alive) continue;
       const int mapped = out.addVertex({gv.x, gv.y, gv.z}, gv.patchId,
                                        VertexConstraint(gv.constraint));
@@ -2548,7 +3310,7 @@ bool GlobalSplitBackend::Export(SemanticMesh &mesh, std::string *error) const {
     }
 
     for (uint32_t f = 0; f < nf; ++f) {
-      const GFace &gf = mImpl->faces[f];
+      const GFace &gf = hostFaces[f];
       if (!gf.alive) continue;
       if (gf.v0 >= nv || gf.v1 >= nv || gf.v2 >= nv ||
           vertexMap[gf.v0] == kInvalid || vertexMap[gf.v1] == kInvalid ||
