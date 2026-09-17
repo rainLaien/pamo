@@ -120,6 +120,7 @@ EdgeLengthAudit SemanticMesh::edgeLengthAudit(float target, float splitRatio,
       ++out.editableCount;
       out.editableMax = std::max(out.editableMax, l);
       if (l > out.splitThreshold) ++out.editableAboveSplit;
+      if (l < out.collapseThreshold) ++out.editableBelowCollapse;
     }
   }
   if (lengths.empty()) return out;

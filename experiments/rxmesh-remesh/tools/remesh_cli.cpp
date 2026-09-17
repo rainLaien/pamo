@@ -88,6 +88,9 @@ int main(int argc, char **argv) {
     const int boundarySplits=refinePartitionBoundary(mesh,cfg.splitRatio*cfg.constantLength);
     std::cout << "boundary_splits=" << boundarySplits << '\n';
   }
+  if (!cfg.adaptive) {
+    mesh.targetLength.assign(size_t(mesh.vertexCount()), cfg.constantLength);
+  }
   mesh.rebuildTopology();
   const EdgeLengthAudit beforeAudit = mesh.edgeLengthAudit(
       cfg.constantLength, cfg.splitRatio, cfg.collapseRatio);
@@ -104,6 +107,7 @@ int main(int argc, char **argv) {
             << " editable_max=" << beforeAudit.editableMax
             << " protected_max=" << beforeAudit.protectedMax
             << " editable_above_split=" << beforeAudit.editableAboveSplit
+            << " editable_below_collapse=" << beforeAudit.editableBelowCollapse
             << " protected_above_split=" << beforeAudit.protectedAboveSplit
             << " edge_count=" << beforeAudit.edgeCount << '\n';
   const AnalyticGeometryAudit beforeGeomAudit = mesh.analyticGeometryAudit();
@@ -126,8 +130,10 @@ int main(int argc, char **argv) {
     for (int cycle = 0; ok && cycle < cfg.maxIterations; ++cycle) {
       global::GlobalTriangleRefineReport cavityReport;
       global::GlobalSplitReport splitReport;
+      global::GlobalCollapseReport collapseReport;
       global::GlobalTopologyValidation cavityValidation;
       global::GlobalTopologyValidation splitValidation;
+      global::GlobalTopologyValidation collapseValidation;
       if (cavity) {
         ok = backend.RunTriangleRefinePass(cavityRatio, cavityReport, &error);
         report.cavityRefines += int(cavityReport.acceptedCount);
@@ -142,6 +148,13 @@ int main(int argc, char **argv) {
         report.secondsSplit += splitReport.totalMs * 0.001;
         if (ok) ok = backend.Validate(splitValidation, &error);
       }
+      if (ok && collapse) {
+        ok = backend.RunCollapsePass(cfg.collapseRatio, collapseReport, &error);
+        report.collapses += int(collapseReport.acceptedCount);
+        report.collapseCandidates += int(collapseReport.candidateCount);
+        report.secondsCollapse += collapseReport.totalMs * 0.001;
+        if (ok) ok = backend.Validate(collapseValidation, &error);
+      }
       std::cout << "global_refine_cycle=" << cycle
                 << " cavity_candidates=" << cavityReport.candidateCount
                 << " cavity_accepted=" << cavityReport.acceptedCount
@@ -151,8 +164,20 @@ int main(int argc, char **argv) {
                 << " split_accepted=" << splitReport.acceptedCount
                 << " split_projection_applied=" << splitReport.projectionApplied
                 << " split_projection_failed=" << splitReport.projectionFailed
+                << " collapse_candidates=" << collapseReport.candidateCount
+                << " collapse_accepted=" << collapseReport.acceptedCount
+                << " collapse_topology_rejected=" << collapseReport.topologyRejected
+                << " collapse_semantic_rejected=" << collapseReport.semanticRejected
+                << " collapse_quality_rejected=" << collapseReport.qualityRejected
+                << " collapse_adjacency_ms=" << collapseReport.adjacencyMs
+                << " collapse_candidate_ms=" << collapseReport.candidateMs
+                << " collapse_claim_ms=" << collapseReport.claimMs
+                << " collapse_execute_ms=" << collapseReport.executeMs
+                << " collapse_scheduler_rounds=" << collapseReport.schedulerRounds
+                << " collapse_active_scanned=" << collapseReport.activeItemsScanned
                 << " cavity_topology_ok=" << cavityValidation.ok()
-                << " split_topology_ok=" << splitValidation.ok() << '\n';
+                << " split_topology_ok=" << splitValidation.ok()
+                << " collapse_topology_ok=" << collapseValidation.ok() << '\n';
       if (ok) {
         SemanticMesh cycleMesh;
         std::string auditError;
@@ -181,6 +206,7 @@ int main(int argc, char **argv) {
                     << " coarse_above_cavity=" << coarseAbove
                     << " residual_above_split=" << residualAbove
                     << " editable_above_split=" << passAudit.editableAboveSplit
+                    << " editable_below_collapse=" << passAudit.editableBelowCollapse
                     << " edge_count=" << passAudit.edgeCount
                     << " analytic_geom_mean=" << geomAudit.mean
                     << " analytic_geom_p95=" << geomAudit.p95
@@ -194,7 +220,8 @@ int main(int argc, char **argv) {
         std::cout << "global_refine_error=" << error << '\n';
         break;
       }
-      if (cavityReport.acceptedCount == 0 && splitReport.acceptedCount == 0) break;
+      if (cavityReport.acceptedCount == 0 && splitReport.acceptedCount == 0 &&
+          collapseReport.acceptedCount == 0) break;
     }
     if (cfg.enableFlip) {
       for (int pass = 0; ok && pass < cfg.maxIterations; ++pass) {
@@ -211,7 +238,7 @@ int main(int argc, char **argv) {
     if (ok) ok = backend.Export(mesh, &error);
     report.topologyValid = ok;
     report.constraintsHeld = ok;
-    report.seconds = report.secondsCavity + report.secondsSplit + report.secondsFlip;
+    report.seconds = report.secondsCavity + report.secondsSplit + report.secondsCollapse + report.secondsFlip;
     backendName = "global-topology-poc";
 #else
     std::cerr << "this binary was built without CAD_ADAPTIVE_GLOBAL_TOPOLOGY\n";
@@ -257,6 +284,7 @@ int main(int argc, char **argv) {
               << " editable_max=" << audit.editableMax
               << " protected_max=" << audit.protectedMax
               << " editable_above_split=" << audit.editableAboveSplit
+              << " editable_below_collapse=" << audit.editableBelowCollapse
               << " protected_above_split=" << audit.protectedAboveSplit
               << " edge_count=" << audit.edgeCount << '\n';
     const AnalyticGeometryAudit geomAudit = mesh.analyticGeometryAudit();

@@ -24,6 +24,7 @@ struct EdgeLengthAudit {
   float editableMax = 0, protectedMax = 0;
   uint32_t edgeCount = 0, editableCount = 0, protectedCount = 0;
   uint32_t editableAboveSplit = 0, protectedAboveSplit = 0;
+  uint32_t editableBelowCollapse = 0;
 };
 
 struct AnalyticGeometryAudit {

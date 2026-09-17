@@ -71,26 +71,43 @@ bool validatePartitionOutput(const SemanticMesh &source, const SemanticMesh &out
     orientation[pid]+=dot(cross(b-a,c-a),projector.analyticNormal(pid,centroid3(a,b,c)));
   }
   bool normalsValid=true;
+  std::string normalsError;
   std::vector<int> patchFaces(source.patches.size(),0);
   for(int f=0;f<output.faceCount();++f) {
     auto pid=output.facePatchId[f];
-    if(pid>=orientation.size()) { normalsValid=false; continue; }
+    if(pid>=orientation.size()) {
+      normalsValid=false;
+      if(normalsError.empty()) normalsError="invalid patch id at face " + std::to_string(f);
+      continue;
+    }
     ++patchFaces[pid];
     auto a=output.facePoint(f,0),b=output.facePoint(f,1),c=output.facePoint(f,2);
     auto mid=centroid3(a,b,c);
-    if(dot(cross(b-a,c-a),projector.analyticNormal(pid,mid))*orientation[pid]<=0) normalsValid=false;
+    const float orientationScore=dot(cross(b-a,c-a),projector.analyticNormal(pid,mid))*orientation[pid];
+    if(!(orientationScore>0)) {
+      normalsValid=false;
+      if(normalsError.empty()) normalsError="orientation mismatch face=" + std::to_string(f) + " patch=" + std::to_string(pid) + " score=" + std::to_string(orientationScore) + " patch_orientation=" + std::to_string(orientation[pid]);
+    }
     Vec3 samples[]={a,b,c,mid,(a+b)*0.5f,(b+c)*0.5f,(c+a)*0.5f};
     for(auto p:samples) {
       auto projected=projector.projectSurface(pid,p);
-      if(!projected.ok) { normalsValid=false; continue; }
+      if(!projected.ok) {
+        normalsValid=false;
+        if(normalsError.empty()) normalsError="analytic projection failed face=" + std::to_string(f) + " patch=" + std::to_string(pid);
+        continue;
+      }
       report.geometryErrorMax=std::max(report.geometryErrorMax,distance(p,projected.position));
     }
   }
-  for(int count:patchFaces) if(!count) normalsValid=false;
+  for(size_t pid=0;pid<patchFaces.size();++pid) if(!patchFaces[pid]) {
+    normalsValid=false;
+    if(normalsError.empty()) normalsError="empty output patch=" + std::to_string(pid);
+  }
   report.constraintsHeld=report.movedLockedVertices==0 && report.missingBoundaryEdges==0;
   if(!report.constraintsHeld || !normalsValid || report.geometryErrorMax>config.maxGeometryError+tolerance) {
     if(error) *error=!report.constraintsHeld ? "CAD feature vertices/edges were lost" :
-      (!normalsValid ? "CAD patch orientation or ownership invalid" : "CAD surface deviation exceeds tolerance");
+      (!normalsValid ? ("CAD patch orientation or ownership invalid: " + normalsError) :
+       "CAD surface deviation exceeds tolerance");
     return false;
   }
   return true;

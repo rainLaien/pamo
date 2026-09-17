@@ -1,6 +1,7 @@
 #include "cad_adaptive/global/GlobalSplitBackend.h"
 
 #include <cuda_runtime.h>
+#include <cub/device/device_scan.cuh>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -20,6 +21,7 @@ struct GPatch {
   float ox, oy, oz;
   float ax, ay, az;
   float radius;
+  float orientationSign;
   uint8_t type;
   uint8_t padding[3]{};
 };
@@ -62,6 +64,15 @@ struct FlipCandidate {
   uint32_t a, b, c, d;
   uint32_t f0, f1;
   float oldQuality, newQuality;
+  uint8_t accepted;
+  uint8_t padding[3]{};
+};
+
+struct CollapseCandidate {
+  uint32_t edgeId, edgeGeneration;
+  uint32_t keep, remove, c, d;
+  uint32_t f0, f1;
+  float priority;
   uint8_t accepted;
   uint8_t padding[3]{};
 };
@@ -175,6 +186,32 @@ __device__ inline float TriangleQualityGpu(const GVertex &a, const GVertex &b, c
   return fminf(1.0f, 3.4641016151377544f * area2 / denom);
 }
 
+__device__ inline float3 AnalyticNormalGpu(const GPatch &p, const GVertex &a,
+                                                   const GVertex &b, const GVertex &c) {
+  if (p.type == uint8_t(PatchType::Plane)) return make_float3(p.ax,p.ay,p.az);
+  if (p.type == uint8_t(PatchType::Cylinder)) {
+    const float x=(a.x+b.x+c.x)/3.0f, y=(a.y+b.y+c.y)/3.0f, z=(a.z+b.z+c.z)/3.0f;
+    const float ox=x-p.ox, oy=y-p.oy, oz=z-p.oz;
+    const float h=ox*p.ax+oy*p.ay+oz*p.az;
+    float rx=ox-p.ax*h, ry=oy-p.ay*h, rz=oz-p.az*h;
+    const float n2=rx*rx+ry*ry+rz*rz;
+    if (!(n2>1e-20f)) return make_float3(0,0,0);
+    const float inv=rsqrtf(n2); return make_float3(rx*inv,ry*inv,rz*inv);
+  }
+  return make_float3(0,0,0);
+}
+
+__device__ inline bool PatchOrientationSafe(const GPatch *patches, uint32_t patchCount,
+                                             uint32_t patchId, const GVertex &a,
+                                             const GVertex &b, const GVertex &c) {
+  if (!patches || patchId>=patchCount) return true;
+  const GPatch p=patches[patchId];
+  const float3 an=AnalyticNormalGpu(p,a,b,c);
+  const float an2=Dot3(an,an);
+  if (!(an2>1e-20f)) return true;
+  return Dot3(TriangleCross(a,b,c),an)*p.orientationSign > 0.0f;
+}
+
 __device__ inline bool FaceHasDirectedEdge(const GFace &f, uint32_t a, uint32_t b) {
   return (f.v0 == a && f.v1 == b) || (f.v1 == a && f.v2 == b) ||
          (f.v2 == a && f.v0 == b);
@@ -245,6 +282,27 @@ __device__ inline bool EdgeHashContains(const unsigned long long *keys,
   return false;
 }
 
+__global__ void CountVertexEdges(const GEdge *edges, uint32_t edgeCount,
+                                 uint32_t vertexCount, uint32_t *counts) {
+  const uint32_t id=blockIdx.x*blockDim.x+threadIdx.x;
+  if(id>=edgeCount) return;
+  const GEdge e=edges[id];
+  if(!e.alive || e.v0>=vertexCount || e.v1>=vertexCount) return;
+  atomicAdd(counts+e.v0,1u); atomicAdd(counts+e.v1,1u);
+}
+
+__global__ void FillVertexEdges(const GEdge *edges, uint32_t edgeCount,
+                                uint32_t vertexCount, const uint32_t *offsets,
+                                uint32_t *cursor, uint32_t *edgeIds) {
+  const uint32_t id=blockIdx.x*blockDim.x+threadIdx.x;
+  if(id>=edgeCount) return;
+  const GEdge e=edges[id];
+  if(!e.alive || e.v0>=vertexCount || e.v1>=vertexCount) return;
+  const uint32_t a=offsets[e.v0]+atomicAdd(cursor+e.v0,1u);
+  const uint32_t b=offsets[e.v1]+atomicAdd(cursor+e.v1,1u);
+  edgeIds[a]=id; edgeIds[b]=id;
+}
+
 __device__ inline GVertex LerpSplitVertex(const GVertex &a, const GVertex &b, float t) {
   GVertex out = a;
   out.x = a.x + (b.x - a.x) * t;
@@ -276,7 +334,9 @@ __device__ inline bool SegmentedSplitQualitySafe(const GVertex &a, const GVertex
     p0=ProjectCandidateVertex(p0,patches,patchCount);
     p1=ProjectCandidateVertex(p1,patches,patchCount);
     if (!(TriangleQualityGpu(p0,p1,c)>qMin) || !(TriangleQualityGpu(p1,p0,d)>qMin) ||
-        !SameHemisphere(a,b,c,p0,p1,c) || !SameHemisphere(b,a,d,p1,p0,d)) return false;
+        !SameHemisphere(a,b,c,p0,p1,c) || !SameHemisphere(b,a,d,p1,p0,d) ||
+        !PatchOrientationSafe(patches,patchCount,patchId,p0,p1,c) ||
+        !PatchOrientationSafe(patches,patchCount,patchId,p1,p0,d)) return false;
   }
   return true;
 }
@@ -325,7 +385,17 @@ __device__ inline bool TriangleRefineQualitySafe(const GVertex &a,const GVertex 
     SameHemisphere(a,b,c,m2,m1,c) && SameHemisphere(a,b,c,m0,m1,m2) &&
     SameHemisphere(b,a,d0,b,m0,d0) && SameHemisphere(b,a,d0,m0,a,d0) &&
     SameHemisphere(c,b,d1,c,m1,d1) && SameHemisphere(c,b,d1,m1,b,d1) &&
-    SameHemisphere(a,c,d2,a,m2,d2) && SameHemisphere(a,c,d2,m2,c,d2);
+    SameHemisphere(a,c,d2,a,m2,d2) && SameHemisphere(a,c,d2,m2,c,d2) &&
+    PatchOrientationSafe(patches,patchCount,patchId,a,m0,m2) &&
+    PatchOrientationSafe(patches,patchCount,patchId,m0,b,m1) &&
+    PatchOrientationSafe(patches,patchCount,patchId,m2,m1,c) &&
+    PatchOrientationSafe(patches,patchCount,patchId,m0,m1,m2) &&
+    PatchOrientationSafe(patches,patchCount,patchId,b,m0,d0) &&
+    PatchOrientationSafe(patches,patchCount,patchId,m0,a,d0) &&
+    PatchOrientationSafe(patches,patchCount,patchId,c,m1,d1) &&
+    PatchOrientationSafe(patches,patchCount,patchId,m1,b,d1) &&
+    PatchOrientationSafe(patches,patchCount,patchId,a,m2,d2) &&
+    PatchOrientationSafe(patches,patchCount,patchId,m2,c,d2);
 }
 
 __device__ inline int TwoEdgeBestLayout(const GVertex&a,const GVertex&b,const GVertex&c,
@@ -337,13 +407,23 @@ __device__ inline int TwoEdgeBestLayout(const GVertex&a,const GVertex&b,const GV
   float qn1=fminf(TriangleQualityGpu(c,m1,d1),TriangleQualityGpu(m1,b,d1));
   if (!(qn0>q) || !(qn1>q) || !SameHemisphere(b,a,d0,b,m0,d0) ||
       !SameHemisphere(b,a,d0,m0,a,d0) || !SameHemisphere(c,b,d1,c,m1,d1) ||
-      !SameHemisphere(c,b,d1,m1,b,d1)) return -1;
+      !SameHemisphere(c,b,d1,m1,b,d1) ||
+      !PatchOrientationSafe(patches,patchCount,patchId,b,m0,d0) ||
+      !PatchOrientationSafe(patches,patchCount,patchId,m0,a,d0) ||
+      !PatchOrientationSafe(patches,patchCount,patchId,c,m1,d1) ||
+      !PatchOrientationSafe(patches,patchCount,patchId,m1,b,d1)) return -1;
   float q0=fminf(qn0,qn1); q0=fminf(q0,TriangleQualityGpu(a,m0,m1));
   q0=fminf(q0,TriangleQualityGpu(m0,b,m1)); q0=fminf(q0,TriangleQualityGpu(a,m1,c));
-  bool o0=SameHemisphere(a,b,c,a,m0,m1)&&SameHemisphere(a,b,c,m0,b,m1)&&SameHemisphere(a,b,c,a,m1,c);
+  bool o0=SameHemisphere(a,b,c,a,m0,m1)&&SameHemisphere(a,b,c,m0,b,m1)&&SameHemisphere(a,b,c,a,m1,c)&&
+    PatchOrientationSafe(patches,patchCount,patchId,a,m0,m1)&&
+    PatchOrientationSafe(patches,patchCount,patchId,m0,b,m1)&&
+    PatchOrientationSafe(patches,patchCount,patchId,a,m1,c);
   float q1=fminf(qn0,qn1); q1=fminf(q1,TriangleQualityGpu(a,m0,c));
   q1=fminf(q1,TriangleQualityGpu(m0,m1,c)); q1=fminf(q1,TriangleQualityGpu(m0,b,m1));
-  bool o1=SameHemisphere(a,b,c,a,m0,c)&&SameHemisphere(a,b,c,m0,m1,c)&&SameHemisphere(a,b,c,m0,b,m1);
+  bool o1=SameHemisphere(a,b,c,a,m0,c)&&SameHemisphere(a,b,c,m0,m1,c)&&SameHemisphere(a,b,c,m0,b,m1)&&
+    PatchOrientationSafe(patches,patchCount,patchId,a,m0,c)&&
+    PatchOrientationSafe(patches,patchCount,patchId,m0,m1,c)&&
+    PatchOrientationSafe(patches,patchCount,patchId,m0,b,m1);
   if (!o0) q0=0; if (!o1) q1=0;
   const float best=fmaxf(q0,q1); if (!(best>q)) return -1;
   return q1>q0?1:0;
@@ -1194,6 +1274,269 @@ __global__ void ExecuteSplitCandidates(GVertex *vertices, GEdge *edges, GFace *f
   }
 }
 
+
+__device__ inline bool FaceContainsVertex(const GFace &f, uint32_t v) {
+  return f.v0==v || f.v1==v || f.v2==v;
+}
+
+__device__ inline void ReplaceFaceVertex(GFace &f, uint32_t from, uint32_t to) {
+  if (f.v0==from) f.v0=to;
+  if (f.v1==from) f.v1=to;
+  if (f.v2==from) f.v2=to;
+}
+
+__device__ inline void ReplaceFaceEdgeId(GFace &f, uint32_t from, uint32_t to) {
+  if (f.e0==from) f.e0=to;
+  if (f.e1==from) f.e1=to;
+  if (f.e2==from) f.e2=to;
+}
+
+__global__ void GenerateCollapseCandidates(
+    const GVertex *vertices, const GEdge *edges, const GFace *faces,
+    uint32_t edgeCount, uint32_t faceCount, float collapseRatio,
+    const unsigned long long *edgeHashKeys, uint32_t hashMask,
+    const uint32_t *vertexEdgeOffsets, const uint32_t *vertexEdgeIds,
+    const GPatch *patches, uint32_t patchCount,
+    CollapseCandidate *candidates, uint32_t candidateCapacity,
+    uint32_t *candidateCount, uint32_t *topologyRejected,
+    uint32_t *semanticRejected, uint32_t *qualityRejected) {
+  const uint32_t id=blockIdx.x*blockDim.x+threadIdx.x;
+  if (id>=edgeCount) return;
+  const GEdge e=edges[id];
+  if (!e.alive || e.f0<0 || e.f1<0 || e.flags!=0) return;
+
+  if (uint32_t(e.f0)>=faceCount || uint32_t(e.f1)>=faceCount) return;
+  const GVertex va=vertices[e.v0], vb=vertices[e.v1];
+  if (!va.alive || !vb.alive) return;
+  const float h=0.5f*(va.targetLength+vb.targetLength);
+  if (!(h>0.0f)) return;
+  const float len2=Dist2(va,vb);
+  const float limit=collapseRatio*h;
+  if (!(len2<limit*limit)) return;
+  const bool vaEditable = va.constraint==uint8_t(VertexConstraint::Free) ||
+                          va.constraint==kSurfaceConstraint;
+  const bool vbEditable = vb.constraint==uint8_t(VertexConstraint::Free) ||
+                          vb.constraint==kSurfaceConstraint;
+  if (!vaEditable || !vbEditable || va.patchId!=vb.patchId) {
+    if (semanticRejected) atomicAdd(semanticRejected,1u);
+    return;
+  }
+  const GFace f0=faces[e.f0], f1=faces[e.f1];
+  if (!f0.alive || !f1.alive || f0.patchId!=f1.patchId || f0.patchId!=va.patchId) {
+    if (semanticRejected) atomicAdd(semanticRejected,1u);
+    return;
+  }
+  const uint32_t keep=min(e.v0,e.v1), remove=max(e.v0,e.v1);
+  const uint32_t c=ThirdVertex(f0,keep,remove), d=ThirdVertex(f1,keep,remove);
+  if (c==kInvalid || d==kInvalid || c==d) {
+    if (topologyRejected) atomicAdd(topologyRejected,1u);
+    return;
+  }
+  uint32_t common=0;
+  for (uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]];
+    if (!x.alive) continue;
+    uint32_t other=kInvalid;
+    if (x.v0==remove) other=x.v1; else if (x.v1==remove) other=x.v0;
+    if (other==kInvalid || other==keep) continue;
+    if (EdgeHashContains(edgeHashKeys,hashMask,keep,other)) ++common;
+  }
+  if (common!=2u) { if(topologyRejected) atomicAdd(topologyRejected,1u); return; }
+  // Link-condition extension: any remove-neighbor other than the two opposite
+  // vertices must not already be adjacent to keep, otherwise the collapse
+  // would create a duplicate edge / non-manifold one-ring.
+  for (uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]];
+    if (!x.alive) continue;
+    uint32_t other=kInvalid;
+    if (x.v0==remove) other=x.v1; else if (x.v1==remove) other=x.v0;
+    if (other==kInvalid || other==keep || other==c || other==d) continue;
+    if (EdgeHashContains(edgeHashKeys,hashMask,keep,other)) {
+      if(topologyRejected) atomicAdd(topologyRejected,1u);
+      return;
+    }
+  }
+
+  constexpr float qMin=1.0e-6f;
+  for (uint32_t j=vertexEdgeOffsets[remove];j<vertexEdgeOffsets[remove+1u];++j) {
+    const GEdge x=edges[vertexEdgeIds[j]];
+    if(!x.alive) continue;
+    const int32_t localFaces[2]={x.f0,x.f1};
+    for(int k=0;k<2;++k) {
+      if(localFaces[k]<0 || uint32_t(localFaces[k])>=faceCount) continue;
+      const uint32_t fi=uint32_t(localFaces[k]);
+      const GFace oldF=faces[fi];
+      if (!oldF.alive || !FaceContainsVertex(oldF,remove)) continue;
+      if (FaceContainsVertex(oldF,keep)) continue;
+      if (oldF.patchId!=va.patchId) { if(semanticRejected) atomicAdd(semanticRejected,1u); return; }
+      GFace nf=oldF;
+      ReplaceFaceVertex(nf,remove,keep);
+      if (nf.v0==nf.v1 || nf.v1==nf.v2 || nf.v0==nf.v2 ||
+          !(TriangleQualityGpu(vertices[nf.v0],vertices[nf.v1],vertices[nf.v2])>qMin) ||
+          !SameHemisphere(vertices[oldF.v0],vertices[oldF.v1],vertices[oldF.v2],
+                          vertices[nf.v0],vertices[nf.v1],vertices[nf.v2]) ||
+          !PatchOrientationSafe(patches, patchCount, nf.patchId,
+                                vertices[nf.v0],vertices[nf.v1],vertices[nf.v2])) {
+        if (qualityRejected) atomicAdd(qualityRejected,1u);
+        return;
+      }
+    }
+  }
+  const uint32_t slot=atomicAdd(candidateCount,1u);
+  if (slot>=candidateCapacity) return;
+  const float len=sqrtf(len2);
+  candidates[slot]={id,e.generation,keep,remove,c,d,uint32_t(e.f0),uint32_t(e.f1),
+                    h/fmaxf(len,1e-12f),0u,{0,0,0}};
+}
+
+__device__ inline unsigned long long CollapseWinnerKey(const CollapseCandidate &c,uint32_t id) {
+  const uint32_t bits=__float_as_uint(c.priority);
+  return (unsigned long long(bits)<<32)|unsigned long long(0xffffffffu-id);
+}
+
+__device__ inline void ClaimCollapseVertexRing(uint32_t v,const GEdge *edges,
+    const uint32_t *offsets,const uint32_t *edgeIds,unsigned long long key,
+    unsigned long long *vertexWinner) {
+  atomicMax(vertexWinner+v,key);
+  for(uint32_t i=offsets[v];i<offsets[v+1u];++i) {
+    const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+    atomicMax(vertexWinner+e.v0,key); atomicMax(vertexWinner+e.v1,key);
+  }
+}
+
+__device__ inline bool OwnCollapseVertexRing(uint32_t v,const GEdge *edges,
+    const uint32_t *offsets,const uint32_t *edgeIds,unsigned long long key,
+    const unsigned long long *vertexWinner) {
+  if(vertexWinner[v]!=key) return false;
+  for(uint32_t i=offsets[v];i<offsets[v+1u];++i) {
+    const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+    if(vertexWinner[e.v0]!=key||vertexWinner[e.v1]!=key) return false;
+  }
+  return true;
+}
+
+__device__ inline void BlockCollapseVertexRing(uint32_t v,const GEdge *edges,
+    const uint32_t *offsets,const uint32_t *edgeIds,uint8_t *vertexBlocked) {
+  vertexBlocked[v]=1;
+  for(uint32_t i=offsets[v];i<offsets[v+1u];++i) {
+    const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+    vertexBlocked[e.v0]=1; vertexBlocked[e.v1]=1;
+  }
+}
+
+__device__ inline bool CollapseVertexRingBlocked(uint32_t v,const GEdge *edges,
+    const uint32_t *offsets,const uint32_t *edgeIds,const uint8_t *vertexBlocked) {
+  if(vertexBlocked[v]) return true;
+  for(uint32_t i=offsets[v];i<offsets[v+1u];++i) {
+    const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
+    if(vertexBlocked[e.v0]||vertexBlocked[e.v1]) return true;
+  }
+  return false;
+}
+
+__global__ void ClaimCollapseCandidates(const CollapseCandidate *candidates,const uint32_t *active,
+    uint32_t activeCount,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    unsigned long long *vertexWinner) {
+  const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
+  const uint32_t id=active[slot]; const CollapseCandidate c=candidates[id];
+  const unsigned long long key=CollapseWinnerKey(c,id);
+  ClaimCollapseVertexRing(c.keep,edges,offsets,edgeIds,key,vertexWinner);
+  ClaimCollapseVertexRing(c.remove,edges,offsets,edgeIds,key,vertexWinner);
+}
+
+__global__ void ResolveCollapseCandidates(CollapseCandidate *candidates,const uint32_t *active,
+    uint32_t activeCount,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    const unsigned long long *vertexWinner,uint8_t *vertexBlocked,
+    uint32_t *acceptedCount,uint32_t *roundAccepted) {
+  const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
+  const uint32_t id=active[slot]; CollapseCandidate &c=candidates[id];
+  const unsigned long long key=CollapseWinnerKey(c,id);
+  if(!OwnCollapseVertexRing(c.keep,edges,offsets,edgeIds,key,vertexWinner) ||
+     !OwnCollapseVertexRing(c.remove,edges,offsets,edgeIds,key,vertexWinner)) return;
+  c.accepted=1;
+  BlockCollapseVertexRing(c.keep,edges,offsets,edgeIds,vertexBlocked);
+  BlockCollapseVertexRing(c.remove,edges,offsets,edgeIds,vertexBlocked);
+  atomicAdd(acceptedCount,1u); atomicAdd(roundAccepted,1u);
+}
+
+__global__ void CompactCollapseCandidates(CollapseCandidate *candidates,const uint32_t *active,
+    uint32_t activeCount,const GEdge *edges,const uint32_t *offsets,const uint32_t *edgeIds,
+    const uint8_t *vertexBlocked,uint32_t *nextActive,uint32_t *nextCount) {
+  const uint32_t slot=blockIdx.x*blockDim.x+threadIdx.x; if(slot>=activeCount) return;
+  const uint32_t id=active[slot]; CollapseCandidate &c=candidates[id];
+  if(c.accepted!=0) return;
+  if(CollapseVertexRingBlocked(c.keep,edges,offsets,edgeIds,vertexBlocked) ||
+     CollapseVertexRingBlocked(c.remove,edges,offsets,edgeIds,vertexBlocked)) {
+    c.accepted=2; return;
+  }
+  nextActive[atomicAdd(nextCount,1u)]=id;
+}
+
+__device__ inline int32_t OtherFace(const GEdge &e,uint32_t faceId) {
+  if(e.f0==int32_t(faceId)) return e.f1;
+  if(e.f1==int32_t(faceId)) return e.f0;
+  return -1;
+}
+
+__global__ void ExecuteCollapseCandidates(GVertex *vertices,GEdge *edges,GFace *faces,
+    CollapseCandidate *candidates,uint32_t candidateCount,uint32_t edgeCount,uint32_t faceCount,
+    const uint32_t *vertexEdgeOffsets,const uint32_t *vertexEdgeIds,uint32_t *staleRejected) {
+  const uint32_t id=blockIdx.x*blockDim.x+threadIdx.x;
+  if(id>=candidateCount||candidates[id].accepted!=1) return;
+  const CollapseCandidate c=candidates[id];
+  GEdge &src=edges[c.edgeId];
+  if(!src.alive||src.generation!=c.edgeGeneration||
+     !vertices[c.keep].alive||!vertices[c.remove].alive){atomicAdd(staleRejected,1u);return;}
+  if(c.f0>=faceCount||c.f1>=faceCount||!faces[c.f0].alive||!faces[c.f1].alive){atomicAdd(staleRejected,1u);return;}
+  const uint32_t eKC=FindFaceEdge(faces[c.f0],edges,c.keep,c.c);
+  const uint32_t eRC=FindFaceEdge(faces[c.f0],edges,c.remove,c.c);
+  const uint32_t eKD=FindFaceEdge(faces[c.f1],edges,c.keep,c.d);
+  const uint32_t eRD=FindFaceEdge(faces[c.f1],edges,c.remove,c.d);
+  if(eKC==kInvalid||eRC==kInvalid||eKD==kInvalid||eRD==kInvalid){atomicAdd(staleRejected,1u);return;}
+  const int32_t outKC=OtherFace(edges[eKC],c.f0), outRC=OtherFace(edges[eRC],c.f0);
+  const int32_t outKD=OtherFace(edges[eKD],c.f1), outRD=OtherFace(edges[eRD],c.f1);
+  if(outKC<0||outRC<0||outKD<0||outRD<0||
+     uint32_t(outKC)>=faceCount||uint32_t(outRC)>=faceCount||
+     uint32_t(outKD)>=faceCount||uint32_t(outRD)>=faceCount||
+     !faces[outKC].alive||!faces[outRC].alive||!faces[outKD].alive||!faces[outRD].alive){
+    atomicAdd(staleRejected,1u);return;
+  }
+
+  // Update only the remove one-ring faces from the pass-snapshot CSR.
+  for(uint32_t i=vertexEdgeOffsets[c.remove];i<vertexEdgeOffsets[c.remove+1u];++i){
+    const GEdge e=edges[vertexEdgeIds[i]];
+    if(!e.alive) continue;
+    const int32_t fs[2]={e.f0,e.f1};
+    for(int k=0;k<2;++k){
+      if(fs[k]<0||uint32_t(fs[k])>=faceCount) continue;
+      const uint32_t fi=uint32_t(fs[k]);
+      if(fi==c.f0||fi==c.f1) continue;
+      GFace &f=faces[fi];
+      if(f.alive&&FaceContainsVertex(f,c.remove)){ReplaceFaceVertex(f,c.remove,c.keep);++f.generation;}
+    }
+  }
+
+  // Update only edges incident to the removed vertex.
+  for(uint32_t i=vertexEdgeOffsets[c.remove];i<vertexEdgeOffsets[c.remove+1u];++i){
+    GEdge &e=edges[vertexEdgeIds[i]]; if(!e.alive) continue;
+    bool changed=false;
+    if(e.v0==c.remove){e.v0=c.keep;changed=true;}
+    if(e.v1==c.remove){e.v1=c.keep;changed=true;}
+    if(changed) ++e.generation;
+  }
+
+  ReplaceFaceEdgeId(faces[outRC],eRC,eKC);
+  ReplaceFaceEdgeId(faces[outRD],eRD,eKD);
+  edges[eKC].f0=outKC; edges[eKC].f1=outRC; ++edges[eKC].generation;
+  edges[eKD].f0=outKD; edges[eKD].f1=outRD; ++edges[eKD].generation;
+  edges[eRC].alive=0; edges[eRC].f0=edges[eRC].f1=-1; ++edges[eRC].generation;
+  edges[eRD].alive=0; edges[eRD].f0=edges[eRD].f1=-1; ++edges[eRD].generation;
+  src.alive=0; src.f0=src.f1=-1; ++src.generation;
+  faces[c.f0].alive=0; ++faces[c.f0].generation;
+  faces[c.f1].alive=0; ++faces[c.f1].generation;
+  vertices[c.remove].alive=0; ++vertices[c.remove].generation;
+}
+
 __device__ inline float FaceArea2(const GVertex *vertices, const GFace &f) {
   const GVertex a = vertices[f.v0], b = vertices[f.v1], c = vertices[f.v2];
   const float abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
@@ -1282,6 +1625,7 @@ struct GlobalSplitBackend::Impl {
   uint32_t gpuPatchCount = 0;
   SplitCandidate *candidates = nullptr;
   FlipCandidate *flipCandidates = nullptr;
+  CollapseCandidate *collapseCandidates = nullptr;
   TriangleRefineCandidate *triangleCandidates = nullptr;
   unsigned long long *edgeHashKeys = nullptr;
   uint32_t *edgeOwner = nullptr;
@@ -1309,11 +1653,18 @@ struct GlobalSplitBackend::Impl {
   uint32_t *capacityRejected = nullptr;
   uint32_t *semanticRejected = nullptr;
   uint32_t *qualityRejected = nullptr;
+  uint32_t *collapseTopologyRejected = nullptr;
   uint32_t *projectionApplied = nullptr;
   uint32_t *projectionFailed = nullptr;
   uint32_t *triangleRejectCounters = nullptr;
   uint32_t *triangleEditableHistogram = nullptr;
   uint32_t *splitNewVertexCount = nullptr;
+  uint32_t *vertexEdgeCounts = nullptr;
+  uint32_t *vertexEdgeOffsets = nullptr;
+  uint32_t *vertexEdgeCursor = nullptr;
+  uint32_t *vertexEdgeIds = nullptr;
+  void *adjacencyScanTemp = nullptr;
+  size_t adjacencyScanTempBytes = 0;
 
   uint32_t vertexCapacity = 0;
   uint32_t edgeCapacity = 0;
@@ -1343,6 +1694,9 @@ struct GlobalSplitBackend::Impl {
       GrowManagedArray(vertexOwner, 0, newV, "grow vertex owners");
       GrowManagedArray(splitVertexWinner, 0, newV, "grow vertex winners");
       GrowManagedArray(vertexBlocked, 0, newV, "grow vertex blocked");
+      GrowManagedArray(vertexEdgeCounts, 0, size_t(newV)+1u, "grow vertex edge counts");
+      GrowManagedArray(vertexEdgeOffsets, 0, size_t(newV)+1u, "grow vertex edge offsets");
+      GrowManagedArray(vertexEdgeCursor, 0, newV, "grow vertex edge cursor");
       vertexCapacity = newV;
     }
     if (newE != oldE) {
@@ -1352,9 +1706,11 @@ struct GlobalSplitBackend::Impl {
       GrowManagedArray(edgeBlocked, 0, newE, "grow edge blocked");
       GrowManagedArray(candidates, preserveCandidates, newE, "grow split candidates");
       GrowManagedArray(flipCandidates, preserveCandidates, newE, "grow flip candidates");
+      GrowManagedArray(collapseCandidates, preserveCandidates, newE, "grow collapse candidates");
       GrowManagedArray(triangleCandidates, preserveCandidates, newE, "grow triangle candidates");
       GrowManagedArray(activeQueueA, 0, newE, "grow active queue A");
       GrowManagedArray(activeQueueB, 0, newE, "grow active queue B");
+      GrowManagedArray(vertexEdgeIds, 0, size_t(newE)*2u, "grow vertex edge ids");
       candidateCapacity = newE;
       edgeCapacity = newE;
 
@@ -1374,6 +1730,39 @@ struct GlobalSplitBackend::Impl {
     }
   }
 
+  void BuildVertexEdgeAdjacency() {
+    const uint32_t nv=*vertexCount, ne=*edgeCount;
+    if(nv==0) return;
+    CheckCuda(cudaMemset(vertexEdgeCounts,0,sizeof(uint32_t)*(size_t(nv)+1u)),
+              "reset vertex edge counts");
+    constexpr uint32_t threads=256;
+    if(ne>0) {
+      const uint32_t blocks=(ne+threads-1u)/threads;
+      CountVertexEdges<<<blocks,threads>>>(edges,ne,nv,vertexEdgeCounts);
+      CheckCuda(cudaDeviceSynchronize(),"CountVertexEdges");
+    }
+    size_t requiredBytes=0;
+    CheckCuda(cub::DeviceScan::ExclusiveSum(nullptr,requiredBytes,
+              vertexEdgeCounts,vertexEdgeOffsets,nv+1u),"query vertex edge scan");
+    if(requiredBytes>adjacencyScanTempBytes) {
+      cudaFree(adjacencyScanTemp); adjacencyScanTemp=nullptr;
+      CheckCuda(cudaMalloc(&adjacencyScanTemp,requiredBytes),"alloc vertex edge scan temp");
+      adjacencyScanTempBytes=requiredBytes;
+    }
+    CheckCuda(cub::DeviceScan::ExclusiveSum(adjacencyScanTemp,adjacencyScanTempBytes,
+              vertexEdgeCounts,vertexEdgeOffsets,nv+1u),"scan vertex edge offsets");
+    CheckCuda(cudaDeviceSynchronize(),"scan vertex edge offsets sync");
+    if(vertexEdgeOffsets[nv] > size_t(edgeCapacity)*2u)
+      throw std::runtime_error("vertex edge adjacency capacity exhausted");
+    CheckCuda(cudaMemset(vertexEdgeCursor,0,sizeof(uint32_t)*nv),"reset vertex edge cursor");
+    if(ne>0) {
+      const uint32_t blocks=(ne+threads-1u)/threads;
+      FillVertexEdges<<<blocks,threads>>>(edges,ne,nv,vertexEdgeOffsets,
+                                          vertexEdgeCursor,vertexEdgeIds);
+      CheckCuda(cudaDeviceSynchronize(),"FillVertexEdges");
+    }
+  }
+
   ~Impl() {
     cudaFree(vertices);
     cudaFree(edges);
@@ -1381,6 +1770,7 @@ struct GlobalSplitBackend::Impl {
     cudaFree(gpuPatches);
     cudaFree(candidates);
     cudaFree(flipCandidates);
+    cudaFree(collapseCandidates);
     cudaFree(triangleCandidates);
     cudaFree(edgeHashKeys);
     cudaFree(edgeOwner);
@@ -1407,21 +1797,31 @@ struct GlobalSplitBackend::Impl {
     cudaFree(capacityRejected);
     cudaFree(semanticRejected);
     cudaFree(qualityRejected);
+    cudaFree(collapseTopologyRejected);
     cudaFree(projectionApplied);
     cudaFree(projectionFailed);
     cudaFree(triangleRejectCounters);
     cudaFree(triangleEditableHistogram);
     cudaFree(splitNewVertexCount);
+    cudaFree(vertexEdgeCounts);
+    cudaFree(vertexEdgeOffsets);
+    cudaFree(vertexEdgeCursor);
+    cudaFree(vertexEdgeIds);
+    cudaFree(adjacencyScanTemp);
   }
 
   size_t MemoryBytes() const {
     return size_t(vertexCapacity) * sizeof(GVertex) +
-           size_t(edgeCapacity) * (sizeof(GEdge) + sizeof(SplitCandidate) + sizeof(FlipCandidate) + sizeof(TriangleRefineCandidate) + 3 * sizeof(uint32_t) + sizeof(uint8_t)) +
+           size_t(edgeCapacity) * (sizeof(GEdge) + sizeof(SplitCandidate) + sizeof(FlipCandidate) + sizeof(CollapseCandidate) + sizeof(TriangleRefineCandidate) + 3 * sizeof(uint32_t) + sizeof(uint8_t)) +
            size_t(faceCapacity) * (sizeof(GFace) + sizeof(uint32_t) + sizeof(uint8_t)) +
            size_t(vertexCapacity) * (sizeof(uint32_t) + sizeof(uint8_t) + sizeof(unsigned long long)) +
            size_t(edgeCapacity) * sizeof(unsigned long long) +
            size_t(faceCapacity) * sizeof(unsigned long long) +
            size_t(gpuPatchCount) * sizeof(GPatch) +
+           (size_t(vertexCapacity)+1u) * 2u * sizeof(uint32_t) +
+           size_t(vertexCapacity) * sizeof(uint32_t) +
+           size_t(edgeCapacity) * 2u * sizeof(uint32_t) +
+           adjacencyScanTempBytes +
            sizeof(ValidationCounters) + 13 * sizeof(uint32_t);
   }
 };
@@ -1458,6 +1858,7 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
     if (mImpl->gpuPatchCount > 0) mImpl->gpuPatches = AllocManaged<GPatch>(mImpl->gpuPatchCount);
     mImpl->candidates = AllocManaged<SplitCandidate>(mImpl->candidateCapacity);
     mImpl->flipCandidates = AllocManaged<FlipCandidate>(mImpl->candidateCapacity);
+    mImpl->collapseCandidates = AllocManaged<CollapseCandidate>(mImpl->candidateCapacity);
     mImpl->triangleCandidates = AllocManaged<TriangleRefineCandidate>(mImpl->candidateCapacity);
     mImpl->edgeHashKeys = AllocManaged<unsigned long long>(mImpl->edgeHashCapacity);
     mImpl->edgeOwner = AllocManaged<uint32_t>(mImpl->edgeCapacity);
@@ -1484,11 +1885,16 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
     mImpl->capacityRejected = AllocManaged<uint32_t>(1);
     mImpl->semanticRejected = AllocManaged<uint32_t>(1);
     mImpl->qualityRejected = AllocManaged<uint32_t>(1);
+    mImpl->collapseTopologyRejected = AllocManaged<uint32_t>(1);
     mImpl->projectionApplied = AllocManaged<uint32_t>(1);
     mImpl->projectionFailed = AllocManaged<uint32_t>(1);
     mImpl->triangleRejectCounters = AllocManaged<uint32_t>(4);
     mImpl->triangleEditableHistogram = AllocManaged<uint32_t>(4);
     mImpl->splitNewVertexCount = AllocManaged<uint32_t>(1);
+    mImpl->vertexEdgeCounts = AllocManaged<uint32_t>(size_t(mImpl->vertexCapacity)+1u);
+    mImpl->vertexEdgeOffsets = AllocManaged<uint32_t>(size_t(mImpl->vertexCapacity)+1u);
+    mImpl->vertexEdgeCursor = AllocManaged<uint32_t>(mImpl->vertexCapacity);
+    mImpl->vertexEdgeIds = AllocManaged<uint32_t>(size_t(mImpl->edgeCapacity)*2u);
 
     *mImpl->vertexCount = nv;
     *mImpl->edgeCount = ne;
@@ -1502,21 +1908,45 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
     *mImpl->capacityRejected = 0;
     *mImpl->semanticRejected = 0;
     *mImpl->qualityRejected = 0;
+    *mImpl->collapseTopologyRejected = 0;
     *mImpl->projectionApplied = 0;
     *mImpl->projectionFailed = 0;
     for (int i = 0; i < 4; ++i) { mImpl->triangleRejectCounters[i] = 0; mImpl->triangleEditableHistogram[i] = 0; }
     *mImpl->splitNewVertexCount = 0;
+
+    std::vector<float> patchOrientation(mImpl->gpuPatchCount, 0.0f);
+    for (uint32_t f = 0; f < uint32_t(src.faceCount()); ++f) {
+      if (!src.faceAlive[f]) continue;
+      const uint32_t patchId = src.facePatchId[f];
+      if (patchId >= src.patches.size()) continue;
+      const PatchRecord &p = src.patches[patchId];
+      Vec3 an{};
+      const Vec3 a = src.facePoint(int(f), 0);
+      const Vec3 b = src.facePoint(int(f), 1);
+      const Vec3 c = src.facePoint(int(f), 2);
+      const Vec3 mid = centroid3(a, b, c);
+      if (p.type == PatchType::Plane) {
+        an = normalize(p.axis, {0, 0, 1});
+      } else if (p.type == PatchType::Cylinder) {
+        const Vec3 axis = normalize(p.axis, {0, 0, 1});
+        const Vec3 off = mid - p.origin;
+        an = normalize(off - axis * dot(off, axis), {0, 0, 0});
+      }
+      if (length2(an) > 0.0f)
+        patchOrientation[patchId] += dot(cross(b - a, c - a), an);
+    }
 
     for (uint32_t i = 0; i < mImpl->gpuPatchCount; ++i) {
       const PatchRecord &p = src.patches[i];
       const float ax=p.axis.x, ay=p.axis.y, az=p.axis.z;
       const float n=std::sqrt(ax*ax+ay*ay+az*az);
       const float inv=n>1e-20f ? 1.0f/n : 1.0f;
+      const float orientationSign = patchOrientation[i] < 0.0f ? -1.0f : 1.0f;
       mImpl->gpuPatches[i] = {p.origin.x,p.origin.y,p.origin.z,
                               n>1e-20f?ax*inv:0.0f,
                               n>1e-20f?ay*inv:0.0f,
                               n>1e-20f?az*inv:1.0f,
-                              p.radius,uint8_t(p.type),{0,0,0}};
+                              p.radius,orientationSign,uint8_t(p.type),{0,0,0}};
     }
 
     for (uint32_t v = 0; v < nv; ++v) {
@@ -1830,6 +2260,128 @@ bool GlobalSplitBackend::RunSplitPass(float splitRatio, GlobalSplitReport &repor
   }
 }
 
+bool GlobalSplitBackend::RunCollapsePass(float collapseRatio, GlobalCollapseReport &report,
+                                         std::string *error) {
+  report = {};
+  const auto totalStart = std::chrono::steady_clock::now();
+  try {
+    if (!mImpl->vertices) throw std::runtime_error("backend not initialized");
+    *mImpl->candidateCount = 0;
+    *mImpl->acceptedCount = 0;
+    *mImpl->roundAccepted = 0;
+    *mImpl->activeCount = 0;
+    *mImpl->nextActiveCount = 0;
+    *mImpl->staleRejected = 0;
+    *mImpl->semanticRejected = 0;
+    *mImpl->qualityRejected = 0;
+    *mImpl->collapseTopologyRejected = 0;
+
+    const uint32_t edgeCount = *mImpl->edgeCount;
+    const uint32_t faceCount = *mImpl->faceCount;
+    constexpr uint32_t threads = 256;
+    const uint32_t edgeBlocks = (edgeCount + threads - 1u) / threads;
+    CheckCuda(cudaMemset(mImpl->edgeHashKeys, 0,
+                         sizeof(unsigned long long) * mImpl->edgeHashCapacity),
+              "reset collapse edge hash");
+    BuildEdgeHash<<<edgeBlocks, threads>>>(mImpl->edges, edgeCount, mImpl->edgeHashKeys,
+                                           mImpl->edgeHashCapacity - 1u);
+    CheckCuda(cudaDeviceSynchronize(), "BuildEdgeHash collapse");
+
+    auto adjacencyMark = std::chrono::steady_clock::now();
+    mImpl->BuildVertexEdgeAdjacency();
+    report.adjacencyMs = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - adjacencyMark).count();
+    auto mark = std::chrono::steady_clock::now();
+    GenerateCollapseCandidates<<<edgeBlocks, threads>>>(
+        mImpl->vertices, mImpl->edges, mImpl->faces, edgeCount, faceCount, collapseRatio,
+        mImpl->edgeHashKeys, mImpl->edgeHashCapacity - 1u,
+        mImpl->vertexEdgeOffsets, mImpl->vertexEdgeIds,
+        mImpl->gpuPatches, mImpl->gpuPatchCount, mImpl->collapseCandidates,
+        mImpl->candidateCapacity, mImpl->candidateCount, mImpl->collapseTopologyRejected,
+        mImpl->semanticRejected, mImpl->qualityRejected);
+    CheckCuda(cudaDeviceSynchronize(), "GenerateCollapseCandidates");
+    report.candidateMs = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - mark).count();
+
+    const uint32_t candidates = std::min(*mImpl->candidateCount, mImpl->candidateCapacity);
+    report.candidateCount = candidates;
+    report.topologyRejected = *mImpl->collapseTopologyRejected;
+    report.semanticRejected = *mImpl->semanticRejected;
+    report.qualityRejected = *mImpl->qualityRejected;
+    if (candidates == 0) {
+      report.globalMemoryBytes = mImpl->MemoryBytes();
+      report.totalMs = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - totalStart).count();
+      return true;
+    }
+
+    const uint32_t candidateBlocks = (candidates + threads - 1u) / threads;
+    CheckCuda(cudaMemset(mImpl->vertexBlocked, 0,
+                         sizeof(uint8_t) * mImpl->vertexCapacity),
+              "reset collapse blocked vertices");
+    InitActiveQueue<<<candidateBlocks, threads>>>(mImpl->activeQueueA, candidates);
+    CheckCuda(cudaDeviceSynchronize(), "InitCollapseActiveQueue");
+    *mImpl->activeCount = candidates;
+    uint32_t *active = mImpl->activeQueueA;
+    uint32_t *next = mImpl->activeQueueB;
+    mark = std::chrono::steady_clock::now();
+    constexpr int kMaxClaimRounds = 4;
+    int claimRounds = 0;
+    for (; claimRounds < kMaxClaimRounds && *mImpl->activeCount > 0; ++claimRounds) {
+      const uint32_t activeNow = *mImpl->activeCount;
+      report.activeItemsScanned += activeNow;
+      const uint32_t activeBlocks = (activeNow + threads - 1u) / threads;
+      CheckCuda(cudaMemset(mImpl->splitVertexWinner, 0,
+                           sizeof(unsigned long long) * mImpl->vertexCapacity),
+                "reset collapse vertex winners");
+      *mImpl->roundAccepted = 0;
+      ClaimCollapseCandidates<<<activeBlocks, threads>>>(
+          mImpl->collapseCandidates, active, activeNow, mImpl->edges,
+          mImpl->vertexEdgeOffsets, mImpl->vertexEdgeIds,
+          mImpl->splitVertexWinner);
+      CheckCuda(cudaDeviceSynchronize(), "ClaimCollapseCandidates");
+      ResolveCollapseCandidates<<<activeBlocks, threads>>>(
+          mImpl->collapseCandidates, active, activeNow, mImpl->edges,
+          mImpl->vertexEdgeOffsets, mImpl->vertexEdgeIds,
+          mImpl->splitVertexWinner, mImpl->vertexBlocked,
+          mImpl->acceptedCount, mImpl->roundAccepted);
+      CheckCuda(cudaDeviceSynchronize(), "ResolveCollapseCandidates");
+      if (*mImpl->roundAccepted == 0) break;
+      *mImpl->nextActiveCount = 0;
+      CompactCollapseCandidates<<<activeBlocks, threads>>>(
+          mImpl->collapseCandidates, active, activeNow, mImpl->edges,
+          mImpl->vertexEdgeOffsets, mImpl->vertexEdgeIds,
+          mImpl->vertexBlocked, next, mImpl->nextActiveCount);
+      CheckCuda(cudaDeviceSynchronize(), "CompactCollapseCandidates");
+      *mImpl->activeCount = *mImpl->nextActiveCount;
+      std::swap(active, next);
+    }
+    report.schedulerRounds = uint32_t(claimRounds);
+    report.claimMs = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - mark).count();
+
+    const uint32_t accepted = *mImpl->acceptedCount;
+    mark = std::chrono::steady_clock::now();
+    ExecuteCollapseCandidates<<<candidateBlocks, threads>>>(
+        mImpl->vertices, mImpl->edges, mImpl->faces, mImpl->collapseCandidates,
+        candidates, edgeCount, faceCount, mImpl->vertexEdgeOffsets,
+        mImpl->vertexEdgeIds, mImpl->staleRejected);
+    CheckCuda(cudaDeviceSynchronize(), "ExecuteCollapseCandidates");
+    report.executeMs = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - mark).count();
+    report.staleRejected = *mImpl->staleRejected;
+    report.acceptedCount = accepted >= report.staleRejected ? accepted - report.staleRejected : 0;
+    report.globalMemoryBytes = mImpl->MemoryBytes();
+    report.dynamicSharedMemoryBytes = 0;
+    report.totalMs = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - totalStart).count();
+    return true;
+  } catch (const std::exception &e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
 bool GlobalSplitBackend::RunFlipPass(float minQualityGain, GlobalFlipReport &report,
                                      std::string *error) {
   report = {};
@@ -1985,21 +2537,27 @@ bool GlobalSplitBackend::Export(SemanticMesh &mesh, std::string *error) const {
 
     SemanticMesh out;
     out.patches = mImpl->patches;
-    out.resizeVertices(int(nv));
+    std::vector<uint32_t> vertexMap(nv, kInvalid);
     for (uint32_t v = 0; v < nv; ++v) {
       const GVertex &gv = mImpl->vertices[v];
-      out.setPosition(int(v), {gv.x, gv.y, gv.z});
-      out.vertexPatchId[v] = gv.patchId;
-      out.vertexConstraint[v] = gv.constraint;
-      out.targetLength[v] = gv.targetLength;
+      if (!gv.alive) continue;
+      const int mapped = out.addVertex({gv.x, gv.y, gv.z}, gv.patchId,
+                                       VertexConstraint(gv.constraint));
+      out.targetLength[mapped] = gv.targetLength;
+      vertexMap[v] = uint32_t(mapped);
     }
 
     for (uint32_t f = 0; f < nf; ++f) {
       const GFace &gf = mImpl->faces[f];
       if (!gf.alive) continue;
+      if (gf.v0 >= nv || gf.v1 >= nv || gf.v2 >= nv ||
+          vertexMap[gf.v0] == kInvalid || vertexMap[gf.v1] == kInvalid ||
+          vertexMap[gf.v2] == kInvalid)
+        throw std::runtime_error("export references a dead vertex");
       PatchType type = PatchType::Unknown;
       if (gf.patchId < out.patches.size()) type = out.patches[gf.patchId].type;
-      out.addFace(int(gf.v0), int(gf.v1), int(gf.v2), gf.patchId, type);
+      out.addFace(int(vertexMap[gf.v0]), int(vertexMap[gf.v1]), int(vertexMap[gf.v2]),
+                  gf.patchId, type);
     }
     out.rebuildTopology();
     std::string validationError;

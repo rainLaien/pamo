@@ -69,6 +69,26 @@ struct GlobalTriangleRefineReport {
   size_t dynamicSharedMemoryBytes = 0;
 };
 
+struct GlobalCollapseReport {
+  uint32_t candidateCount = 0;
+  uint32_t acceptedCount = 0;
+  uint32_t staleRejected = 0;
+  uint32_t topologyRejected = 0;
+  uint32_t semanticRejected = 0;
+  uint32_t qualityRejected = 0;
+  uint32_t schedulerRounds = 0;
+  uint64_t activeItemsScanned = 0;
+
+  double adjacencyMs = 0;
+  double candidateMs = 0;
+  double claimMs = 0;
+  double executeMs = 0;
+  double totalMs = 0;
+
+  size_t globalMemoryBytes = 0;
+  size_t dynamicSharedMemoryBytes = 0;
+};
+
 struct GlobalFlipReport {
   uint32_t candidateCount = 0;
   uint32_t acceptedCount = 0;
@@ -98,6 +118,8 @@ public:
   bool RunSplitPass(float splitRatio, GlobalSplitReport &report,
                     std::string *error = nullptr,
                     float maxRatio = std::numeric_limits<float>::infinity());
+  bool RunCollapsePass(float collapseRatio, GlobalCollapseReport &report,
+                       std::string *error = nullptr);
   bool RunFlipPass(float minQualityGain, GlobalFlipReport &report, std::string *error = nullptr);
   bool Validate(GlobalTopologyValidation &validation, std::string *error = nullptr) const;
   bool Export(SemanticMesh &mesh, std::string *error = nullptr) const;
