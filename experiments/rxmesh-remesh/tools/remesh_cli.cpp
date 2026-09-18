@@ -8,6 +8,8 @@
 #endif
 
 #include "cad_adaptive/PartitionInput.h"
+#include "cad_adaptive/BoundarySizingField.h"
+#include "cad_adaptive/CylinderFilletInitializer.h"
 #include "cad_adaptive/GeometryProjector.h"
 #include <algorithm>
 #include <cmath>
@@ -33,7 +35,12 @@ int main(int argc, char **argv) {
   if (argc < 3) {
     std::cerr << "usage: cad_adaptive_cli INPUT.(obj|stl) OUTPUT.ply [target_length] [--gpu|--cpu|--global]\n"
               << "       cad_adaptive_cli INPUT.cadpart OUTPUT.ply [target_length] --partition [--gpu|--cpu|--global]\n"
-              << "       cad_adaptive_cli --grid TRIS OUTPUT.ply [target_length] [--gpu|--cpu|--global]\n";
+              << "       cad_adaptive_cli --grid TRIS OUTPUT.ply [target_length] [--gpu|--cpu|--global]\n"
+              << "       --boundary-gradation G (0<G<=1), --uniform-sizing, --local-sizing\n"
+              << "       --curvature-sizing is opt-in and may greatly increase mesh density\n"
+              << "       --no-fillet-initialization disables automatic cylindrical fillet seeding\n"
+              << "       --save-initial-mesh saves OUTPUT.ply.initial.ply before GPU iterations\n"
+              << "       --detailed-diagnostics enables expensive per-smooth quality statistics\n";
     return 2;
   }
   const bool grid = std::strcmp(argv[1], "--grid") == 0;
@@ -53,6 +60,18 @@ int main(int argc, char **argv) {
   float maxSizingOutlierFraction = 0.05f;
   float normalDegrees = 10.0f;
   float referenceSampleError = -1.0f;
+  // Local boundary grading and recognized fillet seeding are enabled by default.
+  // A curvature cap for other cylindrical patches remains opt-in.
+  bool localSizing=true, forceLocalSizing=false, curvatureSizing=false;
+  bool filletInitialization=true, saveInitialMesh=false;
+  bool detailedDiagnostics=false;
+  double secondsFilletInitialization=0;
+  float worstPatchQualityP05=0;
+  float finalQualityFloor=0;
+  CylinderFilletInitReport filletReport;
+  float boundaryGradation=0.35f;
+  int localBoundarySplits=0;
+  double secondsLocalSizing=0.0;
   const char *termination = "not_assessed";
   int completedCycles = 0;
   float sizingOutlierFraction = 0.0f;
@@ -64,6 +83,16 @@ int main(int argc, char **argv) {
     else if (std::strcmp(argv[i], "--global") == 0) { useGlobal = true; useGpu = false; }
     else if (std::strcmp(argv[i], "--gpu") == 0) { useGpu = true; useGlobal = false; }
     else if (std::strcmp(argv[i], "--cpu") == 0) { useGpu = false; useGlobal = false; }
+    else if (std::strcmp(argv[i], "--no-fillet-initialization") == 0) filletInitialization=false;
+    else if (std::strcmp(argv[i], "--fillet-initialization") == 0) filletInitialization=true;
+    else if (std::strcmp(argv[i], "--save-initial-mesh") == 0) saveInitialMesh=true;
+    else if (std::strcmp(argv[i], "--detailed-diagnostics") == 0) detailedDiagnostics=true;
+    else if (std::strcmp(argv[i], "--uniform-sizing") == 0) localSizing=false;
+    else if (std::strcmp(argv[i], "--local-sizing") == 0) {localSizing=true;forceLocalSizing=true;}
+    else if (std::strcmp(argv[i], "--curvature-sizing") == 0) curvatureSizing=true;
+    else if (std::strcmp(argv[i], "--no-curvature-sizing") == 0) curvatureSizing=false;
+    else if (std::strcmp(argv[i], "--boundary-gradation") == 0 && i+1<argc)
+      boundaryGradation=std::strtof(argv[++i],nullptr);
     else if (std::strcmp(argv[i], "--no-smooth") == 0) smooth=false;
     else if (std::strcmp(argv[i], "--no-collapse") == 0) collapse=false;
     else if (std::strcmp(argv[i], "--no-flip") == 0) flip=false;
@@ -101,7 +130,9 @@ int main(int argc, char **argv) {
       target=value;
     }
   }
-  if(iters<1 || splitPasses<1 || collapsePasses<1 ||
+  if((forceLocalSizing && !useGlobal) || !std::isfinite(boundaryGradation) ||
+     boundaryGradation<=0.0f || boundaryGradation>1.0f ||
+     iters<1 || splitPasses<1 || collapsePasses<1 ||
      !std::isfinite(target) || target<0 || !std::isfinite(maxError) || maxError<0 ||
      !std::isfinite(cavityRatio) || cavityRatio<=4.0f/3.0f ||
      !std::isfinite(smoothLambda) || smoothLambda<0 || smoothLambda>1 ||
@@ -170,9 +201,52 @@ int main(int argc, char **argv) {
     mesh.targetLength.assign(size_t(mesh.vertexCount()), cfg.constantLength);
   }
   mesh.rebuildTopology();
+  if(useGlobal && localSizing && (partitionInput || forceLocalSizing)) {
+    const auto fieldStart=Clock::now();
+    try {
+      if(filletInitialization && partitionInput) {
+        const auto initialStart=Clock::now();
+        if(!initializeCylinderFillets(mesh,cfg,filletReport,&error)) throw std::runtime_error(error);
+        secondsFilletInitialization=elapsed(initialStart);
+        std::cout << "fillet_initialization detected=" << filletReport.Detected
+                  << " initialized=" << filletReport.Initialized
+                  << " boundary_vertices_added=" << filletReport.BoundaryVerticesAdded
+                  << " seconds=" << secondsFilletInitialization << '\n';
+        for(const auto &p:filletReport.Patches)
+          std::cout << "fillet_patch patch=" << p.PatchId << " target=" << p.TargetLength
+                    << " axial_segments=" << p.AxialSegments << " arc_segments=" << p.ArcSegments
+                    << " axial_step=" << p.AxialStep << " arc_step=" << p.ArcStep
+                    << " initial_faces=" << p.InitialFaces << " quality_mean=" << p.QualityMean
+                    << " quality_min=" << p.QualityMin << '\n';
+        for(const auto &reason:filletReport.Skipped) std::cout << "fillet_skipped " << reason << '\n';
+      }
+      mesh.LocalSizing=BoundarySizingField::create(mesh,cfg,boundaryGradation,curvatureSizing,
+                                                   filletReport.PatchTargetLengths);
+      localBoundarySplits=refinePartitionBoundary(mesh,cfg);
+      mesh.LocalSizing->apply(mesh);
+    } catch(const std::exception &e) {
+      std::cerr << "local sizing failed: " << e.what() << '\n'; return 1;
+    }
+    secondsLocalSizing=elapsed(fieldStart);
+    std::cout << "sizing_mode=boundary_gradation slope=" << boundaryGradation
+              << " curvature=" << curvatureSizing << " seeds=" << mesh.LocalSizing->seeds().size()
+              << " bvh_nodes=" << mesh.LocalSizing->nodes().size()
+              << " local_boundary_splits=" << localBoundarySplits
+              << " min_target=" << *std::min_element(mesh.targetLength.begin(),mesh.targetLength.end())
+              << " max_target=" << *std::max_element(mesh.targetLength.begin(),mesh.targetLength.end())
+              << " seconds=" << secondsLocalSizing << '\n';
+    for(size_t p=0;p<mesh.LocalSizing->patches().size();++p)
+      std::cout << "patch_sizing patch=" << p << " base=" << mesh.LocalSizing->patches()[p].BaseLength << '\n';
+  }
+
+  if(saveInitialMesh) {
+    const std::string initialPath=std::string(outPath)+".initial.ply";
+    if(!mesh.save(initialPath,&error)) {std::cerr << error << '\n';return 1;}
+  }
   const EdgeLengthAudit beforeAudit = mesh.edgeLengthAudit(
       cfg.constantLength, cfg.splitRatio, cfg.collapseRatio);
   std::cout << "edge_length_audit_before "
+            << "threshold_mode=" << (mesh.LocalSizing ? "local_endpoint_mean" : "uniform") << ' '
             << "target=" << beforeAudit.targetLength
             << " split_threshold=" << beforeAudit.splitThreshold
             << " collapse_threshold=" << beforeAudit.collapseThreshold
@@ -205,7 +279,7 @@ int main(int argc, char **argv) {
 #ifdef CAD_ADAPTIVE_GLOBAL_TOPOLOGY
     global::GlobalSplitBackend backend;
     const auto setupStart=Clock::now();
-    ok = backend.Initialize(mesh, 4.0f, &error);
+    ok = backend.Initialize(mesh, filletReport.Initialized ? 1.5f : 4.0f, &error);
     if (ok) ok = backend.configure(cfg, &error);
     report.secondsSetup=elapsed(setupStart);
     termination = "iteration_limit";
@@ -270,6 +344,17 @@ int main(int argc, char **argv) {
         smoothAccepted+=r.acceptedCount; report.rejectPatch+=int(r.semanticRejected);
         report.rejectQuality+=int(r.qualityRejected);
         validatePass();
+        if (detailedDiagnostics && ok) {
+          global::GlobalCycleMetrics smoothAudit;
+          std::string smoothAuditError;
+          if (backend.collectCycleMetrics(cfg.constantLength,cfg.splitRatio,cfg.collapseRatio,
+                                          smoothAudit,&smoothAuditError)) {
+            std::cout << "global_smooth_quality_pass=" << pass
+                      << " quality_mean=" << smoothAudit.QualityMean
+                      << " quality_p05=" << smoothAudit.QualityP05
+                      << " quality_min=" << smoothAudit.QualityMin << '\n';
+          }
+        }
         if(r.acceptedCount==0) break;
       }
       mutations+=splitAccepted+collapseAccepted+flipAccepted+smoothAccepted;
@@ -285,14 +370,25 @@ int main(int argc, char **argv) {
           float(audit.EditableAboveSplit+audit.EditableBelowCollapse)/float(audit.EditableCount);
       secondsCycleAudit+=elapsed(auditStart);
       completedCycles=cycle+1;
+      // A dense good fillet must not hide unfinished coarse planar regions.
+      worstPatchQualityP05=audit.WorstPatchQualityP05;
+      const uint32_t worstPatchId=audit.WorstPatchId;
+      const int worstPatchType=(worstPatchId<reference.patches.size())
+          ? int(reference.patches[worstPatchId].type) : -1;
+      finalQualityFloor=filletReport.Initialized ? std::max(cfg.minQuality,0.01f) : cfg.minQuality;
       const bool meetsTarget=report.qualityP05>=targetQualityP05 &&
-          report.qualityMin>=cfg.minQuality && sizingOutlierFraction<=maxSizingOutlierFraction;
+          (!filletReport.Initialized || worstPatchQualityP05>=targetQualityP05) &&
+          report.qualityMin>=finalQualityFloor && sizingOutlierFraction<=maxSizingOutlierFraction;
       qualifiedCycles=meetsTarget ? qualifiedCycles+1 : 0;
       std::cout << "global_remesh_cycle=" << cycle
                 << " faces=" << audit.FaceCount << " splits=" << splitAccepted
                 << " collapses=" << collapseAccepted << " flips=" << flipAccepted
                 << " smooth_moves=" << smoothAccepted << " quality_mean=" << report.qualityMean
-                << " quality_p05=" << report.qualityP05 << " quality_min=" << report.qualityMin
+                << " quality_p05=" << report.qualityP05
+                << " worst_patch_id=" << worstPatchId
+                << " worst_patch_type=" << worstPatchType
+                << " worst_patch_p05=" << worstPatchQualityP05
+                << " quality_min=" << report.qualityMin
                 << " editable_above_split=" << audit.EditableAboveSplit
                 << " editable_below_collapse=" << audit.EditableBelowCollapse
                 << " sizing_outliers=" << sizingOutlierFraction << " target_met=" << meetsTarget << '\n';
@@ -343,6 +439,7 @@ int main(int argc, char **argv) {
     const EdgeLengthAudit audit = mesh.edgeLengthAudit(
         cfg.constantLength, cfg.splitRatio, cfg.collapseRatio);
     std::cout << "edge_length_audit "
+              << "threshold_mode=" << (mesh.LocalSizing ? "local_endpoint_mean" : "uniform") << ' '
               << "target=" << audit.targetLength
               << " split_threshold=" << audit.splitThreshold
               << " collapse_threshold=" << audit.collapseThreshold
@@ -375,6 +472,41 @@ int main(int argc, char **argv) {
   const float validatedGeometryErrorMax = report.geometryErrorMax;
   fillMeshMetrics(mesh, cfg, report);
   report.geometryErrorMax = std::max(report.geometryErrorMax, validatedGeometryErrorMax);
+  if (detailedDiagnostics) {
+    auto printQualityGroupTmp = [&](const char *name, std::vector<float> q) {
+      if (q.empty()) return; std::sort(q.begin(), q.end());
+      double sum=0; for(float x:q) sum+=x;
+      std::cout << "constraint_quality_group=" << name << " count=" << q.size()
+                << " mean=" << sum/double(q.size())
+                << " p05=" << q[std::min(q.size()-1,q.size()/20)] << " min=" << q.front() << '\n';
+    };
+    std::vector<float> surfaceQTmp, constrainedQTmp; float worstQTmp=2.0f; int worstFTmp=-1;
+    for(int f=0; f<mesh.faceCount(); ++f) {
+      if(!mesh.faceAlive[f]) continue; int a=int(mesh.i0[f]),b=int(mesh.i1[f]),c=int(mesh.i2[f]);
+      float q=triangleQuality(mesh.position(a),mesh.position(b),mesh.position(c));
+      auto editable=[&](int v){auto cc=VertexConstraint(mesh.vertexConstraint[v]); return cc==VertexConstraint::Surface || cc==VertexConstraint::Free;};
+      if(editable(a)&&editable(b)&&editable(c)) surfaceQTmp.push_back(q); else constrainedQTmp.push_back(q);
+      if(q<worstQTmp){worstQTmp=q;worstFTmp=f;}
+    }
+    printQualityGroupTmp("all_surface",surfaceQTmp); printQualityGroupTmp("touch_constrained",constrainedQTmp);
+    if(worstFTmp>=0) {
+      int a=int(mesh.i0[worstFTmp]),b=int(mesh.i1[worstFTmp]),c=int(mesh.i2[worstFTmp]);
+      std::cout << "worst_quality_face=" << worstFTmp << " patch=" << mesh.facePatchId[worstFTmp]
+                << " q=" << worstQTmp << " constraints=" << int(mesh.vertexConstraint[a]) << ','
+                << int(mesh.vertexConstraint[b]) << ',' << int(mesh.vertexConstraint[c])
+                << " target_lengths=" << mesh.targetLength[a] << ',' << mesh.targetLength[b] << ',' << mesh.targetLength[c] << '\n';
+      for (auto ends : {std::pair<int,int>{a,b}, std::pair<int,int>{b,c}, std::pair<int,int>{c,a}}) {
+        for (const auto &e : mesh.edges) {
+          if (int(e.v0)==std::min(ends.first,ends.second) && int(e.v1)==std::max(ends.first,ends.second)) {
+            std::cout << "worst_quality_edge=" << e.v0 << ',' << e.v1
+                      << " flags=" << int(e.flags) << " patch_left=" << e.patchLeft
+                      << " patch_right=" << e.patchRight << '\n';
+            break;
+          }
+        }
+      }
+    }
+  }
   secondsFinalAudit=elapsed(finalAuditStart);
   const auto saveStart=Clock::now();
   if (!mesh.save(outPath, &error)) {
@@ -404,6 +536,18 @@ int main(int argc, char **argv) {
     extra << "  \"seconds_save\": " << secondsSave << ",\n";
     extra << "  \"seconds_operator_total\": " << report.seconds << ",\n";
     extra << "  \"seconds_total_before_report\": " << elapsed(mainStart) << "\n";
+    extra << ",\n  \"sizing_mode\": \"" << (mesh.LocalSizing ? (filletReport.Initialized ? "fillet_boundary_gradation" : (curvatureSizing ? "boundary_curvature_gradation" : "boundary_gradation")) : "uniform") << "\",\n"
+          << "  \"boundary_gradation\": " << boundaryGradation << ",\n"
+          << "  \"curvature_sizing\": " << (mesh.LocalSizing && curvatureSizing ? "true" : "false") << ",\n"
+          << "  \"local_boundary_splits\": " << localBoundarySplits << ",\n"
+          << "  \"seconds_local_sizing\": " << secondsLocalSizing << ",\n"
+          << "  \"target_length_min\": " << *std::min_element(mesh.targetLength.begin(),mesh.targetLength.end()) << ",\n"
+          << "  \"target_length_max\": " << *std::max_element(mesh.targetLength.begin(),mesh.targetLength.end()) << '\n';
+    extra << ",\n  \"fillet_patches_initialized\": " << filletReport.Initialized << ",\n"
+          << "  \"fillet_boundary_vertices_added\": " << filletReport.BoundaryVerticesAdded << ",\n"
+          << "  \"seconds_fillet_initialization\": " << secondsFilletInitialization << '\n';
+    extra << ",\n  \"worst_patch_quality_p05\": " << worstPatchQualityP05 << ",\n"
+          << "  \"final_quality_floor\": " << finalQualityFloor << '\n';
     json.insert(json.rfind('}'),extra.str());
   }
   std::cout << json;

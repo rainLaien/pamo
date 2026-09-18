@@ -7,7 +7,10 @@ param(
   [float]$MaxError = 0,
   [ValidateRange(1, 1000)][int]$Iterations = 20,
   [ValidateSet('global', 'gpu', 'cpu')][string]$Backend = 'global',
-  [ValidateRange(0.001, 89.999)][float]$NormalDegrees = 10
+  [ValidateRange(0.001, 89.999)][float]$NormalDegrees = 10,
+  [ValidateSet('boundary', 'uniform')][string]$Sizing = 'boundary',
+  [ValidateRange(0.001, 1.0)][float]$BoundaryGradation = 0.35,
+  [bool]$FilletInitialization = $true
 )
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($Remesher)) {
@@ -24,13 +27,19 @@ if ($LASTEXITCODE -ne 0) { throw 'PAMO geometric partition failed' }
 & python "$PSScriptRoot/../../cad_mesh/prepare_partition_snapshot.py" $partitionDirectory $snapshotPath
 if ($LASTEXITCODE -ne 0) { throw 'Partition packaging failed' }
 $backendOption = '--' + $Backend
+$sizingOptions = @()
+if ($Backend -eq 'global') {
+  if ($Sizing -eq 'uniform') { $sizingOptions = @('--uniform-sizing') }
+  else { $sizingOptions = @('--local-sizing', '--boundary-gradation', $BoundaryGradation.ToString([Globalization.CultureInfo]::InvariantCulture)) }
+  if (-not $FilletInitialization) { $sizingOptions += '--no-fillet-initialization' }
+}
 # Exit 3 means a geometrically validated candidate was saved, but convergence
 # targets were not reached. It must not be reported as a successful remesh.
 if (-not (Test-Path -LiteralPath $Remesher -PathType Leaf)) { throw "Remesher not found: $Remesher" }
 $remeshExit = -1
 try {
   $ErrorActionPreference = 'Continue'
-  & $Remesher $snapshotPath $outputPath $TargetLength --partition $backendOption --iters $Iterations --max-error $MaxError --normal-degrees $NormalDegrees
+  & $Remesher $snapshotPath $outputPath $TargetLength --partition $backendOption --iters $Iterations --max-error $MaxError --normal-degrees $NormalDegrees @sizingOptions
   $remeshExit = $LASTEXITCODE
 } finally {
   $ErrorActionPreference = 'Stop'

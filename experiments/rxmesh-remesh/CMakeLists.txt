@@ -7,7 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(cad_adaptive
     src/SemanticMesh.cpp
     src/PartitionInput.cpp
+    src/CylinderFilletInitializer.cpp
     src/RemeshField.cpp
+    src/BoundarySizingField.cpp
     src/RemeshPolicy.cpp
     src/AnalyticProjector.cpp
     src/RemeshMetrics.cpp

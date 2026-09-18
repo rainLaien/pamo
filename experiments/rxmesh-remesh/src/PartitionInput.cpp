@@ -1,4 +1,5 @@
 #include "cad_adaptive/PartitionInput.h"
+#include "cad_adaptive/BoundarySizingField.h"
 #include "cad_adaptive/GeometryProjector.h"
 #include <fstream>
 #include <stdexcept>
@@ -40,6 +41,59 @@ int refinePartitionBoundary(SemanticMesh &mesh, float maxLength) {
   mesh.compact(); mesh.computeVertexNormals();
   return splits;
 }
+
+
+int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
+  if(!mesh.LocalSizing) return refinePartitionBoundary(mesh,config.splitRatio*config.constantLength);
+  int total=0;
+  for(int round=0;round<64;++round) {
+    mesh.rebuildTopology();
+    std::vector<uint8_t> claimed(mesh.faceCount(),0);
+    std::vector<EdgeRec> selected;
+    for(const auto &e:mesh.edges) {
+      if(!(e.flags & (EdgePatchBoundary|EdgeMeshBoundary))) continue;
+      const Vec3 a=mesh.position(e.v0),b=mesh.position(e.v1),mid=(a+b)*0.5f;
+      float target=config.constantLength;
+      for(uint32_t p:{e.patchLeft,e.patchRight}) if(p<mesh.patches.size()) {
+        target=std::min(target,mesh.LocalSizing->evaluate(p,a));
+        target=std::min(target,mesh.LocalSizing->evaluate(p,b));
+        target=std::min(target,mesh.LocalSizing->evaluate(p,mid));
+      }
+      if(distance(a,b)<=config.splitRatio*target*(1.0f+1.0e-5f)) continue;
+      if((e.face0>=0 && claimed[e.face0]) || (e.face1>=0 && claimed[e.face1])) continue;
+      selected.push_back(e);
+      if(e.face0>=0) claimed[e.face0]=1;
+      if(e.face1>=0) claimed[e.face1]=1;
+    }
+    if(selected.empty()) {
+      mesh.compact(); mesh.LocalSizing->apply(mesh); mesh.computeVertexNormals();
+      return total;
+    }
+    if(size_t(total)+selected.size()>100000u) throw std::runtime_error("local boundary subdivision budget exceeded");
+    for(const auto &e:selected) {
+      const int middle=mesh.addVertex((mesh.position(e.v0)+mesh.position(e.v1))*0.5f,
+                                     e.patchLeft,VertexConstraint::Locked);
+      for(int f:{e.face0,e.face1}) {
+        if(f<0) continue;
+        const auto triangle=mesh.face(f); const uint32_t patch=mesh.facePatchId[f];
+        bool split=false;
+        for(int k=0;k<3;++k) {
+          const int a=triangle[k],b=triangle[(k+1)%3],c=triangle[(k+2)%3];
+          if((a==int(e.v0)&&b==int(e.v1)) || (a==int(e.v1)&&b==int(e.v0))) {
+            mesh.killFace(f);
+            mesh.addFace(a,middle,c,patch,mesh.patches[patch].type);
+            mesh.addFace(middle,b,c,patch,mesh.patches[patch].type);
+            split=true; break;
+          }
+        }
+        if(!split) throw std::runtime_error("stale shared boundary adjacency");
+      }
+      ++total;
+    }
+  }
+  throw std::runtime_error("local boundary subdivision did not converge");
+}
+
 
 bool validatePartitionOutput(const SemanticMesh &source, const SemanticMesh &output,
                              const RemeshConfig &config, RemeshReport &report, std::string *error) {

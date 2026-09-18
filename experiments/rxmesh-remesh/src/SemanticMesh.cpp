@@ -1,4 +1,5 @@
 #include "cad_adaptive/SemanticMesh.h"
+#include "cad_adaptive/BoundarySizingField.h"
 
 #include <algorithm>
 
@@ -37,7 +38,7 @@ int SemanticMesh::addVertex(Vec3 p, uint32_t patchId, VertexConstraint constrain
   nz.push_back(1);
   vertexPatchId.push_back(patchId);
   vertexConstraint.push_back(uint8_t(constraint));
-  targetLength.push_back(0);
+  targetLength.push_back(LocalSizing ? LocalSizing->evaluate(patchId,p) : 0.0f);
   curvature.push_back(0);
   featureDistance.push_back(1e20f);
   incidentFaces.emplace_back();
@@ -109,18 +110,21 @@ EdgeLengthAudit SemanticMesh::edgeLengthAudit(float target, float splitRatio,
   for (const EdgeRec &e : edges) {
     if (e.v0 >= uint32_t(vertexCount()) || e.v1 >= uint32_t(vertexCount())) continue;
     const float l = distance(position(int(e.v0)), position(int(e.v1)));
+    const float edgeTarget = LocalSizing && targetLength.size()==px.size()
+        ? 0.5f*(targetLength[e.v0]+targetLength[e.v1]) : target;
+    const float upper=edgeTarget*splitRatio, lower=edgeTarget*collapseRatio;
     lengths.push_back(l);
     ++out.edgeCount;
     const bool isProtected = (e.flags & EdgeProtected) != 0;
     if (isProtected) {
       ++out.protectedCount;
       out.protectedMax = std::max(out.protectedMax, l);
-      if (l > out.splitThreshold) ++out.protectedAboveSplit;
+      if (l > upper) ++out.protectedAboveSplit;
     } else {
       ++out.editableCount;
       out.editableMax = std::max(out.editableMax, l);
-      if (l > out.splitThreshold) ++out.editableAboveSplit;
-      if (l < out.collapseThreshold) ++out.editableBelowCollapse;
+      if (l > upper) ++out.editableAboveSplit;
+      if (l < lower) ++out.editableBelowCollapse;
     }
   }
   if (lengths.empty()) return out;
@@ -293,6 +297,7 @@ void SemanticMesh::compact() {
   int nv = 0;
   SemanticMesh out;
   out.patches = patches;
+  out.LocalSizing = LocalSizing;
   for (int v = 0; v < vertexCount(); ++v) {
     bool used = false;
     for (int f : incidentFaces.empty() ? std::vector<int>{} : incidentFaces[v]) {

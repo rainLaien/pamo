@@ -1,4 +1,5 @@
 #include "cad_adaptive/RemeshField.h"
+#include "cad_adaptive/BoundarySizingField.h"
 #include <limits>
 
 namespace cad_adaptive {
@@ -63,6 +64,10 @@ void RemeshField::computeFeatureDistance(SemanticMesh &mesh) {
 
 void RemeshField::compute(SemanticMesh &mesh, const RemeshConfig &config,
                           const GeometryProjector &projector) {
+  if (mesh.LocalSizing) {
+    mesh.LocalSizing->apply(mesh);
+    return;
+  }
   const SizingLimits lim = limits(mesh, config);
   const int n = mesh.vertexCount();
   mesh.targetLength.resize(n);

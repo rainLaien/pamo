@@ -2,10 +2,13 @@
 
 #include "cad_adaptive/Types.h"
 #include <array>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace cad_adaptive {
+
+class BoundarySizingField;
 
 struct EdgeRec {
   uint32_t v0 = 0, v1 = 0;
@@ -36,6 +39,7 @@ struct AnalyticGeometryAudit {
 };
 
 struct SemanticMesh {
+  std::shared_ptr<const BoundarySizingField> LocalSizing;
   std::vector<float> px, py, pz;
   std::vector<float> nx, ny, nz;
   std::vector<uint32_t> vertexPatchId;

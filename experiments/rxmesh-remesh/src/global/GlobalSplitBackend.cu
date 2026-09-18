@@ -1,4 +1,5 @@
 #include "cad_adaptive/global/GlobalSplitBackend.h"
+#include "cad_adaptive/BoundarySizingField.h"
 
 #include <cuda_runtime.h>
 #include <cub/device/device_scan.cuh>
@@ -28,6 +29,10 @@ struct GPatch {
   float NormalCosThreshold = 0.0f;
   float SplitRatio = 4.0f / 3.0f;
   float MinQuality = 1.0e-5f;
+  BoundarySizingPatch Sizing{};
+  const BoundarySizingNode *SizingNodes = nullptr;
+  const BoundarySizingSeed *SizingSeeds = nullptr;
+  float Gradation = 0.0f;
 };
 
 struct GVertex {
@@ -77,6 +82,7 @@ struct CollapseCandidate {
   uint32_t keep, remove, c, d;
   uint32_t f0, f1;
   float destinationX, destinationY, destinationZ;
+  float DestinationTargetLength;
   float priority;
   uint8_t moveKeep;
   uint8_t accepted;
@@ -86,6 +92,7 @@ struct CollapseCandidate {
 struct SmoothCandidate {
   uint32_t vertexId, vertexGeneration;
   float x, y, z;
+  float TargetLength;
   float priority;
   uint8_t accepted;
   uint8_t padding[3]{};
@@ -136,6 +143,8 @@ __device__ inline GVertex ProjectAnalyticVertex(GVertex v, const GPatch *patches
     v.z=o.z+a.z*axial+radial.z*scale;
     if (projectionApplied) atomicAdd(projectionApplied, 1u);
   }
+  if(p.Gradation>0.0f)
+    v.targetLength=evaluateBoundarySizing(v.x,v.y,v.z,p.Sizing,p.SizingNodes,p.SizingSeeds,p.Gradation);
   return v;
 }
 
@@ -876,8 +885,8 @@ __global__ void GenerateSplitCandidates(const GVertex *vertices, const GEdge *ed
   const uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
   if (id >= edgeCount) return;
   const GEdge e = edges[id];
-  if (!e.alive || e.f0 < 0 || e.f1 < 0) return;
-  if (e.flags & uint8_t(EdgeProtected | EdgeMeshBoundary | EdgePatchBoundary)) return;
+  if (!e.alive || e.f0 < 0 || e.f1 < 0) { return; }
+  if (e.flags & uint8_t(EdgeProtected | EdgeMeshBoundary | EdgePatchBoundary)) { return; }
   if (uint32_t(e.f0) >= faceCount || uint32_t(e.f1) >= faceCount) return;
   const GFace f0 = faces[e.f0], f1 = faces[e.f1];
   if (!f0.alive || !f1.alive) return;
@@ -889,17 +898,17 @@ __global__ void GenerateSplitCandidates(const GVertex *vertices, const GEdge *ed
   uint32_t aId=e.v0,bId=e.v1;
   // Candidate and execution checks must use the same face winding.
   if(!FaceHasDirectedEdge(f0,aId,bId)) {
-    if(!FaceHasDirectedEdge(f0,bId,aId)) return;
+    if(!FaceHasDirectedEdge(f0,bId,aId)) { return; }
     const uint32_t tmp=aId; aId=bId; bId=tmp;
   }
-  if(!FaceHasDirectedEdge(f1,bId,aId)) return;
+  if(!FaceHasDirectedEdge(f1,bId,aId)) { return; }
   const GVertex a = vertices[aId], b = vertices[bId];
   if (!a.alive || !b.alive) return;
   const float h = 0.5f * (a.targetLength + b.targetLength);
   if (!(h > 0.0f)) return;
   const float limit = splitRatio * h;
   const float len2 = Dist2(a, b);
-  if (!(len2 > limit * limit)) return;
+  if (!(len2 > limit * limit)) { return; }
   if (isfinite(maxRatio)) {
     const float maxLimit = maxRatio * h;
     if (len2 > maxLimit * maxLimit) return;
@@ -911,7 +920,8 @@ __global__ void GenerateSplitCandidates(const GVertex *vertices, const GEdge *ed
   // Midpoint fallback covers all long editable edges, including coarse input.
   constexpr uint32_t segmentCount = 2u;
   const GVertex vc = vertices[c], vd = vertices[d];
-  if (!SegmentedSplitQualitySafe(a, b, vc, vd, segmentCount, f0.patchId, patches, patchCount)) return;
+  const bool splitSafe=SegmentedSplitQualitySafe(a,b,vc,vd,segmentCount,f0.patchId,patches,patchCount);
+  if (!splitSafe) { return; }
   const uint32_t slot = atomicAdd(candidateCount, 1u);
   if (slot >= candidateCapacity) {
     if (capacityRejected) atomicAdd(capacityRejected, 1u);
@@ -920,7 +930,7 @@ __global__ void GenerateSplitCandidates(const GVertex *vertices, const GEdge *ed
   candidates[slot] = {id, e.generation, aId, bId, c, d,
                       uint32_t(e.f0), uint32_t(e.f1), len / h,
                       uint8_t(segmentCount), 0, {0, 0}};
-}
+  }
 
 __global__ void InitActiveQueue(uint32_t *active, uint32_t count) {
   const uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1656,7 +1666,7 @@ __global__ void GenerateCollapseCandidates(
   if(slot>=candidateCapacity) return;
   const float len=sqrtf(len2);
   candidates[slot]={id,e.generation,keep,remove,c,d,uint32_t(e.f0),uint32_t(e.f1),
-                    destination.x,destination.y,destination.z,
+                    destination.x,destination.y,destination.z,destination.targetLength,
                     h/fmaxf(len,1e-12f),uint8_t(moveKeep?1u:0u),0u,{0,0}};
 }
 
@@ -1858,7 +1868,7 @@ __global__ void GenerateSmoothCandidates(
       const GEdge e=edges[edgeIds[i]]; if(!e.alive) continue;
       const uint32_t n=e.v0==vId?e.v1:e.v0;
       const GVertex vn=vertices[n];
-      const float h=0.5f*(oldV.targetLength+vn.targetLength);
+      const float h=0.5f*(dest.targetLength+vn.targetLength);
       if(h>0.0f) {
         const float newLen=sqrtf(Dist2(dest,vn));
         const float allowed=fmaxf(patch.SplitRatio*h,sqrtf(Dist2(oldV,vn)));
@@ -1898,7 +1908,7 @@ __global__ void GenerateSmoothCandidates(
   if(slot>=candidateCapacity) return;
   const float relativeGain=(bestMin-oldMin)/fmaxf(oldMin,1.0e-6f);
   const float smoothPriority=(1.0f+fmaxf(0.0f,relativeGain))/fmaxf(oldMin,1.0e-6f);
-  candidates[slot]={vId,oldV.generation,bestDest.x,bestDest.y,bestDest.z,smoothPriority,0u,{0,0,0}};
+  candidates[slot]={vId,oldV.generation,bestDest.x,bestDest.y,bestDest.z,bestDest.targetLength,smoothPriority,0u,{0,0,0}};
 }
 
 __device__ inline unsigned long long SmoothWinnerKey(const SmoothCandidate &c) {
@@ -1949,7 +1959,7 @@ __global__ void ExecuteSmoothCandidates(GVertex *vertices,const SmoothCandidate 
   if(id>=candidateCount || candidates[id].accepted!=1) return;
   const SmoothCandidate c=candidates[id]; GVertex &v=vertices[c.vertexId];
   if(!v.alive || v.generation!=c.vertexGeneration) {atomicAdd(staleRejected,1u);return;}
-  v.x=c.x; v.y=c.y; v.z=c.z; ++v.generation;
+  v.x=c.x; v.y=c.y; v.z=c.z; v.targetLength=c.TargetLength; ++v.generation;
 }
 
 __device__ inline int32_t OtherFace(const GEdge &e,uint32_t faceId) {
@@ -1989,6 +1999,7 @@ __global__ void ExecuteCollapseCandidates(GVertex *vertices,GEdge *edges,GFace *
     vertices[c.keep].x=c.destinationX;
     vertices[c.keep].y=c.destinationY;
     vertices[c.keep].z=c.destinationZ;
+    vertices[c.keep].targetLength=c.DestinationTargetLength;
     ++vertices[c.keep].generation;
   }
 
@@ -2157,6 +2168,9 @@ __global__ void EndSchedulerRound(HostControlBlock *control) {
 }
 
 struct GlobalSplitBackend::Impl {
+  std::shared_ptr<const BoundarySizingField> mLocalSizing;
+  BoundarySizingNode *mSizingNodes = nullptr;
+  BoundarySizingSeed *mSizingSeeds = nullptr;
   HostControlBlock *mControl = nullptr;
   HostControlBlock *mDeviceControl = nullptr;
   bool mAdjacencyDirty = true;
@@ -2335,6 +2349,8 @@ struct GlobalSplitBackend::Impl {
   }
 
   ~Impl() {
+    cudaFree(mSizingNodes);
+    cudaFree(mSizingSeeds);
     cudaFree(vertices);
     cudaFree(edges);
     cudaFree(faces);
@@ -2368,7 +2384,9 @@ struct GlobalSplitBackend::Impl {
   }
 
   size_t MemoryBytes() const {
-    return size_t(vertexCapacity) * sizeof(GVertex) +
+    const size_t sizingBytes=mLocalSizing ? mLocalSizing->nodes().size()*sizeof(BoundarySizingNode)+
+        mLocalSizing->seeds().size()*sizeof(BoundarySizingSeed) : 0;
+    return sizingBytes + size_t(vertexCapacity) * sizeof(GVertex) +
            size_t(edgeCapacity) * (sizeof(GEdge) + sizeof(SplitCandidate) + sizeof(FlipCandidate) + sizeof(CollapseCandidate) + sizeof(SmoothCandidate) + sizeof(TriangleRefineCandidate) + 3 * sizeof(uint32_t) + sizeof(uint8_t)) +
            size_t(faceCapacity) * (sizeof(GFace) + sizeof(uint32_t) + sizeof(uint8_t)) +
            size_t(vertexCapacity) * (sizeof(uint32_t) + sizeof(uint8_t) + sizeof(unsigned long long)) +
@@ -2392,6 +2410,7 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
     mImpl = std::make_unique<Impl>();
     SemanticMesh src = mesh;
     src.rebuildTopology();
+    if(src.LocalSizing) src.LocalSizing->apply(src);
     if (src.vertexCount() == 0 || src.faceCount() == 0)
       throw std::runtime_error("empty mesh");
     if (!(capacityFactor >= 1.5f)) capacityFactor = 2.0f;
@@ -2407,6 +2426,19 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
     while (mImpl->edgeHashCapacity < mImpl->edgeCapacity * 2u) mImpl->edgeHashCapacity <<= 1u;
     mImpl->fallbackTargetLength = std::max(1e-6f, src.bboxDiagonal() * 0.01f);
     mImpl->patches = src.patches;
+    mImpl->mLocalSizing = src.LocalSizing;
+    if(src.LocalSizing) {
+      const auto &nodes=src.LocalSizing->nodes();
+      const auto &seeds=src.LocalSizing->seeds();
+      if(!nodes.empty()) {
+        mImpl->mSizingNodes=AllocDevice<BoundarySizingNode>(nodes.size());
+        CheckCuda(cudaMemcpy(mImpl->mSizingNodes,nodes.data(),nodes.size()*sizeof(BoundarySizingNode),cudaMemcpyHostToDevice),"upload sizing nodes");
+      }
+      if(!seeds.empty()) {
+        mImpl->mSizingSeeds=AllocDevice<BoundarySizingSeed>(seeds.size());
+        CheckCuda(cudaMemcpy(mImpl->mSizingSeeds,seeds.data(),seeds.size()*sizeof(BoundarySizingSeed),cudaMemcpyHostToDevice),"upload sizing seeds");
+      }
+    }
 
     mImpl->vertices = AllocDevice<GVertex>(mImpl->vertexCapacity);
     mImpl->edges = AllocDevice<GEdge>(mImpl->edgeCapacity);
@@ -2512,6 +2544,12 @@ bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFact
                               n>1e-20f?ay*inv:0.0f,
                               n>1e-20f?az*inv:1.0f,
                               p.radius,orientationSign,uint8_t(p.type),{0,0,0}};
+      if(src.LocalSizing) {
+        GPatch &gp=mImpl->mHostPatches[i];
+        gp.Sizing=src.LocalSizing->patches()[i];
+        gp.SizingNodes=mImpl->mSizingNodes; gp.SizingSeeds=mImpl->mSizingSeeds;
+        gp.Gradation=src.LocalSizing->gradation();
+      }
     }
 
     for (uint32_t v = 0; v < nv; ++v) {
@@ -3216,12 +3254,15 @@ bool GlobalSplitBackend::collectCycleMetrics(
       if (v >= nv || !vertices[v].alive) throw std::runtime_error("audit dead vertex reference");
       return {vertices[v].x, vertices[v].y, vertices[v].z};
     };
+    std::vector<std::vector<float>> patchQualities(mImpl->patches.size());
     qualities.clear(); qualities.reserve(nf);
     for (const GFace &f : faces) {
       if (!f.alive) continue;
       const float quality = triangleQuality(position(f.v0), position(f.v1), position(f.v2));
       if (!std::isfinite(quality)) throw std::runtime_error("non-finite audit quality");
       qualities.push_back(quality);
+      if(f.patchId>=patchQualities.size()) throw std::runtime_error("invalid metric patch id");
+      patchQualities[f.patchId].push_back(quality);
     }
     if (qualities.empty()) throw std::runtime_error("empty audit mesh");
     std::sort(qualities.begin(), qualities.end());
@@ -3231,10 +3272,21 @@ bool GlobalSplitBackend::collectCycleMetrics(
     metrics.QualityMean = sum / float(qualities.size());
     metrics.QualityP05 = qualities[qualities.size()/20];
     metrics.QualityMin = qualities.front();
-    const float upper = targetLength*splitRatio, lower = targetLength*collapseRatio;
+    metrics.WorstPatchQualityP05=1.0f;
+    for(uint32_t id=0;id<patchQualities.size();++id) {
+      auto &values=patchQualities[id]; if(values.empty()) continue;
+      const size_t index=values.size()/20;
+      std::nth_element(values.begin(),values.begin()+index,values.end());
+      if(values[index]<metrics.WorstPatchQualityP05) {
+        metrics.WorstPatchQualityP05=values[index];metrics.WorstPatchId=id;
+      }
+    }
+    // The audit uses the same local edge target as the mutation operators.
     for (const GEdge &e : edges) {
       if (!e.alive) continue;
       const float edgeLength = distance(position(e.v0), position(e.v1));
+      const float h=mImpl->mLocalSizing ? 0.5f*(vertices[e.v0].targetLength+vertices[e.v1].targetLength) : targetLength;
+      const float upper=h*splitRatio, lower=h*collapseRatio;
       if (!std::isfinite(edgeLength)) throw std::runtime_error("non-finite audit edge");
       ++metrics.EdgeCount;
       if (e.flags & EdgeProtected) continue;
@@ -3299,6 +3351,7 @@ bool GlobalSplitBackend::Export(SemanticMesh &mesh, std::string *error) const {
                          cudaMemcpyDeviceToHost), "download export faces");
     SemanticMesh out;
     out.patches = mImpl->patches;
+    out.LocalSizing = mImpl->mLocalSizing;
     std::vector<uint32_t> vertexMap(nv, kInvalid);
     for (uint32_t v = 0; v < nv; ++v) {
       const GVertex &gv = hostVertices[v];

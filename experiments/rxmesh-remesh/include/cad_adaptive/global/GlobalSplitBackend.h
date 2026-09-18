@@ -131,6 +131,8 @@ struct GlobalCycleMetrics {
   float QualityMean = 0;
   float QualityP05 = 0;
   float QualityMin = 0;
+  float WorstPatchQualityP05 = 0;
+  uint32_t WorstPatchId = kInvalidId;
 };
 
 class GlobalSplitBackend {
