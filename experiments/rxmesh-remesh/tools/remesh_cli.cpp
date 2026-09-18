@@ -38,6 +38,7 @@ int main(int argc, char **argv) {
               << "       cad_adaptive_cli --grid TRIS OUTPUT.ply [target_length] [--gpu|--cpu|--global]\n"
               << "       --boundary-gradation G (0<G<=1), --uniform-sizing, --local-sizing\n"
               << "       --curvature-sizing is opt-in and may greatly increase mesh density\n"
+              << "       --feature-angle DEG classifies raw STL crease edges (default 30)\n"
               << "       --no-fillet-initialization disables automatic cylindrical fillet seeding\n"
               << "       --save-initial-mesh saves OUTPUT.ply.initial.ply before GPU iterations\n"
               << "       --detailed-diagnostics enables expensive per-smooth quality statistics\n";
@@ -59,6 +60,7 @@ int main(int argc, char **argv) {
   float targetQualityP05 = 0.20f;
   float maxSizingOutlierFraction = 0.05f;
   float normalDegrees = 10.0f;
+  float featureAngleDegrees = 30.0f;
   float referenceSampleError = -1.0f;
   // Local boundary grading and recognized fillet seeding are enabled by default.
   // A curvature cap for other cylindrical patches remains opt-in.
@@ -109,6 +111,8 @@ int main(int argc, char **argv) {
       maxSizingOutlierFraction=std::strtof(argv[++i],nullptr);
     else if (std::strcmp(argv[i], "--normal-degrees") == 0 && i+1<argc)
       normalDegrees=std::strtof(argv[++i],nullptr);
+    else if (std::strcmp(argv[i], "--feature-angle") == 0 && i+1<argc)
+      featureAngleDegrees=std::strtof(argv[++i],nullptr);
     else if (std::strcmp(argv[i], "--cavity-ratio") == 0 && i+1<argc)
       cavityRatio=std::strtof(argv[++i],nullptr);
     else if (std::strcmp(argv[i], "--smooth-lambda") == 0 && i+1<argc)
@@ -168,7 +172,8 @@ int main(int argc, char **argv) {
   if (partitionInput) cfg.maxGeometryError = mesh.bboxDiagonal() * 0.001f;
   if (maxError > 0) cfg.maxGeometryError = maxError;
   cfg.maxIterations = iters > 0 ? iters : 5;
-  cfg.enableSmooth=smooth; cfg.enableCollapse=collapse; cfg.enableFlip=flip;
+  cfg.enableSplit=split; cfg.enableSmooth=smooth; cfg.enableCollapse=collapse; cfg.enableFlip=flip;
+  cfg.featureAngleDegrees=featureAngleDegrees;
   cfg.smoothLambda=smoothLambda;
   cfg.normalDegrees=normalDegrees;
   if (partitionInput) {

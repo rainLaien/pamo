@@ -57,6 +57,12 @@ __global__ void edge_flip_kernel(rxmesh::Context context, rxmesh::VertexAttribut
     if (iter.size() != 4 || !iter[1].is_valid() || !iter[3].is_valid()) return;
     const VertexHandle a = iter[0], b = iter[2], c = iter[1], d = iter[3];
     if (!vDirty(a) && !vDirty(b)) return;
+    // Raw STL feature vertices define a protected crease neighborhood.  Do not
+    // let a flip replace connectivity adjacent to a classified crease/corner.
+    if (constraint(a) >= cad_adaptive::gpu::kFeatureEdge ||
+        constraint(b) >= cad_adaptive::gpu::kFeatureEdge ||
+        constraint(c) >= cad_adaptive::gpu::kFeatureEdge ||
+        constraint(d) >= cad_adaptive::gpu::kFeatureEdge) return;
     // Flipping an interior edge does not move its fixed boundary vertices.
     // Reject non-convex or folded diamonds geometrically instead.
     using namespace cad_adaptive::gpu;
@@ -83,6 +89,12 @@ __global__ void edge_flip_kernel(rxmesh::Context context, rxmesh::VertexAttribut
     const float qn1 = cad_adaptive::gpu::triQuality(
         coords(c, 0), coords(c, 1), coords(c, 2), coords(d, 0), coords(d, 1), coords(d, 2),
         coords(b, 0), coords(b, 1), coords(b, 2));
+    const float oldMin = fminf(q0, q1);
+    const float newMin = fminf(qn0, qn1);
+    // Never trade a thin triangle for an even thinner one just to improve
+    // valence.  This is particularly important for raw STL input, where the
+    // source has no analytic patch projection to repair a bad flip later.
+    if (newMin + 1e-7f < oldMin || newMin < 1e-5f) return;
     const float eBefore = float(pre) + (1.f - q0) + (1.f - q1);
     const float eAfter = float(post) + (1.f - qn0) + (1.f - qn1);
     if (eAfter < eBefore - 1e-6f) {

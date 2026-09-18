@@ -19,7 +19,7 @@ __global__ void vertex_smooth_kernel(rxmesh::Context context,
     next(v, 1) = coords(v, 1);
     next(v, 2) = coords(v, 2);
     if (iter.size() == 0 || vBoundary(v) || cad_adaptive::gpu::isImmobile(constraint(v)) ||
-        !vDirty(v))
+        cad_adaptive::gpu::isSeamConstraint(constraint(v)) || !vDirty(v))
       return;
     float sx = 0, sy = 0, sz = 0;
     float nx = 0, ny = 0, nz = 0;

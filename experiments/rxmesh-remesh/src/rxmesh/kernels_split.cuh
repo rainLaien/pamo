@@ -36,22 +36,26 @@ __global__ void edge_split_kernel(rxmesh::Context context, rxmesh::VertexAttribu
       edgeStatus(eh) = Skip;
       return;
     }
-    // Match RXMesh's own remeshing safety rule: do not open a split cavity
-    // when any vertex in the EVDiamond is a mesh/feature boundary vertex.
-    // Real CAD partitions contain many locked/seam vertices; allowing a cavity
-    // to straddle them can invalidate the local patch allocation and lead to
-    // illegal accesses inside CavityManager.
-    if (vBoundary(va) || vBoundary(vb) || vBoundary(vc) || vBoundary(vd) ||
-        cad_adaptive::gpu::isImmobile(constraint(va)) ||
-        cad_adaptive::gpu::isImmobile(constraint(vb)) ||
-        cad_adaptive::gpu::isImmobile(constraint(vc)) ||
-        cad_adaptive::gpu::isImmobile(constraint(vd))) {
+    const int sourceEdgeClass = edgePatch(eh);
+    const bool sharpSource = sourceEdgeClass == cad_adaptive::gpu::kEdgeSharp;
+    // Ordinary CAD splits keep the conservative immobile-vertex rule. A raw
+    // sharp source edge is different: splitting it does not move its Corner
+    // endpoints, it only inserts a midpoint on the original straight segment.
+    const bool boundaryConflict = sharpSource
+        ? (vBoundary(vc) || vBoundary(vd))
+        : (vBoundary(va) || vBoundary(vb) || vBoundary(vc) || vBoundary(vd));
+    if (boundaryConflict ||
+        (!sharpSource && (cad_adaptive::gpu::isImmobile(constraint(va)) ||
+                          cad_adaptive::gpu::isImmobile(constraint(vb)) ||
+                          cad_adaptive::gpu::isImmobile(constraint(vc)) ||
+                          cad_adaptive::gpu::isImmobile(constraint(vd))))) {
       edgeStatus(eh) = Skip;
       return;
     }
-    // An interior diagonal may join two locked feature vertices. Splitting
-    // it leaves both endpoints and every feature edge untouched.
-    if ((!vDirty(va) && !vDirty(vb)) || edgePatch(eh) < 0) {
+    // An interior diagonal may join two feature vertices. Exact sharpness is
+    // carried by edgePatch, not inferred from endpoint constraints.
+    if ((!vDirty(va) && !vDirty(vb)) ||
+        (sourceEdgeClass < 0 && sourceEdgeClass != cad_adaptive::gpu::kEdgeSharp)) {
       edgeStatus(eh) = Skip;
       return;
     }
@@ -94,10 +98,10 @@ __global__ void edge_split_kernel(rxmesh::Context context, rxmesh::VertexAttribu
       coords(nv, 2) = 0.5f * (coords(v0, 2) + coords(v1, 2));
       sizes(nv) = 0.5f * (sizes(v0) + sizes(v1));
       int cNew = 1; // Surface: an interior midpoint is not a feature vertex.
-      // Interior splits stay on origEp (same-patch id). Do not take patch from
-      // opposite diamond verts: a seam vertex is tagged patch 0 and would
-      // relabel a patch-1 triangle that only touches the seam.
-      if (origEp < 0) cNew = kPatchBoundary;
+      // A raw sharp edge is allowed to split along itself. Its midpoint remains
+      // on the original straight STL feature segment and inherits FeatureEdge.
+      if (origEp == cad_adaptive::gpu::kEdgeSharp) cNew = cad_adaptive::gpu::kFeatureEdge;
+      else if (origEp < 0) cNew = kPatchBoundary;
       constraint(nv) = cNew;
       vPatch(nv) = origEp >= 0 ? origEp : (vPatch(v0) < vPatch(v1) ? vPatch(v0) : vPatch(v1));
       vBoundary(nv) = false;
@@ -107,29 +111,58 @@ __global__ void edge_split_kernel(rxmesh::Context context, rxmesh::VertexAttribu
       vTouched(v1) = 1;
       DEdgeHandle e0 = cavity.add_edge(nv, cavity.get_cavity_vertex(c, 0));
       const DEdgeHandle first = e0;
-      if (!e0.is_valid()) return;
+      if (!e0.is_valid()) {
+        cavity.recover(src);
+        return;
+      }
+      const uint32_t edgeCapacity = cavity.patch_info().edges_capacity;
+      if (e0.local_id() >= edgeCapacity) {
+        cavity.recover(src);
+        return;
+      }
+      const int surfacePatch = vPatch(nv);
       edgePatch(e0.get_edge_handle()) = origEp;
       updated.set(e0.local_id(), true);
+
+      bool fillOk = true;
       for (uint16_t i = 0; i < size; ++i) {
         const DEdgeHandle e = cavity.get_cavity_edge(c, i);
         const DEdgeHandle e1 =
             (i == size - 1) ? first.get_flip_dedge()
                             : cavity.add_edge(cavity.get_cavity_vertex(c, i + 1), nv);
-        if (!e1.is_valid()) break;
-        if (i != size - 1) edgePatch(e1.get_edge_handle()) = origEp;
+        if (!e1.is_valid() || e1.local_id() >= edgeCapacity) {
+          fillOk = false;
+          break;
+        }
+        if (i != size - 1) {
+          // EVDiamond order is endpoint, opposite, endpoint, opposite.
+          // Only the two halves of a sharp source edge inherit kEdgeSharp;
+          // the spokes remain ordinary surface edges.
+          const bool sharpHalf = origEp == cad_adaptive::gpu::kEdgeSharp && i == 1;
+          edgePatch(e1.get_edge_handle()) = sharpHalf ? origEp : surfacePatch;
+        }
         updated.set(e1.local_id(), true);
         const FaceHandle f = cavity.add_face(e0, e, e1);
-        if (!f.is_valid()) break;
-        fPatch(f) = origEp >= 0 ? origEp : vPatch(nv);
+        if (!f.is_valid()) {
+          fillOk = false;
+          break;
+        }
+        fPatch(f) = surfacePatch;
         e0 = e1.get_flip_dedge();
+      }
+      if (!fillOk) {
+        cavity.recover(src);
+        return;
       }
       if (accepted) ::atomicAdd(accepted, 1);
     });
   }
   cavity.epilogue(block);
   if (cavity.is_successful()) {
+    const uint32_t edgeCapacity = cavity.patch_info().edges_capacity;
     for_each_edge(cavity.patch_info(), [&](EdgeHandle eh) {
-      if (updated(eh.local_id())) edgeStatus(eh) = Added;
+      if (eh.local_id() < edgeCapacity && updated(eh.local_id()))
+        edgeStatus(eh) = Added;
     });
   }
 }

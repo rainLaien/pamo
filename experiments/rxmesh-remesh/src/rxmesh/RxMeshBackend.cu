@@ -16,10 +16,45 @@
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace cad_adaptive {
 namespace {
+
+struct RawFeatureStats {
+  int SharpEdges = 0;
+  int FeatureVertices = 0;
+  int Corners = 0;
+};
+
+uint64_t rawEdgeKey(uint32_t a, uint32_t b) {
+  if (a > b) std::swap(a, b);
+  return (uint64_t(a) << 32) | uint64_t(b);
+}
+
+RawFeatureStats classifyRawSharpFeatures(SemanticMesh &mesh, float angleDegrees) {
+  RawFeatureStats stats;
+  if (!(angleDegrees > 0.0f && angleDegrees < 180.0f) || mesh.faceCount() == 0) return stats;
+  mesh.rebuildTopology();
+  const float cosThreshold = std::cos(angleDegrees * 0.01745329251994329577f);
+  std::vector<int> degree(size_t(mesh.vertexCount()), 0);
+  for (auto &e : mesh.edges) {
+    if (e.face0 < 0 || e.face1 < 0) continue;
+    const auto f0 = mesh.face(e.face0), f1 = mesh.face(e.face1);
+    const Vec3 n0 = triangleNormal(mesh.position(f0[0]), mesh.position(f0[1]), mesh.position(f0[2]));
+    const Vec3 n1 = triangleNormal(mesh.position(f1[0]), mesh.position(f1[1]), mesh.position(f1[2]));
+    if (dot(n0, n1) > cosThreshold) continue;
+    e.flags = uint8_t(e.flags | EdgeSharp | EdgeProtected);
+    ++degree[e.v0]; ++degree[e.v1]; ++stats.SharpEdges;
+  }
+  for (int v = 0; v < mesh.vertexCount(); ++v) {
+    if (degree[v] <= 0) continue;
+    if (degree[v] != 2) { mesh.vertexConstraint[v] = uint8_t(VertexConstraint::Corner); ++stats.Corners; }
+    else { mesh.vertexConstraint[v] = uint8_t(VertexConstraint::FeatureEdge); ++stats.FeatureVertices; }
+  }
+  return stats;
+}
 
 using rxmesh::DEVICE;
 using rxmesh::HandleError;
@@ -72,29 +107,74 @@ void exportMesh(rxmesh::RXMeshDynamic &rx, rxmesh::VertexAttribute<float> *coord
   out.clear();
   out.patches = patches;
   out.resizeVertices(nv);
+
+  // RXMesh linear_id() is a dense export ID only after update_host(). Verify
+  // that contract instead of silently corrupting SemanticMesh on dynamic meshes.
+  std::vector<uint8_t> vertexSeen(size_t(nv), 0);
+  int exportedVertices = 0;
   rx.for_each_vertex(
       rxmesh::HOST,
       [&](rxmesh::VertexHandle v) {
         const int id = int(rx.linear_id(v));
+        if (id < 0 || id >= nv)
+          throw std::runtime_error("RXMesh export vertex linear_id out of range: " +
+                                   std::to_string(id) + " / " + std::to_string(nv));
+        if (vertexSeen[size_t(id)])
+          throw std::runtime_error("RXMesh export duplicate vertex linear_id: " +
+                                   std::to_string(id));
+        vertexSeen[size_t(id)] = 1;
+        ++exportedVertices;
         out.setPosition(id, {(*coords)(v, 0), (*coords)(v, 1), (*coords)(v, 2)});
         out.vertexConstraint[id] = uint8_t((*constraint)(v));
         out.targetLength[id] = (*sizes)(v);
         out.vertexPatchId[id] = uint32_t((*vPatch)(v));
       },
       nullptr, false);
+  if (exportedVertices != nv)
+    throw std::runtime_error("RXMesh export vertex count mismatch: " +
+                             std::to_string(exportedVertices) + " / " + std::to_string(nv));
+
   std::vector<uint32_t> raw(3 * nf);
   rx.create_face_list(raw.data(), false);
   std::vector<int> facePatch(nf, 0);
+  std::vector<uint8_t> faceSeen(size_t(nf), 0);
+  int exportedFaces = 0;
   rx.for_each_face(
       rxmesh::HOST,
-      [&](rxmesh::FaceHandle f) { facePatch[int(rx.linear_id(f))] = (*fPatch)(f); }, nullptr,
-      false);
+      [&](rxmesh::FaceHandle f) {
+        const int id = int(rx.linear_id(f));
+        if (id < 0 || id >= nf)
+          throw std::runtime_error("RXMesh export face linear_id out of range: " +
+                                   std::to_string(id) + " / " + std::to_string(nf));
+        if (faceSeen[size_t(id)])
+          throw std::runtime_error("RXMesh export duplicate face linear_id: " +
+                                   std::to_string(id));
+        faceSeen[size_t(id)] = 1;
+        ++exportedFaces;
+        facePatch[size_t(id)] = (*fPatch)(f);
+      }, nullptr, false);
+  if (exportedFaces != nf)
+    throw std::runtime_error("RXMesh export face count mismatch: " +
+                             std::to_string(exportedFaces) + " / " + std::to_string(nf));
+
+  int degenerateFaces = 0;
   for (int f = 0; f < nf; ++f) {
+    const uint32_t a = raw[3 * f], b = raw[3 * f + 1], c = raw[3 * f + 2];
+    if (a >= uint32_t(nv) || b >= uint32_t(nv) || c >= uint32_t(nv))
+      throw std::runtime_error("RXMesh export face vertex index out of range at face " +
+                               std::to_string(f));
+    if (a == b || b == c || c == a) {
+      ++degenerateFaces;
+      continue;
+    }
     const uint32_t patch = uint32_t(facePatch[f]);
     PatchType type = PatchType::Unknown;
     if (patch < out.patches.size()) type = out.patches[patch].type;
-    out.addFace(int(raw[3 * f]), int(raw[3 * f + 1]), int(raw[3 * f + 2]), patch, type);
+    out.addFace(int(a), int(b), int(c), patch, type);
   }
+  if (degenerateFaces)
+    std::cerr << "[cad_adaptive rxmesh] export skipped degenerate_faces="
+              << degenerateFaces << '\n';
   out.rebuildTopology();
 }
 
@@ -108,8 +188,11 @@ void sliceAll(rxmesh::RXMeshDynamic &rx, rxmesh::VertexAttribute<float> *coords,
               rxmesh::VertexAttribute<int> *vTouched) {
   rx.cleanup();
   CUDA_ERROR(cudaDeviceSynchronize());
-  if (2 * rx.get_num_patches(true) > rx.get_max_num_patches())
-    throw std::runtime_error("RXMesh patch pool exhausted");
+  if (2 * rx.get_num_patches(true) > rx.get_max_num_patches()) {
+    throw std::runtime_error("RXMesh patch pool exhausted current=" +
+        std::to_string(rx.get_num_patches(true)) + " max=" +
+        std::to_string(rx.get_max_num_patches()));
+  }
   rx.slice_patches(*coords, *sizes, *constraint, *vPatch, *fPatch, *edgePatch, *status, *boundary,
                    *scratch, *valence, *vDirty, *vTouched);
   rx.cleanup();
@@ -171,6 +254,16 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     ensureCuda();
     GeometryProjector projector;
     mesh.rebuildTopology();
+    const bool rawUnknownSinglePatch = mesh.patches.size() == 1 &&
+        mesh.patches[0].type == PatchType::Unknown;
+    RawFeatureStats rawFeatures;
+    if (rawUnknownSinglePatch) {
+      rawFeatures = classifyRawSharpFeatures(mesh, config.featureAngleDegrees);
+      std::cout << "raw_feature_classification angle_degrees=" << config.featureAngleDegrees
+                << " sharp_edges=" << rawFeatures.SharpEdges
+                << " feature_vertices=" << rawFeatures.FeatureVertices
+                << " corners=" << rawFeatures.Corners << '\n';
+    }
     int boundIn = 0;
     for (const auto &e : mesh.edges)
       if (e.flags & EdgeMeshBoundary) ++boundIn;
@@ -184,6 +277,12 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     if (config.enableSmooth && hasReferenceOnlyPatch)
       std::cerr << "[cad_adaptive rxmesh] smoothing disabled: Unknown/Freeform patches "
                    "require reference-mesh projection (GPU BVH not wired yet)\n";
+    std::unordered_set<uint64_t> rawSharpEdges;
+    if (rawUnknownSinglePatch && rawFeatures.SharpEdges > 0) {
+      rawSharpEdges.reserve(size_t(rawFeatures.SharpEdges) * 2u);
+      for (const auto &e : mesh.edges)
+        if (e.flags & EdgeSharp) rawSharpEdges.insert(rawEdgeKey(e.v0, e.v1));
+    }
     std::vector<std::vector<uint32_t>> fv;
     std::vector<std::vector<float>> verts;
     std::vector<int> constraint, vPatch, fPatch;
@@ -191,7 +290,28 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     meshToFv(mesh, fv, verts, constraint, sizes, vPatch, fPatch);
     if (!config.adaptive && config.constantLength > 0)
       for (float &h : sizes) h = config.constantLength;
-    const float reserve = std::max(3.0f, 64.0f / std::max(1.0f, float(fv.size()) / 256.0f));
+    float reserve = std::max(3.0f, 64.0f / std::max(1.0f, float(fv.size()) / 256.0f));
+    if (rawUnknownSinglePatch) {
+      // A very coarse STL can require thousands of first-order edge segments
+      // before it reaches the target length. RXMesh dynamic slicing consumes
+      // patch IDs while that refinement proceeds, so size the metadata pool from
+      // the actual coarse-edge demand rather than a model-specific constant.
+      uint64_t firstOrderExtraSegments = 0;
+      for (const auto &e : mesh.edges) {
+        const float h = 0.5f * (mesh.targetLength[e.v0] + mesh.targetLength[e.v1]);
+        if (!(h > 0.0f)) continue;
+        const float limit = config.splitRatio * h;
+        const float len = distance(mesh.position(int(e.v0)), mesh.position(int(e.v1)));
+        if (len > limit) firstOrderExtraSegments += uint64_t(std::ceil(len / limit)) - 1u;
+      }
+      reserve = float(std::max<uint64_t>(1024u,
+          std::min<uint64_t>(8192u, std::max<uint64_t>(1u, firstOrderExtraSegments) * 2u)));
+      std::cout << "raw_patch_pool first_order_extra_segments=" << firstOrderExtraSegments
+                << " patch_alloc_factor=" << reserve << '\n';
+    }
+    // Raw STL can start as one extremely coarse patch and generate many slices
+    // while long surface edges are refined. Reserve patch IDs up front; this is
+    // metadata capacity, not permission to cross classified sharp features.
     // Keep small inputs in one initial patch. Splitting a tiny closed mesh
     // into uneven patches gives it undersized local capacities and forces
     // repeated migration/slicing before its first remeshing pass completes.
@@ -207,6 +327,17 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     auto fp = rx.add_face_attribute<int>(facePatch, "face_patch");
     auto status = rx.add_edge_attribute<gpu::EdgeStatus>("edge_status", 1);
     auto edgePatch = rx.add_edge_attribute<int>("edge_patch", 1);
+    edgePatch->reset(0, rxmesh::LOCATION_ALL);
+    if (!rawSharpEdges.empty()) {
+      std::vector<uint32_t> edgeList(size_t(rx.get_num_edges()) * 2u);
+      rx.create_edge_list(edgeList.data(), false);
+      rx.for_each_edge(rxmesh::HOST, [&](rxmesh::EdgeHandle e) {
+        const uint32_t row = rx.linear_id(e);
+        const uint32_t a = edgeList[2u * row], b = edgeList[2u * row + 1u];
+        if (rawSharpEdges.count(rawEdgeKey(a, b))) (*edgePatch)(e) = gpu::kEdgeSharp;
+      }, nullptr, false);
+      edgePatch->move(rxmesh::HOST, rxmesh::DEVICE);
+    }
     auto boundary = rx.add_vertex_attribute<bool>("boundary", 1);
     auto valence = rx.add_vertex_attribute<uint8_t>("valence", 1);
     auto vDirty = rx.add_vertex_attribute<int>("v_dirty", 1);
@@ -292,8 +423,16 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     constexpr uint32_t threads = 256;
     const float splitRatio = config.splitRatio;
     const float collapseRatio = config.collapseRatio;
-    auto extraShmem = [&](uint32_t, uint32_t e, uint32_t) {
+    // Split needs one temporary edge mask. Collapse and flip both allocate
+    // an edge mask plus two vertex masks for link_condition(); account for all
+    // three or ShmemAllocator writes past the dynamic shared-memory region.
+    auto edgeMaskShmem = [&](uint32_t, uint32_t e, uint32_t) {
       return rxmesh::detail::mask_num_bytes(e) + rxmesh::ShmemAllocator::default_alignment;
+    };
+    auto topologyMaskShmem = [&](uint32_t v, uint32_t e, uint32_t) {
+      return rxmesh::detail::mask_num_bytes(e) +
+             2u * rxmesh::detail::mask_num_bytes(v) +
+             3u * rxmesh::ShmemAllocator::default_alignment;
     };
     auto expandDirty2Ring = [&] {
       constexpr uint32_t t = 256;
@@ -328,11 +467,19 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       markStatusFromDirty();
       rx.reset_scheduler();
       int launches = 0;
+      const int launchBudget = rawUnknownSinglePatch ? 64 : 2048;
       while (!rx.is_queue_empty()) {
-        if (++launches > 2048) throw std::runtime_error("RXMesh scheduler stalled");
+        if (++launches > launchBudget) {
+          if (rawUnknownSinglePatch) break; // continue refinement in the next macro iteration
+          throw std::runtime_error("RXMesh scheduler stalled");
+        }
         rxmesh::LaunchBox<threads> lb;
-        rx.update_launch_box({rxmesh::Op::EVDiamond}, lb, (void *)edge_split_kernel<threads>, true,
-                             false, false, false, extraShmem);
+        // Split's Query<EVDiamond> is used only to select cavity creators.
+        // CavityManager already reserves the dynamic workspace; adding a
+        // separate query workspace here double-counts it and can push the
+        // launch into a bad shared-memory configuration after patch growth.
+        rx.update_launch_box({}, lb, (void *)edge_split_kernel<threads>, true,
+                             false, false, false, edgeMaskShmem);
         edge_split_kernel<threads><<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
             rx.get_context(), *coords, *sAttr, *cAttr, *vp, *fp, *edgePatch, *status, *boundary,
             *vDirty, *vTouched, splitRatio, accepted, candidates);
@@ -353,11 +500,15 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       markStatusFromDirty();
       rx.reset_scheduler();
       int launches = 0;
+      const int launchBudget = rawUnknownSinglePatch ? 64 : 2048;
       while (!rx.is_queue_empty()) {
-        if (++launches > 2048) throw std::runtime_error("RXMesh scheduler stalled");
+        if (++launches > launchBudget) {
+          if (rawUnknownSinglePatch) break;
+          throw std::runtime_error("RXMesh collapse scheduler stalled");
+        }
         rxmesh::LaunchBox<threads> lb;
         rx.update_launch_box({rxmesh::Op::EVDiamond}, lb, (void *)edge_collapse_kernel<threads>,
-                             true, false, false, false, extraShmem);
+                             true, false, false, false, topologyMaskShmem);
         edge_collapse_kernel<threads><<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
             rx.get_context(), *coords, *sAttr, *cAttr, *vp, *fp, *edgePatch, *status, *boundary,
             *vDirty, *vTouched, collapseRatio, splitRatio, accepted, candidates);
@@ -385,11 +536,15 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       markStatusFromDirty();
       rx.reset_scheduler();
       int launches = 0;
+      const int launchBudget = rawUnknownSinglePatch ? 64 : 2048;
       while (!rx.is_queue_empty()) {
-        if (++launches > 2048) throw std::runtime_error("RXMesh scheduler stalled");
+        if (++launches > launchBudget) {
+          if (rawUnknownSinglePatch) break;
+          throw std::runtime_error("RXMesh flip scheduler stalled");
+        }
         rxmesh::LaunchBox<threads> lb;
         rx.update_launch_box({rxmesh::Op::EVDiamond}, lb, (void *)edge_flip_kernel<threads>, true,
-                             false, false, false, extraShmem);
+                             false, false, false, topologyMaskShmem);
         edge_flip_kernel<threads><<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
             rx.get_context(), *coords, *valence, *sAttr, *cAttr, *vp, *fp, *edgePatch, *status,
             *boundary, *vDirty, *vTouched, accepted, candidates);
@@ -407,15 +562,30 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     for (int it = 0; it < config.maxIterations; ++it) {
       auto mark = std::chrono::steady_clock::now();
-      if (config.enableSplit) report.splits += runSplit();
+      if (config.enableSplit) {
+        report.splits += runSplit();
+        rx.update_host();
+        if (!rx.validate())
+          throw std::runtime_error("RXMesh topology invalid immediately after split");
+      }
       report.secondsSplit +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
       mark = std::chrono::steady_clock::now();
-      if (config.enableCollapse) report.collapses += runCollapse();
+      if (config.enableCollapse) {
+        report.collapses += runCollapse();
+        rx.update_host();
+        if (!rx.validate())
+          throw std::runtime_error("RXMesh topology invalid immediately after collapse");
+      }
       report.secondsCollapse +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
       mark = std::chrono::steady_clock::now();
-      if (config.enableFlip) report.flips += runFlip();
+      if (config.enableFlip) {
+        report.flips += runFlip();
+        rx.update_host();
+        if (!rx.validate())
+          throw std::runtime_error("RXMesh topology invalid immediately after flip");
+      }
       report.secondsFlip +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
       tagPatchInterfaces();

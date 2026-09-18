@@ -47,9 +47,9 @@ if(CAD_ADAPTIVE_RXMESH)
     add_subdirectory("${CAD_ADAPTIVE_RXMESH_SOURCE}" ${CMAKE_BINARY_DIR}/rxmesh_dep)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${_saved_runtime}")
 
-    # Device-link inside this STATIC lib. Per-test *.device-link.obj on MSVC
-    # does not rebuild when RxMeshBackend.obj changes, which is LNK2001
-    # __fatbinwrap / __cudaRegisterLinkedBinary (hash mismatch).
+    # RXMesh itself contains multiple CUDA translation units with relocatable
+    # device code. The wrapper therefore still requires one final CUDA device
+    # link; disabling it produces __cudaRegisterLinkedBinary_* unresolved symbols.
     add_library(cad_adaptive_rx STATIC src/rxmesh/RxMeshBackend.cu)
     target_link_libraries(cad_adaptive_rx PUBLIC cad_adaptive RXMesh)
     target_compile_features(cad_adaptive_rx PUBLIC cxx_std_17 cuda_std_17)
@@ -73,13 +73,9 @@ if(CAD_ADAPTIVE_RXMESH)
     target_compile_options(cad_adaptive_global PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
-    # Same CLI and same global remesher, without unrelated RXMesh solver DLLs.
-    # Keep the original multi-backend executable for explicit --gpu users.
-    add_executable(cad_adaptive_global_cli tools/remesh_cli.cpp)
-    target_link_libraries(cad_adaptive_global_cli PRIVATE cad_adaptive_global)
-
-    # VS CudaLink does not rebuild cad_adaptive_rx.device-link.obj when
-    # RxMeshBackend.obj changes (LNK2001 fatbinwrap hash mismatch).
+    # VS CudaLink can leave cad_adaptive_rx.device-link.obj stale when
+    # RxMeshBackend.cu or an included RXMesh kernel changes. Force that
+    # intermediate to be regenerated so the fatbin registration hashes match.
     set(_rx_dlink_stamp "${CMAKE_CURRENT_BINARY_DIR}/rxmesh_backend.dlink.stamp")
     file(GLOB _rx_kernel_headers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/rxmesh/*.cuh")
     add_custom_command(
@@ -97,6 +93,12 @@ if(CAD_ADAPTIVE_RXMESH)
             "${CAD_ADAPTIVE_RXMESH_SOURCE}/include/rxmesh/rxmesh_static.cu"
         COMMENT "Drop stale cad_adaptive_rx CUDA device-link object")
     target_sources(cad_adaptive_rx PRIVATE "${_rx_dlink_stamp}")
+
+    # Same CLI and same global remesher, without unrelated RXMesh solver DLLs.
+    # Keep the original multi-backend executable for explicit --gpu users.
+    add_executable(cad_adaptive_global_cli tools/remesh_cli.cpp)
+    target_link_libraries(cad_adaptive_global_cli PRIVATE cad_adaptive_global)
+
 
     target_link_libraries(cad_adaptive_cli PRIVATE cad_adaptive_rx cad_adaptive_global)
     target_compile_definitions(cad_adaptive_cli PRIVATE

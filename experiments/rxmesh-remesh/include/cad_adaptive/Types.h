@@ -105,6 +105,7 @@ struct RemeshConfig {
   float collapseRatio = 4.0f / 5.0f;
   float minQuality = 1e-5f;
   float normalDegrees = 10;
+  float featureAngleDegrees = 30; // raw STL crease threshold; independent of CAD normal tolerance
   int maxIterations = 5;
   bool adaptive = true;
   bool enableSplit = true;

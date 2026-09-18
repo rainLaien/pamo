@@ -14,6 +14,7 @@ constexpr int kCorner = 4;
 constexpr int kLocked = 5;
 constexpr int kEdgeMeshBoundary = -1;
 constexpr int kEdgePatchBoundary = -2;
+constexpr int kEdgeSharp = -3;
 constexpr int kPatchPlane = 1;
 constexpr int kPatchCylinder = 2;
 
