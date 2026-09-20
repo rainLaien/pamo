@@ -1,43 +1,16 @@
-[19:39:19] [info] RXMesh: Total number of device: 1
-[19:39:19] [info] RXMesh: Using device Number: 0
-[19:39:19] [info] RXMesh: Device name: NVIDIA GeForce RTX 3060
-[19:39:19] [info] RXMesh: Compute Capability: 8.6
-[19:39:19] [info] RXMesh: Total amount of global memory (MB): 12287.4
-[19:39:19] [info] RXMesh: 28 Multiprocessors, 128 CUDA Cores/MP: 3584 CUDA Cores
-[19:39:19] [info] RXMesh: Maximum # blocks per SM: 16
-[19:39:19] [info] RXMesh: ECC support: Disabled
-[19:39:19] [info] RXMesh: GPU Max Clock rate: 1777.0 MHz (1.78 GHz)
-[19:39:19] [info] RXMesh: Memory Clock rate: 7501.0 Mhz
-[19:39:19] [info] RXMesh: Memory Bus Width:  192-bit
-[19:39:19] [info] RXMesh: Peak Memory Bandwidth: 360.048000(GB/s)
-[19:39:19] [info] RXMesh: Kernels compiled for compute capability: 860
-[19:39:19] [info] RXMesh: Using cuSolver Version 11.7.1
-[19:39:19] [info] RXMesh: Using cuSparse Version 12.5.4
-[19:39:19] [info] RXMesh: Using cuBlas Version 12.6.3
-[19:39:19] [info] RXMesh: Patcher: num_patches = 1
-[19:39:19] [info] RXMesh: Patcher: patches_size = 512
-[19:39:19] [info] RXMesh: Patcher: num_components = 1
-[19:39:19] [info] RXMesh: Patcher: Num lloyd run = 0
-[19:39:19] [info] RXMesh: Patcher: Parallel patches construction time = 0 (ms) and 0 (ms/lloyd_run)
-[19:39:19] [info] RXMesh: Patcher: max_patch_size= 424, min_patch_size= 424, avg_patch_size= 424
-[19:39:19] [info] RXMesh: Patcher: number external ribbon elements = 0 (0.00%)
-[19:39:19] [info] RXMesh: RXMesh: Num colors = 1
-[19:39:19] [info] RXMesh: RXMesh: #Vertices = 214, #Faces= 424, #Edges= 636, #Patches = 1
-[19:39:19] [info] RXMesh: RXMesh: Input is edge manifold
-[19:39:19] [info] RXMesh: RXMesh: Input is closed
-[19:39:19] [info] RXMesh: RXMesh: Input max valence = 28
-[19:39:19] [info] RXMesh: RXMesh: max edge incident faces = 2
-[19:39:19] [info] RXMesh: RXMesh: max face adjacent faces = 3
-[19:39:19] [info] RXMesh: RXMesh: per-patch maximum face count = 424
-[19:39:19] [info] RXMesh: RXMesh: per-patch maximum edge count = 636
-[19:39:19] [info] RXMesh: RXMesh: per-patch maximum vertex count = 214
-[19:39:19] [info] RXMesh: RXMesh::init timings:
-[19:39:19] [info] RXMesh:   total = 9.9123 (ms)
-[19:39:19] [info] RXMesh:   build = 6.1543 (ms)
-[19:39:19] [info] RXMesh:   populate_patch_stash = 0.0248 (ms)
-[19:39:19] [info] RXMesh:   coloring = 0.611 (ms)
-[19:39:19] [info] RXMesh:   build_device = 2.7893 (ms)
-[19:39:19] [info] RXMesh:   PatchScheduler = 0.0817 (ms)
-[19:39:19] [info] RXMesh:   compute_max_lp_capacity = 0.0006 (ms)
-[19:39:19] [info] RXMesh:   create_handles = 0.0786 (ms)
-[19:39:19] [info] RXMesh:   context.init = 0.1095 (ms)
+[12:31:27] [info] RXMesh: Total number of device: 1
+[12:31:27] [info] RXMesh: Using device Number: 0
+[12:31:27] [info] RXMesh: Device name: NVIDIA GeForce RTX 3060
+[12:31:27] [info] RXMesh: Compute Capability: 8.6
+[12:31:27] [info] RXMesh: Total amount of global memory (MB): 12287.4
+[12:31:27] [info] RXMesh: 28 Multiprocessors, 128 CUDA Cores/MP: 3584 CUDA Cores
+[12:31:27] [info] RXMesh: Maximum # blocks per SM: 16
+[12:31:27] [info] RXMesh: ECC support: Disabled
+[12:31:27] [info] RXMesh: GPU Max Clock rate: 1777.0 MHz (1.78 GHz)
+[12:31:27] [info] RXMesh: Memory Clock rate: 7501.0 Mhz
+[12:31:27] [info] RXMesh: Memory Bus Width:  192-bit
+[12:31:27] [info] RXMesh: Peak Memory Bandwidth: 360.048000(GB/s)
+[12:31:27] [info] RXMesh: Kernels compiled for compute capability: 860
+[12:31:27] [info] RXMesh: Using cuSolver Version 11.7.1
+[12:31:27] [info] RXMesh: Using cuSparse Version 12.5.4
+[12:31:27] [info] RXMesh: Using cuBlas Version 12.6.3

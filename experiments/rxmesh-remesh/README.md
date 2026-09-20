@@ -153,6 +153,34 @@ These safeguards do not require a correct CAD partition. They cover the raw
 single-patch backend; the separate analytic CAD backend has its own checks.
 Invalid input or an unmet final constraint still fails explicitly.
 
+## Raw CUDA tolerance-query acceleration
+
+Operation feasibility uses a bounded source-surface query: BVH branches outside
+the existing local error radius are skipped, and the first source point within
+that radius proves acceptance. Exact nearest-point queries remain in projection
+and final distance auditing. The acceptance threshold, source surface, operation
+ordering and safety checks are unchanged.
+
+On RTX 3060, `浇道.stl` (identical to `examples/3.stl`),
+`--gpu --iters 20 --feature-refine`, fresh sequential processes measured:
+
+| Backend stage | Before | After |
+|---|---:|---:|
+| Collapse | 110.13 s | 36.03 s |
+| Smooth and projection | 50.38 s | 9.83 s |
+| Total remesh | 180.24 s | 60.70 s |
+
+The before/after exported OBJ files are byte-identical (SHA256
+`CAEDFAA24A6DB51F69C507D26B3DD5C0E27A546F484180F326D3FBC8471FEAA8`).
+An optimized repeat took 60.88 s with the same hash and non-timing metrics.
+`Unnamed-Body.stl` with the same options improved from 4.40 s to 2.33 s,
+also with byte-identical output. All five GPU tests and CUDA memcheck passed.
+These are backend times for the tested models, not a general performance guarantee.
+The `raw_projection_safety` regression compares bounded queries, with and without
+a BVH, against brute-force nearest-point acceptance across patches, tolerance
+boundaries and spatial sizing. The larger remaining work is persistent GPU
+topology/compaction to reduce per-pass host adjacency rebuilds and transfers.
+
 ## CAD partition handoff
 
 ```powershell

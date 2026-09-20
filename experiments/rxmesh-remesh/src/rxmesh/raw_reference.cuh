@@ -144,16 +144,35 @@ __device__ __noinline__ bool projectReference(ReferenceSurfaceGpu ref,
   }
   return found;
 }
-__device__ inline bool referenceNear(ReferenceSurfaceGpu ref, int patch,
+__device__ __noinline__ bool referenceNear(ReferenceSurfaceGpu ref, int patch,
                                      float3 p) {
   if (!ref.count)
     return true;
-  float3 q;
-  if (!projectReference(ref, patch, p, q))
-    return false;
-  const auto d = sub3(q, p);
   const float tolerance = toleranceAt(ref, p);
-  return dot3(d, d) <= tolerance * tolerance;
+  const float radius2=tolerance*tolerance;
+  // Feasibility needs any source point inside the original tolerance, not
+  // the exact closest point. Prune with a conservative bound and stop at
+  // the first witness. The actual acceptance predicate is unchanged.
+  const float bound=radius2+fmaxf(1.e-10f,radius2*1.e-5f);
+  int node=0;
+  while(node<(ref.nodeCount ? ref.nodeCount : 1)) {
+    int first=0,count=ref.count;
+    if(ref.nodeCount) {
+      const auto n=ref.nodes[node];
+      if(boxDistance2(p,n)>bound){node=n.escape;continue;}
+      if(n.first<0){++node;continue;}
+      first=n.first;count=n.count;
+    }
+    for(int k=0;k<count;++k) {
+      const int id=ref.nodeCount ? ref.triangleIds[first+k] : k;
+      const auto t=ref.triangles[id];
+      if(t.patch!=patch)continue;
+      const auto d=sub3(closestTriangle(p,t),p);
+      if(dot3(d,d)<=radius2)return true;
+    }
+    ++node;
+  }
+  return false;
 }
 __device__ __noinline__ bool referenceFaceSafe(ReferenceSurfaceGpu ref,
                                                int patch, float3 a, float3 b,

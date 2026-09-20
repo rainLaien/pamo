@@ -11,6 +11,23 @@ __global__ void compareSizing(ReferenceSurfaceGpu indexed,int *failures) {
   if(sizingAt(indexed,p)!=sizingAt(linear,p))atomicAdd(failures,1);
 }
 
+__global__ void compareReferenceNear(ReferenceSurfaceGpu ref,int *failures) {
+  const int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=8192)return;
+  const auto p=make_float3(float(i%32)*.125f-2.f,
+                          float((i/32)%32)*.125f-2.f,
+                          float(i/1024-4)*.03125f);
+  for(int patch=0;patch<3;++patch) {
+    auto linear=ref;linear.nodeCount=0;
+    float3 q;
+    const float tolerance=toleranceAt(ref,p);
+    const bool expected=projectReference(linear,patch,p,q) &&
+                        dist2(p,q)<=tolerance*tolerance;
+    if(referenceNear(ref,patch,p)!=expected)atomicAdd(failures,1);
+    if(referenceNear(linear,patch,p)!=expected)atomicAdd(failures,1);
+  }
+}
+
 int main() {
   DeviceArena arena;ArenaScope scope(arena);
   SemanticMesh mesh;mesh.patches.resize(1);
@@ -68,5 +85,25 @@ int main() {
   ref.sizing=sizes.p;ref.sizingCount=int(seeds.size());ref.sizingNodes=tree.p;ref.sizingNodeCount=int(nodes.size());ref.sizingIds=order.p;ref.band=.75f;
   checked(cudaMemset(failures.p,0,sizeof(int)));
   compareSizing<<<32,128>>>(ref,failures.p);sync();CHECK(failures.read()[0]==0);
+  // Compare radius witnesses to brute-force nearest-point acceptance, including
+  // missing patches, exact tolerance boundaries and the spatial sizing field.
+  std::vector<ReferenceTriangleGpu> surface;
+  for(int i=0;i<64;++i) {
+    float x=float(i%8)*.5f-2.f,y=float(i/8)*.5f-2.f;
+    surface.push_back({{x,y,0},{x+.5f,y,0},{x,y+.5f,0},i%2});
+  }
+  buildReferenceBvh(surface,1.e-5f,nodes,ids);
+  Buffer<ReferenceTriangleGpu> surfaceBuffer(surface);
+  Buffer<ReferenceBvhNode> surfaceTree(nodes);Buffer<int> surfaceOrder(ids);
+  ref.triangles=surfaceBuffer.p;ref.count=int(surface.size());
+  ref.nodes=surfaceTree.p;ref.nodeCount=int(nodes.size());ref.triangleIds=surfaceOrder.p;
+  for(float tolerance:{0.f,.03125f,.125f,.25f}) {
+    ref.tolerance=tolerance;
+    for(bool sized:{false,true}) {
+      auto query=ref;if(!sized)query.sizingCount=0;
+      compareReferenceNear<<<64,128>>>(query,failures.p);sync();
+      CHECK(failures.read()[0]==0);
+    }
+  }
   return test_result("raw_projection_safety");
 }
