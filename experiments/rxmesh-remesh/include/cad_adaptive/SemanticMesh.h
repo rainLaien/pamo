@@ -4,6 +4,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace cad_adaptive {
@@ -54,6 +55,10 @@ struct SemanticMesh {
   std::vector<uint8_t> faceAlive;
 
   std::vector<PatchRecord> patches;
+  // Persistent geometric-feature identity keyed by undirected vertex pair.
+  // Unlike EdgeRec flags this survives rebuildTopology(), mirroring VCGLib's
+  // persistent face-edge selection semantics.
+  std::unordered_map<uint64_t, uint32_t> featureEdges;
   std::vector<EdgeRec> edges;
   std::vector<std::vector<int>> incidentFaces;
 

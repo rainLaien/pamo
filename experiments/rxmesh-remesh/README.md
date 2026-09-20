@@ -27,6 +27,80 @@ Completed: [`RXREMESH-001.md`](RXREMESH-001.md) (001.0–001.5) and
 A raw STL has no `PatchId` / `EdgeSharp`. The raw CLI path remains an unlabeled
 topology experiment. For CAD shape preservation, use the PAMO handoff below.
 
+## Raw STL quality baseline (`--gpu`)
+
+```powershell
+.\experiments\rxmesh-remesh\build_rx\Release\cad_adaptive_cli.exe `
+  .\examples\Unnamed-Body.stl out.obj --gpu --iters 20
+```
+
+An unlabelled single-patch mesh now selects `gpu-raw-cuda`, a dedicated CUDA
+operator implementation. It does not run the CPU remesher or VCGLib internally.
+The RXMesh cavity backend continues to handle the existing labelled/analytic
+path. The raw CUDA path uses GPU triangle split templates, short/small-area
+collapse, a relaxed low-valence collapse pass, valence/quality flips, and
+projected smoothing against an immutable copy of the input triangles. Creases
+are classified once and propagated. Qualifying crease segments can coarsen;
+this phase does not promise preservation of every original feature vertex.
+
+CPU code constructs adjacency and compacts GPU output between topology passes.
+Reference queries currently scan the source triangles. Uniform and optional
+feature/curvature sizing support small reference meshes; this is not a
+demonstrated large-mesh GPU speedup. It does not exactly reproduce VCGLib's sequential scheduling, smoothing
+step count or dedicated fold-relaxation pass. `--cpu` remains the separate
+experimental CPU implementation.
+
+For a real VCGLib comparison, configure with
+`-DCAD_ADAPTIVE_VCGLIB_REFERENCE=ON -DVCGLIB_ROOT=D:/openSourceInstall/vcglib`, then
+build `vcglib_reference`. Its arguments are
+`INPUT OUTPUT [target_length] [iterations] [feature_angle] [max_error]`; defaults
+match the raw CLI's length, iterations, feature angle and geometry tolerance.
+The CLI's raw geometry report samples the original input, not the output itself.
+`tools/compare_raw_meshes.py` independently audits exported meshes, including
+sampled distances in both directions (requires NumPy, SciPy and trimesh).
+
+Configure `-DBUILD_TESTING=ON` to build the raw-reference quality regression and
+existing RXMesh isotropic, constraints and analytic-projection regressions.
+
+## Raw feature and curvature refinement
+
+```powershell
+.\experiments\rxmesh-remesh\build_rx\Release\cad_adaptive_cli.exe `
+  .\examples\Unnamed-Body.stl refined.obj --gpu --feature-refine
+```
+
+This opt-in mode refines curved regions, rather than all feature edges. Sharp
+plane/plane intersections remain geometric constraints without automatically
+receiving smaller elements. Coplanar triangles are grouped first; a chain of
+normal changes through adjacent groups provides curvature evidence. An isolated
+shallow junction between two planes is excluded as well as sharp dihedrals.
+This is a discrete heuristic, not a complete CAD surface classifier.
+
+`--feature-size H` sets the lower bound on curvature-driven size (default 0.25
+of the regular length). It no longer sets a size on all creases. The curvature
+size combines a sagitta bound with a normal-rotation bound controlled by
+`--normal-degrees` (default 10). Lowering H alone does not force refinement when
+curvature already permits a larger size. `--feature-band B` controls transition
+width onto adjacent planes (default 0.75 of the regular length, previously 2).
+Both options imply `--feature-refine`. H must be positive and smaller than the
+regular length; B must be positive. Scope is raw single Unknown patch `--gpu`.
+
+Immutable source curvature edges seed the field, evaluated on the GPU after
+edits. Split/collapse use local targets; proposed edits and final seven-point
+face samples use `min(max-error, 0.08 * local-target)`. The local sizing audit
+reports local edge-band compliance. The other edge audit explicitly reports
+only the global reference length. Shared curve/plane boundaries remain conforming
+and require a narrow transition on the plane. The field uses Euclidean distance;
+very close sheets, noisy input, and undersampled curves need further validation.
+It preserves the STL surface, not an unprovided exact CAD surface.
+
+For `Unnamed-Body.stl`, 20 cycles now produce 11,092 faces instead of the previous
+feature-distance mode's 21,688. In fixed inspection regions, average edge length
+changes from 0.87 to 0.59 on the round and from 0.46 to 1.82 on distant plane/plane
+intersections (regular target 1.80). Mean triangle quality is 0.97358; independently
+sampled bidirectional error is 0.02839. Regression tests cover a square prism,
+a shallow two-plane junction, a smooth cylinder and the user's STL.
+
 ## CAD partition handoff
 
 ```powershell

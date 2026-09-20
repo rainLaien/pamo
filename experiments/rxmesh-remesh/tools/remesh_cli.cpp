@@ -38,6 +38,7 @@ int main(int argc, char **argv) {
               << "       cad_adaptive_cli --grid TRIS OUTPUT.ply [target_length] [--gpu|--cpu|--global]\n"
               << "       --boundary-gradation G (0<G<=1), --uniform-sizing, --local-sizing\n"
               << "       --curvature-sizing is opt-in and may greatly increase mesh density\n"
+              << "       --feature-refine [--feature-size H] [--feature-band B] for raw --gpu\n"
               << "       --feature-angle DEG classifies raw STL crease edges (default 30)\n"
               << "       --no-fillet-initialization disables automatic cylindrical fillet seeding\n"
               << "       --save-initial-mesh saves OUTPUT.ply.initial.ply before GPU iterations\n"
@@ -61,6 +62,8 @@ int main(int argc, char **argv) {
   float maxSizingOutlierFraction = 0.05f;
   float normalDegrees = 10.0f;
   float featureAngleDegrees = 30.0f;
+  bool featureRefine=false;
+  float featureSize=0, featureBand=0;
   float referenceSampleError = -1.0f;
   // Local boundary grading and recognized fillet seeding are enabled by default.
   // A curvature cap for other cylindrical patches remains opt-in.
@@ -111,6 +114,15 @@ int main(int argc, char **argv) {
       maxSizingOutlierFraction=std::strtof(argv[++i],nullptr);
     else if (std::strcmp(argv[i], "--normal-degrees") == 0 && i+1<argc)
       normalDegrees=std::strtof(argv[++i],nullptr);
+    else if (std::strcmp(argv[i], "--feature-refine") == 0) featureRefine=true;
+    else if (std::strcmp(argv[i], "--feature-size") == 0 && i+1<argc) {
+      featureSize=std::strtof(argv[++i],nullptr); featureRefine=true;
+      if (!(featureSize>0) || !std::isfinite(featureSize)) {std::cerr<<"invalid feature size\n";return 2;}
+    }
+    else if (std::strcmp(argv[i], "--feature-band") == 0 && i+1<argc) {
+      featureBand=std::strtof(argv[++i],nullptr); featureRefine=true;
+      if (!(featureBand>0) || !std::isfinite(featureBand)) {std::cerr<<"invalid feature band\n";return 2;}
+    }
     else if (std::strcmp(argv[i], "--feature-angle") == 0 && i+1<argc)
       featureAngleDegrees=std::strtof(argv[++i],nullptr);
     else if (std::strcmp(argv[i], "--cavity-ratio") == 0 && i+1<argc)
@@ -156,7 +168,10 @@ int main(int argc, char **argv) {
     std::cerr << error << '\n';
     return 1;
   }
-  lockMeshBoundary(mesh);
+  // Preserve open boundaries for synthetic grids/partitioned CAD handoff.
+  // A generic STL/OBJ remesh should classify its own border/crease constraints
+  // in the CPU backend instead of locking every input boundary vertex.
+  if (grid || partitionInput) lockMeshBoundary(mesh);
   std::cout << "geometric_patches=" << mesh.patches.size() << " partition_input=" << partitionInput << '\n';
   RemeshConfig cfg;
   cfg.adaptive = false;
@@ -174,6 +189,14 @@ int main(int argc, char **argv) {
   cfg.maxIterations = iters > 0 ? iters : 5;
   cfg.enableSplit=split; cfg.enableSmooth=smooth; cfg.enableCollapse=collapse; cfg.enableFlip=flip;
   cfg.featureAngleDegrees=featureAngleDegrees;
+  if (featureRefine) {
+    if (!useGpu || partitionInput || mesh.patches.size()!=1 || mesh.patches[0].type!=PatchType::Unknown) {
+      std::cerr<<"--feature-refine requires raw single-patch --gpu input\n";return 2;
+    }
+    cfg.featureEdgeLength=featureSize>0 ? featureSize : .25f*cfg.constantLength;
+    cfg.featureBand=featureBand>0 ? featureBand : .75f*cfg.constantLength;
+    if (!(cfg.featureEdgeLength<cfg.constantLength)) {std::cerr<<"feature size must be below regular target\n";return 2;}
+  }
   cfg.smoothLambda=smoothLambda;
   cfg.normalDegrees=normalDegrees;
   if (partitionInput) {
@@ -251,7 +274,7 @@ int main(int argc, char **argv) {
   const EdgeLengthAudit beforeAudit = mesh.edgeLengthAudit(
       cfg.constantLength, cfg.splitRatio, cfg.collapseRatio);
   std::cout << "edge_length_audit_before "
-            << "threshold_mode=" << (mesh.LocalSizing ? "local_endpoint_mean" : "uniform") << ' '
+            << "threshold_mode=" << (mesh.LocalSizing ? "local_endpoint_mean" : (featureRefine ? "global_reference_only" : "uniform")) << ' '
             << "target=" << beforeAudit.targetLength
             << " split_threshold=" << beforeAudit.splitThreshold
             << " collapse_threshold=" << beforeAudit.collapseThreshold
@@ -277,7 +300,7 @@ int main(int argc, char **argv) {
   secondsPreprocess=elapsed(mainStart);
   RemeshReport report;
   SemanticMesh reference;
-  if (partitionInput) reference = mesh;
+  reference = mesh;
   bool ok = false;
   const char *backendName = "cpu";
   if (useGlobal) {
@@ -421,7 +444,8 @@ int main(int argc, char **argv) {
     }
     RxMeshBackend backend;
     ok = backend.remesh(mesh, cfg, report);
-    backendName = "gpu";
+    backendName = reference.patches.size()==1 && reference.patches[0].type==PatchType::Unknown
+        ? "gpu-raw-cuda" : "gpu-rxmesh";
 #else
     std::cerr << "this binary was built without CAD_ADAPTIVE_RXMESH\n";
     return 1;
@@ -444,7 +468,7 @@ int main(int argc, char **argv) {
     const EdgeLengthAudit audit = mesh.edgeLengthAudit(
         cfg.constantLength, cfg.splitRatio, cfg.collapseRatio);
     std::cout << "edge_length_audit "
-              << "threshold_mode=" << (mesh.LocalSizing ? "local_endpoint_mean" : "uniform") << ' '
+              << "threshold_mode=" << (mesh.LocalSizing ? "local_endpoint_mean" : (featureRefine ? "global_reference_only" : "uniform")) << ' '
               << "target=" << audit.targetLength
               << " split_threshold=" << audit.splitThreshold
               << " collapse_threshold=" << audit.collapseThreshold
@@ -474,9 +498,34 @@ int main(int argc, char **argv) {
   }
   // Populate final quality/sizing metrics for every backend. Preserve the stricter
   // CAD-contract geometry bound, which samples more than face centroids.
+  if (featureRefine) {
+    float minTarget=cfg.constantLength,maxTarget=0; int inBand=0;
+    for (float h:mesh.targetLength) {minTarget=std::min(minTarget,h);maxTarget=std::max(maxTarget,h);}
+    for (auto e:mesh.edges) {
+      const float h=.5f*(mesh.targetLength[e.v0]+mesh.targetLength[e.v1]);
+      const float len=distance(mesh.position(e.v0),mesh.position(e.v1));
+      inBand+=len>=cfg.collapseRatio*h && len<=cfg.splitRatio*h;
+    }
+    std::cout<<"raw_local_sizing_audit target_min="<<minTarget<<" target_max="<<maxTarget
+             <<" local_edge_band_fraction="<<double(inBand)/mesh.edges.size()<<'\n';
+  }
   const float validatedGeometryErrorMax = report.geometryErrorMax;
-  fillMeshMetrics(mesh, cfg, report);
+  fillMeshMetrics(mesh, cfg, report, featureRefine);
   report.geometryErrorMax = std::max(report.geometryErrorMax, validatedGeometryErrorMax);
+  if(!partitionInput && !grid) {
+    GeometryProjector sourceProjector;sourceProjector.build(reference);
+    float sourceError=0;
+    for(int f=0;f<mesh.faceCount();++f) if(mesh.faceAlive[f]) {
+      const auto a=mesh.facePoint(f,0),b=mesh.facePoint(f,1),c=mesh.facePoint(f,2);
+      for(auto p:{a,b,c,(a+b)*.5f,(b+c)*.5f,(c+a)*.5f,(a+b+c)*(1.f/3.f)}) {
+        const auto hit=sourceProjector.projectSurface(mesh.facePatchId[f],p);
+        if(!hit.ok){std::cerr<<"source-reference validation failed\n";return 1;}
+        sourceError=std::max(sourceError,distance(p,hit.position));
+      }
+    }
+    report.geometryErrorMax=sourceError;
+    std::cout<<"source_sampled_error="<<sourceError<<" budget="<<cfg.maxGeometryError<<'\n';
+  }
   if (detailedDiagnostics) {
     auto printQualityGroupTmp = [&](const char *name, std::vector<float> q) {
       if (q.empty()) return; std::sort(q.begin(), q.end());
@@ -520,6 +569,16 @@ int main(int argc, char **argv) {
   }
   secondsSave=elapsed(saveStart);
   std::string json = remeshReportJson(report);
+  {
+    std::ostringstream extra;
+    extra<<",\n  \"backend\": \""<<backendName<<"\",\n"
+         <<"  \"geometry_error_budget\": "<<cfg.maxGeometryError<<",\n"
+         <<"  \"reference_error_is_sampled\": true\n";
+    if(featureRefine) extra<<",  \"feature_refine\": true,\n"
+        <<"  \"feature_size\": "<<cfg.featureEdgeLength<<",\n"
+        <<"  \"feature_band\": "<<cfg.featureBand<<"\n";
+    if(!useGlobal)json.insert(json.rfind('}'),extra.str());
+  }
   if(useGlobal) {
     std::ostringstream extra;
     extra << ",\n  \"termination\": \"" << termination << "\",\n"

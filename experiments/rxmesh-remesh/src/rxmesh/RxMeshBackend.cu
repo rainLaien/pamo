@@ -11,6 +11,7 @@
 #include "kernels_patch.cuh"
 #include "kernels_smooth.cuh"
 #include "kernels_split.cuh"
+#include "cad_adaptive/RawCudaRemesher.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,40 +22,6 @@
 
 namespace cad_adaptive {
 namespace {
-
-struct RawFeatureStats {
-  int SharpEdges = 0;
-  int FeatureVertices = 0;
-  int Corners = 0;
-};
-
-uint64_t rawEdgeKey(uint32_t a, uint32_t b) {
-  if (a > b) std::swap(a, b);
-  return (uint64_t(a) << 32) | uint64_t(b);
-}
-
-RawFeatureStats classifyRawSharpFeatures(SemanticMesh &mesh, float angleDegrees) {
-  RawFeatureStats stats;
-  if (!(angleDegrees > 0.0f && angleDegrees < 180.0f) || mesh.faceCount() == 0) return stats;
-  mesh.rebuildTopology();
-  const float cosThreshold = std::cos(angleDegrees * 0.01745329251994329577f);
-  std::vector<int> degree(size_t(mesh.vertexCount()), 0);
-  for (auto &e : mesh.edges) {
-    if (e.face0 < 0 || e.face1 < 0) continue;
-    const auto f0 = mesh.face(e.face0), f1 = mesh.face(e.face1);
-    const Vec3 n0 = triangleNormal(mesh.position(f0[0]), mesh.position(f0[1]), mesh.position(f0[2]));
-    const Vec3 n1 = triangleNormal(mesh.position(f1[0]), mesh.position(f1[1]), mesh.position(f1[2]));
-    if (dot(n0, n1) > cosThreshold) continue;
-    e.flags = uint8_t(e.flags | EdgeSharp | EdgeProtected);
-    ++degree[e.v0]; ++degree[e.v1]; ++stats.SharpEdges;
-  }
-  for (int v = 0; v < mesh.vertexCount(); ++v) {
-    if (degree[v] <= 0) continue;
-    if (degree[v] != 2) { mesh.vertexConstraint[v] = uint8_t(VertexConstraint::Corner); ++stats.Corners; }
-    else { mesh.vertexConstraint[v] = uint8_t(VertexConstraint::FeatureEdge); ++stats.FeatureVertices; }
-  }
-  return stats;
-}
 
 using rxmesh::DEVICE;
 using rxmesh::HandleError;
@@ -256,14 +223,7 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     mesh.rebuildTopology();
     const bool rawUnknownSinglePatch = mesh.patches.size() == 1 &&
         mesh.patches[0].type == PatchType::Unknown;
-    RawFeatureStats rawFeatures;
-    if (rawUnknownSinglePatch) {
-      rawFeatures = classifyRawSharpFeatures(mesh, config.featureAngleDegrees);
-      std::cout << "raw_feature_classification angle_degrees=" << config.featureAngleDegrees
-                << " sharp_edges=" << rawFeatures.SharpEdges
-                << " feature_vertices=" << rawFeatures.FeatureVertices
-                << " corners=" << rawFeatures.Corners << '\n';
-    }
+    if(rawUnknownSinglePatch) return remeshRawCuda(mesh,config,report);
     int boundIn = 0;
     for (const auto &e : mesh.edges)
       if (e.flags & EdgeMeshBoundary) ++boundIn;
@@ -277,12 +237,6 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     if (config.enableSmooth && hasReferenceOnlyPatch)
       std::cerr << "[cad_adaptive rxmesh] smoothing disabled: Unknown/Freeform patches "
                    "require reference-mesh projection (GPU BVH not wired yet)\n";
-    std::unordered_set<uint64_t> rawSharpEdges;
-    if (rawUnknownSinglePatch && rawFeatures.SharpEdges > 0) {
-      rawSharpEdges.reserve(size_t(rawFeatures.SharpEdges) * 2u);
-      for (const auto &e : mesh.edges)
-        if (e.flags & EdgeSharp) rawSharpEdges.insert(rawEdgeKey(e.v0, e.v1));
-    }
     std::vector<std::vector<uint32_t>> fv;
     std::vector<std::vector<float>> verts;
     std::vector<int> constraint, vPatch, fPatch;
@@ -291,24 +245,6 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     if (!config.adaptive && config.constantLength > 0)
       for (float &h : sizes) h = config.constantLength;
     float reserve = std::max(3.0f, 64.0f / std::max(1.0f, float(fv.size()) / 256.0f));
-    if (rawUnknownSinglePatch) {
-      // A very coarse STL can require thousands of first-order edge segments
-      // before it reaches the target length. RXMesh dynamic slicing consumes
-      // patch IDs while that refinement proceeds, so size the metadata pool from
-      // the actual coarse-edge demand rather than a model-specific constant.
-      uint64_t firstOrderExtraSegments = 0;
-      for (const auto &e : mesh.edges) {
-        const float h = 0.5f * (mesh.targetLength[e.v0] + mesh.targetLength[e.v1]);
-        if (!(h > 0.0f)) continue;
-        const float limit = config.splitRatio * h;
-        const float len = distance(mesh.position(int(e.v0)), mesh.position(int(e.v1)));
-        if (len > limit) firstOrderExtraSegments += uint64_t(std::ceil(len / limit)) - 1u;
-      }
-      reserve = float(std::max<uint64_t>(1024u,
-          std::min<uint64_t>(8192u, std::max<uint64_t>(1u, firstOrderExtraSegments) * 2u)));
-      std::cout << "raw_patch_pool first_order_extra_segments=" << firstOrderExtraSegments
-                << " patch_alloc_factor=" << reserve << '\n';
-    }
     // Raw STL can start as one extremely coarse patch and generate many slices
     // while long surface edges are refined. Reserve patch IDs up front; this is
     // metadata capacity, not permission to cross classified sharp features.
@@ -328,16 +264,6 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
     auto status = rx.add_edge_attribute<gpu::EdgeStatus>("edge_status", 1);
     auto edgePatch = rx.add_edge_attribute<int>("edge_patch", 1);
     edgePatch->reset(0, rxmesh::LOCATION_ALL);
-    if (!rawSharpEdges.empty()) {
-      std::vector<uint32_t> edgeList(size_t(rx.get_num_edges()) * 2u);
-      rx.create_edge_list(edgeList.data(), false);
-      rx.for_each_edge(rxmesh::HOST, [&](rxmesh::EdgeHandle e) {
-        const uint32_t row = rx.linear_id(e);
-        const uint32_t a = edgeList[2u * row], b = edgeList[2u * row + 1u];
-        if (rawSharpEdges.count(rawEdgeKey(a, b))) (*edgePatch)(e) = gpu::kEdgeSharp;
-      }, nullptr, false);
-      edgePatch->move(rxmesh::HOST, rxmesh::DEVICE);
-    }
     auto boundary = rx.add_vertex_attribute<bool>("boundary", 1);
     auto valence = rx.add_vertex_attribute<uint8_t>("valence", 1);
     auto vDirty = rx.add_vertex_attribute<int>("v_dirty", 1);
@@ -467,10 +393,9 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       markStatusFromDirty();
       rx.reset_scheduler();
       int launches = 0;
-      const int launchBudget = rawUnknownSinglePatch ? 64 : 2048;
+      const int launchBudget = 2048;
       while (!rx.is_queue_empty()) {
         if (++launches > launchBudget) {
-          if (rawUnknownSinglePatch) break; // continue refinement in the next macro iteration
           throw std::runtime_error("RXMesh scheduler stalled");
         }
         rxmesh::LaunchBox<threads> lb;
@@ -500,10 +425,9 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       markStatusFromDirty();
       rx.reset_scheduler();
       int launches = 0;
-      const int launchBudget = rawUnknownSinglePatch ? 64 : 2048;
+      const int launchBudget = 2048;
       while (!rx.is_queue_empty()) {
         if (++launches > launchBudget) {
-          if (rawUnknownSinglePatch) break;
           throw std::runtime_error("RXMesh collapse scheduler stalled");
         }
         rxmesh::LaunchBox<threads> lb;
@@ -536,10 +460,9 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       markStatusFromDirty();
       rx.reset_scheduler();
       int launches = 0;
-      const int launchBudget = rawUnknownSinglePatch ? 64 : 2048;
+      const int launchBudget = 2048;
       while (!rx.is_queue_empty()) {
         if (++launches > launchBudget) {
-          if (rawUnknownSinglePatch) break;
           throw std::runtime_error("RXMesh flip scheduler stalled");
         }
         rxmesh::LaunchBox<threads> lb;
@@ -560,7 +483,9 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
 
     report.secondsSetup =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    for (int it = 0; it < config.maxIterations; ++it) {
+
+    const int optimizeCycles = config.maxIterations;
+    for (int it = 0; it < optimizeCycles; ++it) {
       auto mark = std::chrono::steady_clock::now();
       if (config.enableSplit) {
         report.splits += runSplit();
@@ -571,8 +496,10 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       report.secondsSplit +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
       mark = std::chrono::steady_clock::now();
+      int collapsed = 0;
       if (config.enableCollapse) {
-        report.collapses += runCollapse();
+        collapsed = runCollapse();
+        report.collapses += collapsed;
         rx.update_host();
         if (!rx.validate())
           throw std::runtime_error("RXMesh topology invalid immediately after collapse");
@@ -580,8 +507,10 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       report.secondsCollapse +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
       mark = std::chrono::steady_clock::now();
+      int flipped = 0;
       if (config.enableFlip) {
-        report.flips += runFlip();
+        flipped = runFlip();
+        report.flips += flipped;
         rx.update_host();
         if (!rx.validate())
           throw std::runtime_error("RXMesh topology invalid immediately after flip");

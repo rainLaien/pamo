@@ -94,8 +94,13 @@ void RemeshField::compute(SemanticMesh &mesh, const RemeshConfig &config,
     const float hCurv = curvatureLength(kmax, lim.epsilon, lim.hMax);
     const float hRegular = clampf(std::min(hPatch, hCurv), lim.hMin, lim.hMax);
     const float band = config.featureBand > 0 ? config.featureBand : 4.0f * hRegular;
+    // Geometry tolerance is not a mesh-size target. Using 2*epsilon here
+    // drove raw STL crease neighborhoods orders of magnitude below the global
+    // target (e.g. h=1.8 -> hFeature=0.02), causing split explosions and
+    // needle triangles. Unless explicitly overridden, keep the feature itself
+    // at the regular local size and let featureBand control only the transition.
     const float hFeatEdge =
-        config.featureEdgeLength > 0 ? config.featureEdgeLength : std::min(hRegular, 2.0f * lim.epsilon);
+        config.featureEdgeLength > 0 ? config.featureEdgeLength : hRegular;
     const float hFeat = featureLength(mesh.featureDistance[v], band, hFeatEdge, hRegular);
     mesh.targetLength[v] = combine(hCurv, hFeat, hPatch, lim.hMax, lim);
   }

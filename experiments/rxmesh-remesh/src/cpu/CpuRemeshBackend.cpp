@@ -4,15 +4,68 @@
 #include "cad_adaptive/RemeshMetrics.h"
 #include "cad_adaptive/RemeshField.h"
 #include "cad_adaptive/RemeshPolicy.h"
+#include "cad_adaptive/TriangleRefineBackend.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
 #include <unordered_set>
 #include <vector>
 
 namespace cad_adaptive {
 namespace {
+
+void cleanGenericInput(SemanticMesh &mesh) {
+  std::unordered_set<std::string> faces;
+  for (int f = 0; f < mesh.faceCount(); ++f) {
+    if (!mesh.faceAlive[f]) continue;
+    int v[3] = {int(mesh.i0[f]), int(mesh.i1[f]), int(mesh.i2[f])};
+    if (v[0] == v[1] || v[1] == v[2] || v[2] == v[0] ||
+        !(triangleQuality(mesh.position(v[0]), mesh.position(v[1]), mesh.position(v[2])) > 1e-12f)) {
+      mesh.killFace(f);
+      continue;
+    }
+    int s[3] = {v[0], v[1], v[2]};
+    std::sort(s, s + 3);
+    const std::string key = std::to_string(s[0]) + ":" + std::to_string(s[1]) + ":" +
+                            std::to_string(s[2]);
+    if (!faces.insert(key).second) mesh.killFace(f);
+  }
+  mesh.rebuildTopology();
+  mesh.compact();
+  mesh.rebuildTopology();
+}
+
+void classifyGenericCreases(SemanticMesh &mesh, float angleDegrees) {
+  if (!(angleDegrees > 0.0f && angleDegrees < 180.0f)) return;
+  mesh.rebuildTopology();
+  const float cosine = std::cos(angleDegrees * 3.14159265358979323846f / 180.0f);
+  std::vector<int> degree(mesh.vertexCount(), 0);
+  for (auto &e : mesh.edges) {
+    if (e.face0 < 0 || e.face1 < 0) continue;
+    const auto a = mesh.face(e.face0), b = mesh.face(e.face1);
+    const Vec3 n0 = triangleNormal(mesh.position(a[0]), mesh.position(a[1]), mesh.position(a[2]));
+    const Vec3 n1 = triangleNormal(mesh.position(b[0]), mesh.position(b[1]), mesh.position(b[2]));
+    if (dot(n0, n1) > cosine) continue;
+    e.flags = uint8_t(e.flags | EdgeSharp | EdgeProtected);
+    if (e.featureCurveId == 0)
+      e.featureCurveId = uint32_t((uint64_t(e.v0) * 73856093ull ^
+                                   uint64_t(e.v1) * 19349663ull) & 0x7fffffffu) + 1u;
+    const uint32_t lo = std::min(e.v0, e.v1), hi = std::max(e.v0, e.v1);
+    mesh.featureEdges[(uint64_t(lo) << 32) | uint64_t(hi)] = e.featureCurveId;
+    ++degree[e.v0];
+    ++degree[e.v1];
+  }
+  for (int v = 0; v < mesh.vertexCount(); ++v) {
+    if (degree[v] == 0) continue;
+    mesh.vertexConstraint[v] = uint8_t(
+        degree[v] == 2 ? VertexConstraint::FeatureEdge : VertexConstraint::Corner);
+  }
+  // Rebuild converts the persistent vertex constraints back into protected
+  // sharp edges, so later topology refreshes preserve the crease contract.
+  mesh.rebuildTopology();
+}
 
 int oppositeVertex(const SemanticMesh &m, int f, int a, int b) {
   const int v[3] = {int(m.i0[f]), int(m.i1[f]), int(m.i2[f])};
@@ -113,12 +166,16 @@ void splitEdge(SemanticMesh &mesh, const EdgeRec &e, int mid) {
 bool CpuRemeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, RemeshReport &report) {
   report = {};
   const auto started = std::chrono::steady_clock::now();
+
+  // VCGLib-style generic baseline: sanitize first, then freeze an immutable
+  // reference surface and classify geometric creases by dihedral angle.
+  cleanGenericInput(mesh);
+  classifyGenericCreases(mesh, config.featureAngleDegrees);
   std::string err;
   if (!mesh.validate(&err)) {
     report.topologyValid = false;
     return false;
   }
-  mesh.rebuildTopology();
   const SemanticMesh referenceMesh = mesh;
   int boundIn = 0;
   for (const auto &e : mesh.edges)
@@ -165,69 +222,25 @@ bool CpuRemeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Re
     std::vector<uint8_t> used(nv, 0);
 
     if (config.enableSplit) {
-      struct Cand {
-        int e;
-        float score;
-      };
-      std::vector<Cand> cands;
-      for (int ei = 0; ei < int(mesh.edges.size()); ++ei) {
-        const auto &e = mesh.edges[ei];
-        if (!edgeDirty(e)) continue;
-        if (!RemeshPolicy::canSplit(e.flags)) continue;
-        const float h0 = mesh.targetLength[e.v0], h1 = mesh.targetLength[e.v1];
-        const float len = distance(mesh.position(int(e.v0)), mesh.position(int(e.v1)));
-        if (!RemeshPolicy::lengthSplitCandidate(len, h0, h1, config.splitRatio)) continue;
-        ++report.splitCandidates;
-        cands.push_back({ei, len / std::max(RemeshPolicy::edgeTarget(h0, h1), 1e-12f)});
+      SemanticMesh refined;
+      TriangleRefineStats stats;
+      std::string refineError;
+      if (!refineMidpointConforming(mesh, config, projector, refined, stats, &refineError)) {
+        ++report.rejectTopology;
+      } else if (stats.SplitEdges > 0) {
+        report.splitCandidates += stats.SplitEdges;
+        report.splits += stats.SplitEdges;
+        std::cout << "cpu_split_masks it=" << it
+                  << " m0=" << stats.MaskCounts[0] << " m1=" << stats.MaskCounts[1]
+                  << " m2=" << stats.MaskCounts[2] << " m3=" << stats.MaskCounts[3]
+                  << " m4=" << stats.MaskCounts[4] << " m5=" << stats.MaskCounts[5]
+                  << " m6=" << stats.MaskCounts[6] << " m7=" << stats.MaskCounts[7]
+                  << " split_edges=" << stats.SplitEdges << '\n';
+        mesh = std::move(refined);
+        refresh();
+        dirty.assign(mesh.vertexCount(), 1);
+        used.assign(mesh.vertexCount(), 0);
       }
-      std::sort(cands.begin(), cands.end(),
-                [](const Cand &a, const Cand &b) { return a.score > b.score; });
-      for (const auto &c : cands) {
-        const auto e = mesh.edges[c.e];
-        if (e.v0 >= uint32_t(used.size()) || e.v1 >= uint32_t(used.size())) continue;
-        if (used[e.v0] || used[e.v1]) continue;
-        if (e.face0 < 0) continue;
-        Vec3 mid = (mesh.position(int(e.v0)) + mesh.position(int(e.v1))) * 0.5f;
-        const auto constraint = RemeshPolicy::inheritSplitConstraint(
-            e.flags, VertexConstraint(mesh.vertexConstraint[e.v0]),
-            VertexConstraint(mesh.vertexConstraint[e.v1]));
-        const uint32_t patch = RemeshPolicy::inheritSplitPatch(e.patchLeft, e.patchRight);
-        ProjectionResult hit;
-        if (isBoundaryConstraint(constraint) || (e.flags & (EdgePatchBoundary | EdgeMeshBoundary)))
-          hit = projector.projectFeature(e.featureCurveId, mid);
-        else
-          hit = projector.projectSurface(patch, mid);
-        if (!hit.ok) {
-          ++report.rejectError;
-          continue;
-        }
-        mid = hit.position;
-        const Vec3 oldN = triangleNormal(mesh.facePoint(e.face0, 0), mesh.facePoint(e.face0, 1),
-                                         mesh.facePoint(e.face0, 2));
-        const int opp = oppositeVertex(mesh, e.face0, int(e.v0), int(e.v1));
-        if (opp < 0) {
-          ++report.rejectTopology;
-          continue;
-        }
-        const Reject chk =
-            checkTriangle(mesh, mesh.position(int(e.v0)), mid, mesh.position(opp),
-                          mesh.facePatchId[e.face0], oldN, config, projector);
-        if (chk != Reject::None) {
-          countReject(report, chk);
-          continue;
-        }
-        used[e.v0] = used[e.v1] = 1;
-        const int m = mesh.addVertex(mid, patch, constraint);
-        mesh.targetLength[m] =
-            RemeshPolicy::edgeTarget(mesh.targetLength[e.v0], mesh.targetLength[e.v1]);
-        if (int(used.size()) <= m) used.resize(m + 1, 0);
-        used[m] = 1;
-        splitEdge(mesh, e, m);
-        ++report.splits;
-      }
-      refresh();
-      stampDirty(used);
-      used.assign(mesh.vertexCount(), 0);
     }
 
     if (config.enableCollapse) {
@@ -320,6 +333,26 @@ bool CpuRemeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Re
           Vec3 pa = mesh.position(t[0] == remove ? keep : t[0]);
           Vec3 pb = mesh.position(t[1] == remove ? keep : t[1]);
           Vec3 pc = mesh.position(t[2] == remove ? keep : t[2]);
+          // VCGLib checkFacesAfterCollapse contract:
+          // 1) do not let a collapse halve local triangle quality;
+          // 2) do not create edges longer than maxLength;
+          // 3) keep the existing normal/geometry checks.
+          const float oldQ = triangleQuality(mesh.position(t[0]), mesh.position(t[1]),
+                                             mesh.position(t[2]));
+          const float newQ = triangleQuality(pa, pb, pc);
+          if (newQ <= 0.5f * oldQ) {
+            why = Reject::Quality;
+            ok = false;
+            break;
+          }
+          const float maxLen = config.splitRatio * RemeshPolicy::edgeTarget(
+              mesh.targetLength[keep], mesh.targetLength[remove]);
+          if (distance(pa, pb) > maxLen || distance(pb, pc) > maxLen ||
+              distance(pc, pa) > maxLen) {
+            why = Reject::Quality;
+            ok = false;
+            break;
+          }
           why = checkTriangle(mesh, pa, pb, pc, mesh.facePatchId[f], oldN, config, projector);
           if (why != Reject::None) {
             ok = false;
@@ -446,6 +479,23 @@ bool CpuRemeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Re
         }
         const Vec3 dest = hit.position;
         if (dest.x == p.x && dest.y == p.y && dest.z == p.z) continue;
+        // Permit smoothing while the mesh is still far from the target band,
+        // but require monotonic improvement of the local sizing objective.
+        float sizingBefore = 0.0f, sizingAfter = 0.0f;
+        float maxRatioBefore = 0.0f, maxRatioAfter = 0.0f;
+        for (int n : neighbors(mesh, v)) {
+          const float h = RemeshPolicy::edgeTarget(mesh.targetLength[v], mesh.targetLength[n]);
+          if (!(h > 0.0f)) continue;
+          const float rb = distance(p, mesh.position(n)) / h;
+          const float ra = distance(dest, mesh.position(n)) / h;
+          sizingBefore += std::fabs(rb - 1.0f);
+          sizingAfter += std::fabs(ra - 1.0f);
+          maxRatioBefore = std::max(maxRatioBefore, rb);
+          maxRatioAfter = std::max(maxRatioAfter, ra);
+        }
+        if (sizingAfter > sizingBefore + 1e-6f ||
+            maxRatioAfter > std::max(maxRatioBefore, config.splitRatio) + 1e-6f)
+          continue;
         bool ok = true;
         const Vec3 old = p;
         mesh.setPosition(v, dest);
@@ -484,6 +534,13 @@ bool CpuRemeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Re
 
   mesh.compact();
   mesh.rebuildTopology();
+
+  // Final VCGLib-style cleanup: topology operations can leave duplicate or
+  // numerically collapsed faces even when each local transaction was legal.
+  // Remove them before final validation/metrics rather than exporting poison.
+  cleanGenericInput(mesh);
+  mesh.computeVertexNormals();
+
   int boundOut = 0;
   for (const auto &e : mesh.edges)
     if (e.flags & EdgeMeshBoundary) ++boundOut;

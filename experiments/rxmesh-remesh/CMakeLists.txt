@@ -13,13 +13,25 @@ add_library(cad_adaptive
     src/RemeshPolicy.cpp
     src/AnalyticProjector.cpp
     src/RemeshMetrics.cpp
+    src/RelaxProject.cpp
+    src/MultiSegmentRefineBackend.cpp
+    src/TriangleRefineBackend.cpp
     src/cpu/CpuRemeshBackend.cpp)
 target_include_directories(cad_adaptive PUBLIC include)
 
 add_executable(cad_adaptive_cli tools/remesh_cli.cpp)
 target_link_libraries(cad_adaptive_cli PRIVATE cad_adaptive)
 
+option(CAD_ADAPTIVE_VCGLIB_REFERENCE "Build a native VCGLib raw-mesh comparison executable" OFF)
+set(VCGLIB_ROOT "D:/openSourceInstall/vcglib" CACHE PATH "VCGLib headers for the optional reference")
+if(CAD_ADAPTIVE_VCGLIB_REFERENCE)
+    add_executable(vcglib_reference tools/vcglib_reference.cpp)
+    target_include_directories(vcglib_reference PRIVATE "${VCGLIB_ROOT}" "${VCGLIB_ROOT}/eigenlib")
+    target_link_libraries(vcglib_reference PRIVATE cad_adaptive)
+endif()
+
 option(CAD_ADAPTIVE_RXMESH "Build the isolated RXMesh GPU backend" OFF)
+include(CTest)
 set(CAD_ADAPTIVE_RXMESH_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../RXMesh"
     CACHE PATH "Pinned RXMesh source (e468c34)")
 
@@ -51,7 +63,10 @@ if(CAD_ADAPTIVE_RXMESH)
     # device code. The wrapper therefore still requires one final CUDA device
     # link; disabling it produces __cudaRegisterLinkedBinary_* unresolved symbols.
     add_library(cad_adaptive_rx STATIC src/rxmesh/RxMeshBackend.cu)
-    target_link_libraries(cad_adaptive_rx PUBLIC cad_adaptive RXMesh)
+    add_library(cad_adaptive_raw_cuda STATIC src/rxmesh/RawCudaRemesher.cu)
+    target_link_libraries(cad_adaptive_raw_cuda PUBLIC cad_adaptive)
+    target_compile_features(cad_adaptive_raw_cuda PUBLIC cxx_std_17 cuda_std_17)
+    target_link_libraries(cad_adaptive_rx PUBLIC cad_adaptive RXMesh cad_adaptive_raw_cuda)
     target_compile_features(cad_adaptive_rx PUBLIC cxx_std_17 cuda_std_17)
     target_compile_definitions(cad_adaptive_rx PUBLIC CAD_ADAPTIVE_RXMESH=1)
     set_target_properties(cad_adaptive_rx PROPERTIES
@@ -65,6 +80,11 @@ if(CAD_ADAPTIVE_RXMESH)
     # link RXMesh: topology lives in global memory and split operators gather
     # only their local EVDiamond working set.
     add_library(cad_adaptive_global STATIC src/global/GlobalSplitBackend.cu)
+    if(MSVC AND CMAKE_CUDA_COMPILER)
+        get_filename_component(_cuda_bin_dir "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+        get_filename_component(_cuda_root "${_cuda_bin_dir}" DIRECTORY)
+        set_property(TARGET cad_adaptive_global PROPERTY VS_GLOBAL_CudaToolkitDir "${_cuda_root}/")
+    endif()
     target_link_libraries(cad_adaptive_global PUBLIC cad_adaptive)
     target_include_directories(cad_adaptive_global PUBLIC include)
     target_compile_features(cad_adaptive_global PUBLIC cxx_std_17 cuda_std_17)
@@ -104,6 +124,16 @@ if(CAD_ADAPTIVE_RXMESH)
     target_compile_definitions(cad_adaptive_cli PRIVATE
         CAD_ADAPTIVE_RXMESH=1
         CAD_ADAPTIVE_GLOBAL_TOPOLOGY=1)
+    if(BUILD_TESTING)
+        foreach(case raw_reference isotropic constraints project)
+            add_executable(test_rxmesh_${case} tests/test_rxmesh_${case}.cpp)
+            target_link_libraries(test_rxmesh_${case} PRIVATE cad_adaptive_rx)
+            add_test(NAME rxmesh_${case} COMMAND test_rxmesh_${case})
+            set_tests_properties(rxmesh_${case} PROPERTIES TIMEOUT 180)
+        endforeach()
+        target_compile_definitions(test_rxmesh_raw_reference PRIVATE
+            RAW_BODY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../examples/Unnamed-Body.stl")
+    endif()
 else()
     target_sources(cad_adaptive PRIVATE src/rxmesh/RxMeshStub.cpp)
 endif()

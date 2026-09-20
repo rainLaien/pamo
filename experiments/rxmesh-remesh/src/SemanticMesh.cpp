@@ -224,6 +224,11 @@ void SemanticMesh::rebuildTopology() {
     }
   }
   for (auto &e : edges) {
+    const auto fit = featureEdges.find(edgeKey(e.v0, e.v1));
+    if (fit != featureEdges.end()) {
+      e.flags = uint8_t(e.flags | EdgeSharp | EdgeProtected);
+      e.featureCurveId = fit->second;
+    }
     if (e.face1 < 0) {
       e.flags = uint8_t(e.flags | EdgeMeshBoundary | EdgeProtected);
       e.featureCurveId = kOpenBoundaryFeature;
@@ -233,13 +238,9 @@ void SemanticMesh::rebuildTopology() {
       e.flags = uint8_t(e.flags | EdgePatchBoundary | EdgeProtected);
       e.featureCurveId = featureForPatches(e.patchLeft, e.patchRight);
     }
-    const auto c0 = VertexConstraint(vertexConstraint[e.v0]);
-    const auto c1 = VertexConstraint(vertexConstraint[e.v1]);
-    if (isBoundaryConstraint(c0) && isBoundaryConstraint(c1) && e.featureCurveId == 0 &&
-        (c0 == VertexConstraint::FeatureEdge || c1 == VertexConstraint::FeatureEdge)) {
-      e.flags = uint8_t(e.flags | EdgeSharp | EdgeProtected);
-      e.featureCurveId = featureForPatches(e.patchLeft, e.patchRight);
-    }
+    // Do not infer sharp topology from endpoint constraints. A feature
+    // vertex can have ordinary interior spokes after refinement. Geometric
+    // sharp edges are represented explicitly and persistently by featureEdges.
   }
 }
 
@@ -325,6 +326,15 @@ void SemanticMesh::compact() {
     const int a = map[int(i0[f])], b = map[int(i1[f])], c = map[int(i2[f])];
     if (a < 0 || b < 0 || c < 0) continue;
     out.addFace(a, b, c, facePatchId[f], PatchType(facePatchType[f]));
+  }
+  for (const auto &kv : featureEdges) {
+    const uint32_t oldA = uint32_t(kv.first >> 32);
+    const uint32_t oldB = uint32_t(kv.first & 0xffffffffu);
+    if (oldA >= map.size() || oldB >= map.size()) continue;
+    const int a = map[oldA], b = map[oldB];
+    if (a < 0 || b < 0 || a == b) continue;
+    const uint32_t lo = uint32_t(std::min(a, b)), hi = uint32_t(std::max(a, b));
+    out.featureEdges[(uint64_t(lo) << 32) | uint64_t(hi)] = kv.second;
   }
   out.rebuildTopology();
   *this = std::move(out);

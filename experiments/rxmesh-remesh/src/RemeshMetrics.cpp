@@ -10,13 +10,17 @@
 namespace cad_adaptive {
 
 void fillMeshMetrics(SemanticMesh &mesh, const RemeshConfig &config, RemeshReport &report) {
+  fillMeshMetrics(mesh, config, report, false);
+}
+
+void fillMeshMetrics(SemanticMesh &mesh, const RemeshConfig &config, RemeshReport &report, bool preserveTargets) {
   mesh.rebuildTopology();
   GeometryProjector projector;
   projector.build(mesh);
-  RemeshField::compute(mesh, config, projector);
+  if (!preserveTargets) RemeshField::compute(mesh, config, projector);
 
   std::vector<float> qualities, sizing;
-  float qmin = 1, geom = 0;
+  float qmin = 1, geom = report.geometryErrorMax;
   for (int f = 0; f < mesh.faceCount(); ++f) {
     if (!mesh.faceAlive[f]) continue;
     const Vec3 a = mesh.position(int(mesh.i0[f]));
@@ -26,8 +30,13 @@ void fillMeshMetrics(SemanticMesh &mesh, const RemeshConfig &config, RemeshRepor
     qualities.push_back(q);
     qmin = std::min(qmin, q);
     const Vec3 mid = centroid3(a, b, c);
-    const auto hit = projector.projectSurface(mesh.facePatchId[f], mid);
-    if (hit.ok) geom = std::max(geom, distance(mid, hit.position));
+    const auto patch=projector.patch(mesh.facePatchId[f]);
+    // A raw output projected onto itself reports no source error and costs
+    // O(F^2). Its source-reference audit is performed by the caller instead.
+    if(patch && (patch->type==PatchType::Plane || patch->type==PatchType::Cylinder)) {
+      const auto hit = projector.projectSurface(mesh.facePatchId[f], mid);
+      if (hit.ok) geom = std::max(geom, distance(mid, hit.position));
+    }
   }
   for (const auto &e : mesh.edges) {
     const float h = RemeshPolicy::edgeTarget(mesh.targetLength[e.v0], mesh.targetLength[e.v1]);
