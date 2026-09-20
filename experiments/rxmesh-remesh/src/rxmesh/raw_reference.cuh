@@ -23,6 +23,10 @@ struct SizingSegmentGpu {
   float3 a, b;
   float target;
 };
+struct ReferenceBvhNode {
+  float3 lower,upper;
+  int first=-1,count=0,escape=0;
+};
 struct ReferenceSurfaceGpu {
   const ReferenceTriangleGpu *triangles = nullptr;
   int count = 0;
@@ -30,6 +34,12 @@ struct ReferenceSurfaceGpu {
   const SizingSegmentGpu *sizing = nullptr;
   int sizingCount = 0;
   float regularLength = 0, band = 0;
+  const ReferenceBvhNode *nodes=nullptr;
+  const int *triangleIds=nullptr;
+  int nodeCount=0;
+  const ReferenceBvhNode *sizingNodes=nullptr;
+  const int *sizingIds=nullptr;
+  int sizingNodeCount=0;
 };
 __device__ inline float3 add3(float3 a, float3 b) {
   return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
@@ -37,11 +47,28 @@ __device__ inline float3 add3(float3 a, float3 b) {
 __device__ inline float3 mul3(float3 a, float s) {
   return make_float3(a.x * s, a.y * s, a.z * s);
 }
+__device__ inline float boxDistance2(float3 p,const ReferenceBvhNode &t) {
+  float x=fmaxf(0.f,fmaxf(t.lower.x-p.x,p.x-t.upper.x));
+  float y=fmaxf(0.f,fmaxf(t.lower.y-p.y,p.y-t.upper.y));
+  float z=fmaxf(0.f,fmaxf(t.lower.z-p.z,p.z-t.upper.z));
+  return x*x+y*y+z*z;
+}
 // Immutable source features define a continuous spatial field. Re-evaluating it
 // after every edit prevents collapse/smoothing from erasing the refinement.
 __device__ inline float sizingAt(ReferenceSurfaceGpu ref, float3 p) {
   float h = ref.regularLength;
-  for (int i = 0; i < ref.sizingCount; ++i) {
+  int node=0;
+  while(node<(ref.sizingNodeCount ? ref.sizingNodeCount : 1)) {
+    int first=0,count=ref.sizingCount;
+    if(ref.sizingNodeCount) {
+      const auto n=ref.sizingNodes[node];
+      // Beyond the transition band every descendant contributes >= regularLength.
+      if(boxDistance2(p,n)>ref.band*ref.band*1.00001f) {node=n.escape;continue;}
+      if(n.first<0){++node;continue;}
+      first=n.first;count=n.count;
+    }
+    for(int k=0;k<count;++k) {
+      const int i=ref.sizingNodeCount ? ref.sizingIds[first+k] : k;
     const auto s = ref.sizing[i];
     const auto ab = sub3(s.b, s.a);
     float t = fminf(
@@ -49,6 +76,8 @@ __device__ inline float sizingAt(ReferenceSurfaceGpu ref, float3 p) {
     const auto d = sub3(p, add3(s.a, mul3(ab, t)));
     h = fminf(h, s.target + (ref.regularLength - s.target) * sqrtf(dot3(d, d)) /
                                 ref.band);
+    }
+    ++node;
   }
   return h;
 }
@@ -90,23 +119,28 @@ __device__ inline float3 closestTriangle(float3 p,
     return t.a;
   return add3(t.a, add3(mul3(ab, vb / denom), mul3(ac, vc / denom)));
 }
-// Immutable source triangles. Exhaustive search is intentional for the small
-// raw-STL reference; it is exact nearest-triangle search, not a moving target.
+// Stackless immutable BVH. Equal-distance ties retain original source order.
 __device__ __noinline__ bool projectReference(ReferenceSurfaceGpu ref,
-                                              int patch, float3 p, float3 &q) {
-  float best = FLT_MAX;
-  bool found = false;
-  for (int i = 0; i < ref.count; ++i) {
-    const auto t = ref.triangles[i];
-    if (t.patch != patch)
-      continue;
-    const auto hit = closestTriangle(p, t), d = sub3(hit, p);
-    const float d2 = dot3(d, d);
-    if (d2 < best) {
-      best = d2;
-      q = hit;
-      found = true;
+                                              int patch,float3 p,float3 &q) {
+  float best=FLT_MAX; int bestId=2147483647; bool found=false;
+  int node=0;
+  while(node<(ref.nodeCount ? ref.nodeCount : 1)) {
+    int first=0,count=ref.count;
+    if(ref.nodeCount) {
+      const auto n=ref.nodes[node];
+      if(best<FLT_MAX && boxDistance2(p,n)>best+fmaxf(1.e-10f,best*1.e-5f)) {node=n.escape;continue;}
+      if(n.first<0) {++node;continue;}
+      first=n.first;count=n.count;
     }
+    for(int k=0;k<count;++k) {
+      const int id=ref.nodeCount ? ref.triangleIds[first+k] : k;
+      const auto t=ref.triangles[id];
+      if(t.patch!=patch)continue;
+      const auto hit=closestTriangle(p,t),d=sub3(hit,p);
+      const float d2=dot3(d,d);
+      if(d2<best || (d2==best && id<bestId)) {best=d2;bestId=id;q=hit;found=true;}
+    }
+    ++node;
   }
   return found;
 }

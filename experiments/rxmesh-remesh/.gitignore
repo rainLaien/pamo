@@ -9,6 +9,7 @@ tests/*
 !tests/test_rxmesh_isotropic.cpp
 !tests/test_rxmesh_constraints.cpp
 !tests/test_rxmesh_project.cpp
+!tests/test_raw_projection.cu
 
 # One-off development patch scripts and scratch files
 patch_*.py

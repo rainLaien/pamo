@@ -192,10 +192,13 @@ AnalyticGeometryAudit SemanticMesh::analyticGeometryAudit() const {
 }
 
 void SemanticMesh::rebuildTopology() {
-  incidentFaces.assign(vertexCount(), {});
+  incidentFaces.resize(vertexCount());
+  for(auto &faces:incidentFaces)faces.clear();
   edges.clear();
-  std::unordered_map<uint64_t, int> index;
-  index.reserve(size_t(faceCount()) * 2);
+  // Preserve first-seen edge IDs without one heap allocation per hash entry.
+  size_t capacity=8;while(capacity<size_t(faceCount())*6)capacity*=2;
+  std::vector<int> index(capacity,-1);
+  const auto slotHash=[&](uint64_t x) {x^=x>>33;x*=0xff51afd7ed558ccdULL;x^=x>>33;return size_t(x)&(capacity-1);};
   for (int f = 0; f < faceCount(); ++f) {
     if (!faceAlive[f]) continue;
     const int v[3] = {int(i0[f]), int(i1[f]), int(i2[f])};
@@ -203,17 +206,19 @@ void SemanticMesh::rebuildTopology() {
       if (v[k] >= 0 && v[k] < vertexCount()) incidentFaces[v[k]].push_back(f);
       const uint32_t a = uint32_t(v[k]), b = uint32_t(v[(k + 1) % 3]);
       const uint64_t key = edgeKey(a, b);
-      auto it = index.find(key);
-      if (it == index.end()) {
+      size_t slot=slotHash(key);
+      while(index[slot]>=0 && edgeKey(edges[index[slot]].v0,edges[index[slot]].v1)!=key)
+        slot=(slot+1)&(capacity-1);
+      if (index[slot]<0) {
         EdgeRec e;
         e.v0 = std::min(a, b);
         e.v1 = std::max(a, b);
         e.face0 = f;
         e.patchLeft = facePatchId[f];
         edges.push_back(e);
-        index[key] = int(edges.size()) - 1;
+        index[slot] = int(edges.size()) - 1;
       } else {
-        EdgeRec &e = edges[it->second];
+        EdgeRec &e = edges[index[slot]];
         if (e.face1 < 0) {
           e.face1 = f;
           e.patchRight = facePatchId[f];

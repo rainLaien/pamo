@@ -44,9 +44,9 @@ are classified once and propagated. Qualifying crease segments can coarsen;
 this phase does not promise preservation of every original feature vertex.
 
 CPU code constructs adjacency and compacts GPU output between topology passes.
-Reference queries currently scan the source triangles. Uniform and optional
-feature/curvature sizing support small reference meshes; this is not a
-demonstrated large-mesh GPU speedup. It does not exactly reproduce VCGLib's sequential scheduling, smoothing
+Reference queries use an immutable stackless triangle BVH. Uniform and optional
+feature/curvature sizing support the tested small reference meshes; large-mesh
+scaling is not yet established. It does not exactly reproduce VCGLib's sequential scheduling, smoothing
 step count or dedicated fold-relaxation pass. `--cpu` remains the separate
 experimental CPU implementation.
 
@@ -100,6 +100,58 @@ changes from 0.87 to 0.59 on the round and from 0.46 to 1.82 on distant plane/pl
 intersections (regular target 1.80). Mean triangle quality is 0.97358; independently
 sampled bidirectional error is 0.02839. Regression tests cover a square prism,
 a shallow two-plane junction, a smooth cylinder and the user's STL.
+
+## Raw GPU performance
+
+The raw CUDA implementation now reuses per-call device scratch storage, downloads
+candidate counts instead of complete candidate records, and updates flip faces
+without vertex compaction. Adjacency uses contiguous open-addressed lookup arrays
+while preserving first-seen edge IDs. Vertex-star safety checks visit each face
+once, and smoothing reuses its trial projection. Source projection uses a
+stackless BVH with original-triangle tie ordering. The CLI reuses the backend's
+final immutable-source GPU audit and metrics rather than repeating them on CPU;
+independent export auditing remains available in `compare_raw_meshes.py`.
+
+On RTX 3060 / `Unnamed-Body.stl`, `--gpu --feature-refine`, 20 iterations, medians
+of three fresh CLI processes before/after optimization were:
+
+| Timing | Before | After | Speedup |
+|---|---:|---:|---:|
+| Whole command, including startup and export | 8.965 s | 6.078 s | 1.47x |
+| Remesh backend | 7.758 s | 4.639 s | 1.67x |
+| Flip stage | 1.711 s | 0.568 s | 3.01x |
+
+All six exported OBJ SHA256 values match. Iteration count, sizing and quality
+thresholds are unchanged. These numbers describe one model on one machine, not a
+general speedup guarantee. CPU adjacency reconstruction and per-pass topology
+transfers remain; moving those operations and compaction onto persistent GPU
+storage is the next larger architectural opportunity.
+
+## Raw CUDA operation safety
+
+Raw single-patch reprojection is staged: proposed positions are checked together
+on every incident triangle before they are committed. Degenerate faces, normal
+reversals, excessive quality loss and sampled source-distance violations cancel
+the affected vertex moves. Partial rollbacks are rechecked because they can
+affect neighboring triangles; failure to stabilize within 16 passes rolls back
+the entire projection. This also applies with `--no-smooth`.
+
+Split templates undergo the same source-distance check on their new triangles.
+Rejected templates cancel shared edge splits consistently, then regenerate and
+recheck their neighbors before committing. Neither operation deletes bad faces
+or relaxes the final error budget. Topology is checked after each stage,
+including smoothing/projection, and failures identify the cycle and stage.
+Geometry checks sample triangle vertices, edge midpoints and centroids; they
+are not continuous Hausdorff guarantees or a general self-intersection test.
+
+Curvature sizing seeds now use an immutable spatial BVH with the same distance
+and target-length formula as the linear search. `raw_projection_safety` covers
+projection-induced degeneracy, projection-induced interior distance violations,
+accepted safe projection, and indexed-versus-linear sizing equality.
+
+These safeguards do not require a correct CAD partition. They cover the raw
+single-patch backend; the separate analytic CAD backend has its own checks.
+Invalid input or an unmet final constraint still fails explicitly.
 
 ## CAD partition handoff
 

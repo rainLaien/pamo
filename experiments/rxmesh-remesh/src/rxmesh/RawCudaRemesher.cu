@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <numeric>
+#include <functional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,20 +26,48 @@ void sync() {
   checked(cudaGetLastError());
   checked(cudaDeviceSynchronize());
 }
+// Per-call, per-thread scratch cache. CUDA allocation/free synchronization is
+// paid once per capacity class rather than once per topology pass.
+struct DeviceArena {
+  struct Block {void *p; size_t bytes;};
+  std::vector<Block> available;
+  static size_t capacity(size_t bytes) {size_t n=256;while(n<bytes)n*=2;return n;}
+  void *acquire(size_t bytes) {
+    for(size_t i=0;i<available.size();++i) if(available[i].bytes==bytes) {
+      void *p=available[i].p;available[i]=available.back();available.pop_back();return p;
+    }
+    void *p=nullptr;checked(cudaMalloc(&p,bytes));return p;
+  }
+  void release(void *p,size_t bytes) {available.push_back({p,bytes});}
+  ~DeviceArena() {for(auto b:available)cudaFree(b.p);}
+};
+thread_local DeviceArena *activeArena=nullptr;
+struct ArenaScope {
+  DeviceArena *previous;
+  explicit ArenaScope(DeviceArena &a):previous(activeArena){activeArena=&a;}
+  ~ArenaScope(){activeArena=previous;}
+};
 template <class T> struct Buffer {
   T *p = nullptr;
   size_t n = 0;
+  size_t bytes = 0;
+  DeviceArena *arena=activeArena;
   explicit Buffer(size_t size = 0) : n(size) {
-    if (n)
-      checked(cudaMalloc(&p, n * sizeof(T)));
+    if (n) {
+      bytes=DeviceArena::capacity(n*sizeof(T));
+      if(arena)p=static_cast<T*>(arena->acquire(bytes));
+      else checked(cudaMalloc(&p,bytes));
+    }
   }
   explicit Buffer(const std::vector<T> &v) : Buffer(v.size()) {
     if (n)
       checked(cudaMemcpy(p, v.data(), n * sizeof(T), cudaMemcpyHostToDevice));
   }
   ~Buffer() {
-    if (p)
-      cudaFree(p);
+    if (p) {
+      if(arena)arena->release(p,bytes);
+      else cudaFree(p);
+    }
   }
   Buffer(const Buffer &) = delete;
   Buffer &operator=(const Buffer &) = delete;
@@ -89,20 +119,20 @@ struct DeviceMesh {
   Buffer<Edge> edges;
   Buffer<int> offsets, ids, faceEdges;
   static std::vector<Vertex> verts(const SemanticMesh &m) {
-    std::vector<Vertex> out;
+    std::vector<Vertex> out;out.reserve(m.vertexCount());
     for (int i = 0; i < m.vertexCount(); ++i)
       out.push_back(
           {point(m.position(i)), m.vertexConstraint[i], m.targetLength[i]});
     return out;
   }
   static std::vector<Triangle> tris(const SemanticMesh &m) {
-    std::vector<Triangle> out;
+    std::vector<Triangle> out;out.reserve(m.faceCount());
     for (int f = 0; f < m.faceCount(); ++f)
       out.push_back({{int(m.i0[f]), int(m.i1[f]), int(m.i2[f])}});
     return out;
   }
   static std::vector<Edge> eds(const SemanticMesh &m) {
-    std::vector<Edge> out;
+    std::vector<Edge> out;out.reserve(m.edges.size());
     for (auto e : m.edges)
       out.push_back({int(e.v0), int(e.v1), e.face0, e.face1,
                      bool(e.flags & (EdgeSharp | EdgeMeshBoundary))});
@@ -128,21 +158,31 @@ struct DeviceMesh {
     return a;
   }
   static std::vector<int> fe(const SemanticMesh &m) {
-    std::unordered_map<uint64_t, int> lookup;
-    for (int i = 0; i < int(m.edges.size()); ++i)
-      lookup[key(m.edges[i].v0, m.edges[i].v1)] = i;
-    std::vector<int> out;
-    for (int f = 0; f < m.faceCount(); ++f) {
-      auto t = m.face(f);
-      for (int k = 0; k < 3; ++k)
-        out.push_back(lookup.at(key(t[k], t[(k + 1) % 3])));
+    size_t capacity=8;while(capacity<2*m.edges.size())capacity*=2;
+    std::vector<int> slots(capacity,-1);
+    auto hash=[&](uint64_t x){x^=x>>33;x*=0xff51afd7ed558ccdULL;x^=x>>33;return size_t(x)&(capacity-1);};
+    for(int i=0;i<int(m.edges.size());++i) {
+      auto slot=hash(key(m.edges[i].v0,m.edges[i].v1));
+      while(slots[slot]>=0)slot=(slot+1)&(capacity-1);
+      slots[slot]=i;
+    }
+    std::vector<int> out;out.reserve(3*m.faceCount());
+    for(int f=0;f<m.faceCount();++f) {
+      auto t=m.face(f);
+      for(int k=0;k<3;++k) {
+        const auto edgeKey=key(t[k],t[(k+1)%3]);auto slot=hash(edgeKey);
+        while(slots[slot]>=0 && key(m.edges[slots[slot]].v0,m.edges[slots[slot]].v1)!=edgeKey)
+          slot=(slot+1)&(capacity-1);
+        if(slots[slot]<0)throw std::runtime_error("missing face edge");
+        out.push_back(slots[slot]);
+      }
     }
     return out;
   }
   explicit DeviceMesh(const SemanticMesh &m, ReferenceSurfaceGpu ref)
       : vertices(verts(m)), faces(tris(m)), edges(eds(m)), offsets(offs(m)),
         ids(adjacency(m)), faceEdges(fe(m)) {
-    updateTargets<<<(m.vertexCount() + 255) / 256, 256>>>(vertices.p,
+    updateTargets<<<(m.vertexCount() + 127) / 128, 128>>>(vertices.p,
                                                           m.vertexCount(), ref);
   }
   MeshView view() {
@@ -187,6 +227,13 @@ __device__ bool movable(MeshView m, int v, int edge) {
   return dot3(directions[0], directions[1]) <=
          -.9f * sqrtf(dot3(directions[0], directions[0]) *
                       dot3(directions[1], directions[1]));
+}
+// An incident triangle is reached through two edges of a vertex star.
+// Assign it to exactly one, retaining the complete safety test once.
+__device__ bool ownsFace(Triangle t,Edge e,int v) {
+  int smallest=2147483647;
+  for(int k=0;k<3;++k)if(t.v[k]!=v)smallest=min(smallest,t.v[k]);
+  return other(e,v)==smallest;
 }
 __device__ bool changedFaceSafe(MeshView m, Triangle t, int a, int b,
                                 float3 dest, float high,
@@ -332,10 +379,10 @@ __global__ void collapseCandidates(MeshView m, Candidate *out, float low,
     int v = side ? a : b;
     for (int i = m.offsets[v]; i < m.offsets[v + 1]; ++i) {
       auto x = m.e[m.ids[i]];
-      if (x.f0 >= 0 &&
+      if (x.f0 >= 0 && ownsFace(m.f[x.f0],x,v) &&
           !changedFaceSafe(m, m.f[x.f0], a, b, dest, high, ref, relaxed))
         return;
-      if (x.f1 >= 0 &&
+      if (x.f1 >= 0 && ownsFace(m.f[x.f1],x,v) &&
           !changedFaceSafe(m, m.f[x.f1], a, b, dest, high, ref, relaxed))
         return;
     }
@@ -506,13 +553,14 @@ __global__ void smoothVertices(MeshView m, Vertex *next,
   for (int attempt = 0; attempt < 8; ++attempt) {
     auto trial = add3(p, mul3(sub3(avg, p), step));
     float3 dest;
-    bool ok =
-        referenceNear(ref, 0, trial) && projectReference(ref, 0, trial, dest);
+    bool ok=projectReference(ref,0,trial,dest);
+    const float tolerance=toleranceAt(ref,trial);
+    ok=ok && dist2(dest,trial)<=tolerance*tolerance;
     for (int i = m.offsets[v]; i < m.offsets[v + 1] && ok; ++i) {
       auto e = m.e[m.ids[i]];
-      if (e.f0 >= 0)
+      if (e.f0 >= 0 && ownsFace(m.f[e.f0],e,v))
         ok = changedFaceSafe(m, m.f[e.f0], v, v, dest, 0, ref, true);
-      if (ok && e.f1 >= 0)
+      if (ok && e.f1 >= 0 && ownsFace(m.f[e.f1],e,v))
         ok = changedFaceSafe(m, m.f[e.f1], v, v, dest, 0, ref, true);
     }
     if (ok) {
@@ -525,13 +573,63 @@ __global__ void smoothVertices(MeshView m, Vertex *next,
     step *= .5f;
   }
 }
-__global__ void projectVertices(MeshView m, ReferenceSurfaceGpu ref) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= m.nv || m.v[v].constraint >= 4)
-    return;
+__global__ void proposeProjection(MeshView m,Vertex *proposal,ReferenceSurfaceGpu ref) {
+  int v=blockIdx.x*blockDim.x+threadIdx.x;
+  if(v>=m.nv)return;
+  proposal[v]=m.v[v];
+  if(m.v[v].constraint>=4)return;
   float3 q;
-  if (projectReference(ref, 0, m.v[v].p, q))
-    m.v[v].p = q;
+  if(projectReference(ref,0,m.v[v].p,q))proposal[v].p=q;
+}
+__global__ void checkProjectionFaces(MeshView m,const Vertex *proposal,ReferenceSurfaceGpu ref,int *reject,int *badFaces) {
+  int f=blockIdx.x*blockDim.x+threadIdx.x;
+  if(f>=m.nf)return;
+  auto t=m.f[f];
+  const auto a=m.v[t.v[0]].p,b=m.v[t.v[1]].p,c=m.v[t.v[2]].p;
+  const auto x=proposal[t.v[0]].p,y=proposal[t.v[1]].p,z=proposal[t.v[2]].p;
+  const auto oldN=normal3(a,b,c),newN=normal3(x,y,z);
+  const float area2=dot3(newN,newN),oldArea2=dot3(oldN,oldN);
+  const float q=qualityVcg(x,y,z);
+  const bool qualityBad=!(area2>0) || !isfinite(area2) || !(q>0) || !isfinite(q) ||
+      q<.5f*qualityVcg(a,b,c) || dot3(oldN,newN)<.7f*sqrtf(oldArea2*area2);
+  const bool moved=dist2(a,x)>0 || dist2(b,y)>0 || dist2(c,z)>0;
+  const bool errorBad=!qualityBad && moved && !referenceFaceSafe(ref,0,x,y,z);
+  if(qualityBad || errorBad) {
+    atomicAdd(badFaces,1);
+    if(errorBad)atomicAdd(badFaces+1,1);
+    for(int k=0;k<3;++k)atomicExch(reject+t.v[k],1);
+  }
+}
+__global__ void revertProjection(MeshView m,Vertex *proposal,const int *reject,int *rejected) {
+  int v=blockIdx.x*blockDim.x+threadIdx.x;
+  if(v>=m.nv || !reject[v])return;
+  if(dist2(proposal[v].p,m.v[v].p)>0)atomicAdd(rejected,1);
+  proposal[v]=m.v[v];
+}
+// Validate the complete proposed face, not each vertex in isolation. Partial
+// rollback can invalidate a neighboring face, so recheck until stable. A bounded
+// failure rolls back the entire projection; topology checks are never bypassed.
+int safeProject(MeshView m,ReferenceSurfaceGpu ref,int *errorRejects=nullptr) {
+  Buffer<Vertex> proposal(m.nv);
+  Buffer<int> reject(m.nv),bad(2),rejected(1);
+  checked(cudaMemset(rejected.p,0,sizeof(int)));
+  proposeProjection<<<(m.nv+127)/128,128>>>(m,proposal.p,ref);
+  for(int pass=0;pass<16;++pass) {
+    checked(cudaMemset(reject.p,0,m.nv*sizeof(int)));
+    checked(cudaMemset(bad.p,0,2*sizeof(int)));
+    checkProjectionFaces<<<(m.nf+127)/128,128>>>(m,proposal.p,ref,reject.p,bad.p);
+    sync();
+    const auto counts=bad.read();
+    if(errorRejects)*errorRejects+=counts[1];
+    if(counts[0]==0) {
+      checked(cudaMemcpy(m.v,proposal.p,m.nv*sizeof(Vertex),cudaMemcpyDeviceToDevice));
+      return rejected.read()[0];
+    }
+    revertProjection<<<(m.nv+127)/128,128>>>(m,proposal.p,reject.p,rejected.p);
+  }
+  sync();
+  // No proposal is committed. The original positions remain valid.
+  return m.nv;
 }
 
 __global__ void auditGeometry(MeshView m, ReferenceSurfaceGpu ref,
@@ -586,16 +684,43 @@ void rebuild(SemanticMesh &mesh, const std::vector<Vertex> &vertices,
   out.rebuildTopology();
   mesh = std::move(out);
 }
-int split(SemanticMesh &mesh, float h, float high, ReferenceSurfaceGpu ref) {
+__global__ void rejectSplitFaces(MeshView m,const Vertex *v,const Triangle *faces,
+                                  int *marked,ReferenceSurfaceGpu ref,int *bad) {
+  int f=blockIdx.x*blockDim.x+threadIdx.x;if(f>=m.nf)return;
+  if(faces[4*f+1].v[0]<0)return;
+  for(int q=0;q<4;++q) {
+    auto t=faces[4*f+q];if(t.v[0]<0)continue;
+    auto a=v[t.v[0]].p,b=v[t.v[1]].p,c=v[t.v[2]].p;
+    if(!(qualityVcg(a,b,c)>0) || !referenceFaceSafe(ref,0,a,b,c)) {
+      atomicAdd(bad,1);
+      for(int k=0;k<3;++k)atomicExch(marked+m.faceEdges[3*f+k],0);
+      return;
+    }
+  }
+}
+int split(SemanticMesh &mesh, float h, float high, ReferenceSurfaceGpu ref,RemeshReport &report) {
   DeviceMesh d(mesh, ref);
   auto m = d.view();
   Buffer<Vertex> v(m.nv + m.ne);
   Buffer<Triangle> f(4 * m.nf);
   Buffer<int> marked(m.ne);
-  splitVertices<<<(std::max(m.nv, m.ne) + 255) / 256, 256>>>(m, v.p, marked.p,
+  splitVertices<<<(std::max(m.nv, m.ne) + 127) / 128, 128>>>(m, v.p, marked.p,
                                                              high, ref);
-  splitFaces<<<(m.nf + 255) / 256, 256>>>(m, v.p, marked.p, f.p);
-  sync();
+  Buffer<int> bad(1);
+  // Read/write split masks are separate: neighboring threads may cancel the
+  // same edge, but never read a mask while another thread writes it.
+  Buffer<int> checkedMask(m.ne);
+  bool stable=false;
+  for(int pass=0;pass<16;++pass) {
+    splitFaces<<<(m.nf+127)/128,128>>>(m,v.p,marked.p,f.p);
+    checked(cudaMemcpy(checkedMask.p,marked.p,m.ne*sizeof(int),cudaMemcpyDeviceToDevice));
+    checked(cudaMemset(bad.p,0,sizeof(int)));
+    rejectSplitFaces<<<(m.nf+127)/128,128>>>(m,v.p,f.p,checkedMask.p,ref,bad.p);
+    sync();const int rejected=bad.read()[0];report.rejectError+=rejected;
+    if(!rejected){stable=true;break;}
+    checked(cudaMemcpy(marked.p,checkedMask.p,m.ne*sizeof(int),cudaMemcpyDeviceToDevice));
+  }
+  if(!stable)return 0;
   auto marks = marked.read();
   int count = std::count(marks.begin(), marks.end(), 1);
   if (!count)
@@ -611,6 +736,10 @@ int split(SemanticMesh &mesh, float h, float high, ReferenceSurfaceGpu ref) {
   rebuild(mesh, v.read(), f.read(), features, h);
   return count;
 }
+__global__ void countCandidates(const Candidate *c,const int *chosen,int n,int *counts) {
+  int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i<n) {if(chosen[i])atomicAdd(counts,1);if(c[i].keep>=0)atomicAdd(counts+1,1);}
+}
 int topology(SemanticMesh &mesh, float h, float low, float high,
              ReferenceSurfaceGpu ref, bool flip, bool relaxed, unsigned seed,
              RemeshReport &report) {
@@ -620,34 +749,37 @@ int topology(SemanticMesh &mesh, float h, float low, float high,
   Buffer<unsigned long long> claims(m.nv);
   Buffer<int> chosen(m.ne), mapping(m.nv);
   if (flip)
-    flipCandidates<<<(m.ne + 255) / 256, 256>>>(m, candidates.p, ref);
+    flipCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, ref);
   else
-    collapseCandidates<<<(m.ne + 255) / 256, 256>>>(m, candidates.p, low, high,
+    collapseCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, low, high,
                                                     ref, relaxed);
-  initClaims<<<(m.nv + 255) / 256, 256>>>(claims.p, m.nv);
-  claimCandidates<<<(m.ne + 255) / 256, 256>>>(m, candidates.p, claims.p, flip,
+  initClaims<<<(m.nv + 127) / 128, 128>>>(claims.p, m.nv);
+  claimCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, claims.p, flip,
                                                seed);
-  resolveCandidates<<<(m.ne + 255) / 256, 256>>>(m, candidates.p, claims.p,
+  resolveCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, claims.p,
                                                  chosen.p, flip, seed);
+  Buffer<int> counts(2);
+  checked(cudaMemset(counts.p,0,2*sizeof(int)));
+  countCandidates<<<(m.ne+127)/128,128>>>(candidates.p,chosen.p,m.ne,counts.p);
   sync();
-  auto selected = chosen.read();
-  int count = std::count(selected.begin(), selected.end(), 1);
-  auto cs = candidates.read();
-  for (auto c : cs)
-    if (c.keep >= 0) {
-      if (flip)
-        ++report.flipCandidates;
-      else
-        ++report.collapseCandidates;
-    }
+  const auto totals=counts.read();
+  const int count=totals[0];
+  if(flip)report.flipCandidates+=totals[1];else report.collapseCandidates+=totals[1];
   if (!count)
     return 0;
-  initMap<<<(m.nv + 255) / 256, 256>>>(mapping.p, m.nv);
-  applyCandidates<<<(m.ne + 255) / 256, 256>>>(m, candidates.p, chosen.p,
+  if(!flip) initMap<<<(m.nv + 127) / 128, 128>>>(mapping.p, m.nv);
+  applyCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, chosen.p,
                                                mapping.p, flip);
   if (!flip)
-    remapFaces<<<(m.nf + 255) / 256, 256>>>(m, mapping.p);
+    remapFaces<<<(m.nf + 127) / 128, 128>>>(m, mapping.p);
   sync();
+  if(flip) {
+    // Flips neither delete vertices nor change coordinates/feature identities.
+    const auto faces=d.faces.read();
+    for(int f=0;f<m.nf;++f) {mesh.i0[f]=faces[f].v[0];mesh.i1[f]=faces[f].v[1];mesh.i2[f]=faces[f].v[2];}
+    mesh.rebuildTopology();
+    return count;
+  }
   auto features = mesh.featureEdges;
   if (!flip) {
     auto map = mapping.read();
@@ -662,18 +794,18 @@ int topology(SemanticMesh &mesh, float h, float low, float high,
   return count;
 }
 int smooth(SemanticMesh &mesh, ReferenceSurfaceGpu ref, float lambda,
-           unsigned seed) {
+           unsigned seed, RemeshReport &report) {
   DeviceMesh d(mesh, ref);
   auto m = d.view();
   Buffer<Vertex> next(m.nv);
   Buffer<int> moved(1);
   checked(cudaMemset(moved.p, 0, sizeof(int)));
   for (int pass = 0; pass < 12; ++pass) {
-    smoothVertices<<<(m.nv + 255) / 256, 256>>>(m, next.p, ref, lambda,
+    smoothVertices<<<(m.nv + 127) / 128, 128>>>(m, next.p, ref, lambda,
                                                 seed + pass, moved.p);
     std::swap(m.v, next.p);
   }
-  projectVertices<<<(m.nv + 255) / 256, 256>>>(m, ref);
+  report.rejectQuality += safeProject(m,ref,&report.rejectError);
   sync();
   std::vector<Vertex> verts(m.nv);
   checked(cudaMemcpy(verts.data(), m.v, m.nv * sizeof(Vertex),
@@ -684,6 +816,33 @@ int smooth(SemanticMesh &mesh, ReferenceSurfaceGpu ref, float lambda,
   }
   return moved.read()[0];
 }
+void buildReferenceBvh(const std::vector<ReferenceTriangleGpu> &triangles,float boxPad,
+                       std::vector<ReferenceBvhNode> &tree,std::vector<int> &sourceIds) {
+    tree.clear();sourceIds.resize(triangles.size());
+    std::iota(sourceIds.begin(),sourceIds.end(),0);
+    auto coord=[](float3 p,int axis){return axis==0?p.x:(axis==1?p.y:p.z);};
+    std::function<void(int,int)> buildTree=[&](int begin,int end) {
+      const int id=int(tree.size());tree.emplace_back();
+      float3 lo=make_float3(FLT_MAX,FLT_MAX,FLT_MAX),hi=make_float3(-FLT_MAX,-FLT_MAX,-FLT_MAX);
+      for(int i=begin;i<end;++i) {const auto t=triangles[sourceIds[i]];for(auto p:{t.a,t.b,t.c}) {
+        lo.x=std::min(lo.x,p.x);lo.y=std::min(lo.y,p.y);lo.z=std::min(lo.z,p.z);
+        hi.x=std::max(hi.x,p.x);hi.y=std::max(hi.y,p.y);hi.z=std::max(hi.z,p.z);
+      }}
+      tree[id].lower=make_float3(lo.x-boxPad,lo.y-boxPad,lo.z-boxPad);
+      tree[id].upper=make_float3(hi.x+boxPad,hi.y+boxPad,hi.z+boxPad);
+      if(end-begin<=4) {tree[id].first=begin;tree[id].count=end-begin;}
+      else {
+        int axis=0;if(hi.y-lo.y>hi.x-lo.x)axis=1;if(hi.z-lo.z>coord(hi,axis)-coord(lo,axis))axis=2;
+        std::stable_sort(sourceIds.begin()+begin,sourceIds.begin()+end,[&](int a,int b) {
+          const auto ta=triangles[a],tb=triangles[b];
+          return coord(ta.a,axis)+coord(ta.b,axis)+coord(ta.c,axis)<coord(tb.a,axis)+coord(tb.b,axis)+coord(tb.c,axis);
+        });
+        int mid=(begin+end)/2;buildTree(begin,mid);buildTree(mid,end);
+      }
+      tree[id].escape=int(tree.size());
+    };
+    if(!triangles.empty())buildTree(0,int(triangles.size()));
+}
 } // namespace raw
 
 bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
@@ -691,6 +850,8 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
   using namespace raw;
   using Clock = std::chrono::steady_clock;
   auto start = Clock::now();
+  DeviceArena arena;
+  ArenaScope arenaScope(arena);
   report = {};
   try {
     if (mesh.LocalSizing || (cfg.adaptive && !(cfg.featureEdgeLength > 0)))
@@ -746,6 +907,11 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       triangles.push_back({point(mesh.facePoint(f, 0)),
                            point(mesh.facePoint(f, 1)),
                            point(mesh.facePoint(f, 2)), 0});
+    std::vector<ReferenceBvhNode> tree;
+    std::vector<int> sourceIds;
+    buildReferenceBvh(triangles,mesh.bboxDiagonal()*1.e-6f,tree,sourceIds);
+    Buffer<ReferenceBvhNode> bvh(tree);
+    Buffer<int> triangleIds(sourceIds);
     Buffer<ReferenceTriangleGpu> reference(triangles);
     std::vector<SizingSegmentGpu> seeds;
     const bool refine = cfg.featureEdgeLength > 0;
@@ -808,10 +974,18 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
         if (local < h)
           seeds.push_back({point(a), point(b), local});
       }
+    std::vector<ReferenceTriangleGpu> seedBounds;
+    for(auto seed:seeds)seedBounds.push_back({seed.a,seed.b,seed.a,0});
+    std::vector<ReferenceBvhNode> sizeTree;std::vector<int> sizeIds;
+    buildReferenceBvh(seedBounds,mesh.bboxDiagonal()*1.e-6f,sizeTree,sizeIds);
+    Buffer<ReferenceBvhNode> sizingBvh(sizeTree);Buffer<int> sizingIds(sizeIds);
     Buffer<SizingSegmentGpu> sizing(seeds);
     ReferenceSurfaceGpu ref{reference.p, int(reference.n), cfg.maxGeometryError,
                             sizing.p,    int(sizing.n),    h,
                             band};
+    ref.sizingNodes=sizingBvh.p;ref.sizingNodeCount=int(sizeTree.size());ref.sizingIds=sizingIds.p;
+    ref.nodes=bvh.p;ref.nodeCount=int(tree.size());ref.triangleIds=triangleIds.p;
+    std::cout<<"reference_query=bvh nodes="<<ref.nodeCount<<std::endl;
     std::cout << "raw_sizing="
               << (refine ? "curvature_only" : "uniform")
               << " seeds=" << seeds.size()
@@ -823,15 +997,19 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
               << triangles.size()
               << " feature_edges=" << mesh.featureEdges.size()
               << " host_adjacency=true" << std::endl;
+    int currentCycle=-1;
+    const char *stage="setup";
     auto validate = [&]() {
       if (!mesh.validate(&error))
-        throw std::runtime_error("raw CUDA topology: " + error);
+        throw std::runtime_error("raw CUDA topology: cycle="+std::to_string(currentCycle)+" stage="+stage+": " + error);
     };
     for (int cycle = 0; cycle < cfg.maxIterations; ++cycle) {
+      currentCycle=cycle;
       int ns = 0, nc = 0, nf = 0, nm = 0;
       auto mark = Clock::now();
+      stage="split";
       if (cfg.enableSplit) {
-        ns = split(mesh, h, cfg.splitRatio * h, ref);
+        ns = split(mesh, h, cfg.splitRatio * h, ref,report);
         report.splits += ns;
         report.splitCandidates += ns;
         validate();
@@ -839,6 +1017,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       report.secondsSplit +=
           std::chrono::duration<double>(Clock::now() - mark).count();
       mark = Clock::now();
+      stage="collapse";
       if (cfg.enableCollapse) {
         for (int pass = 0; pass < 8; ++pass) {
           int n =
@@ -857,6 +1036,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       report.secondsCollapse +=
           std::chrono::duration<double>(Clock::now() - mark).count();
       mark = Clock::now();
+      stage="flip";
       if (cfg.enableFlip) {
         for (int pass = 0; pass < 8; ++pass) {
           int n =
@@ -872,13 +1052,14 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       report.secondsFlip +=
           std::chrono::duration<double>(Clock::now() - mark).count();
       mark = Clock::now();
+      stage="smooth_projection";
       if (cfg.enableSmooth) {
-        nm = smooth(mesh, ref, cfg.smoothLambda, unsigned(cycle * 12 + 1));
+        nm = smooth(mesh, ref, cfg.smoothLambda, unsigned(cycle * 12 + 1),report);
         report.smoothMoves += nm;
       } else {
         DeviceMesh d(mesh, ref);
         auto m = d.view();
-        projectVertices<<<(m.nv + 255) / 256, 256>>>(m, ref);
+        report.rejectQuality += safeProject(m,ref,&report.rejectError);
         sync();
         auto v = d.vertices.read();
         for (int i = 0; i < m.nv; ++i) {
@@ -886,6 +1067,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
           mesh.setPosition(i, {p.x, p.y, p.z});
         }
       }
+      validate();
       report.secondsSmooth +=
           std::chrono::duration<double>(Clock::now() - mark).count();
       std::cout << "raw_gpu_cycle=" << cycle << " faces=" << mesh.faceCount()
@@ -899,7 +1081,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       auto m = d.view();
       Buffer<unsigned int> maximum(2);
       checked(cudaMemset(maximum.p, 0, 2*sizeof(unsigned int)));
-      auditGeometry<<<(m.nf + 255) / 256, 256>>>(m, ref, maximum.p);
+      auditGeometry<<<(m.nf + 127) / 128, 128>>>(m, ref, maximum.p);
       sync();
       auto audit = maximum.read();
       auto bits = audit[0];

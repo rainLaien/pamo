@@ -510,9 +510,10 @@ int main(int argc, char **argv) {
              <<" local_edge_band_fraction="<<double(inBand)/mesh.edges.size()<<'\n';
   }
   const float validatedGeometryErrorMax = report.geometryErrorMax;
-  fillMeshMetrics(mesh, cfg, report, featureRefine);
+  const bool rawGpuAudited=std::strcmp(backendName,"gpu-raw-cuda")==0;
+  if(!rawGpuAudited) fillMeshMetrics(mesh, cfg, report, featureRefine);
   report.geometryErrorMax = std::max(report.geometryErrorMax, validatedGeometryErrorMax);
-  if(!partitionInput && !grid) {
+  if(!partitionInput && !grid && !rawGpuAudited) {
     GeometryProjector sourceProjector;sourceProjector.build(reference);
     float sourceError=0;
     for(int f=0;f<mesh.faceCount();++f) if(mesh.faceAlive[f]) {
