@@ -22,21 +22,43 @@ void checked(cudaError_t e) {
   if (e != cudaSuccess)
     throw std::runtime_error(cudaGetErrorString(e));
 }
+thread_local cudaStream_t executionStream=nullptr;
+cudaError_t streamCopy(void *dst,const void *src,size_t bytes,cudaMemcpyKind kind) {
+  if(!executionStream)return cudaMemcpy(dst,src,bytes,kind);
+  checked(cudaMemcpyAsync(dst,src,bytes,kind,executionStream));
+  checked(cudaStreamSynchronize(executionStream));
+  return cudaSuccess;
+}
+cudaError_t streamZero(void *dst,int value,size_t bytes) {
+  if(!executionStream)return cudaMemset(dst,value,bytes);
+  checked(cudaMemsetAsync(dst,value,bytes,executionStream));
+  return cudaSuccess;
+}
+struct StreamScope {
+  cudaStream_t previous=executionStream, owned=nullptr;
+  explicit StreamScope(bool independent) {if(independent){checked(cudaStreamCreateWithFlags(&owned,cudaStreamNonBlocking));executionStream=owned;}}
+  ~StreamScope(){if(owned){cudaStreamSynchronize(owned);cudaStreamDestroy(owned);}executionStream=previous;}
+};
 void sync() {
   checked(cudaGetLastError());
-  checked(cudaDeviceSynchronize());
+  checked(cudaStreamSynchronize(executionStream));
 }
 // Per-call, per-thread scratch cache. CUDA allocation/free synchronization is
 // paid once per capacity class rather than once per topology pass.
 struct DeviceArena {
   struct Block {void *p; size_t bytes;};
   std::vector<Block> available;
+  size_t allocated=0,limit=0;
   static size_t capacity(size_t bytes) {size_t n=256;while(n<bytes)n*=2;return n;}
   void *acquire(size_t bytes) {
     for(size_t i=0;i<available.size();++i) if(available[i].bytes==bytes) {
       void *p=available[i].p;available[i]=available.back();available.pop_back();return p;
     }
-    void *p=nullptr;checked(cudaMalloc(&p,bytes));return p;
+    if(limit && allocated+bytes>limit) {
+      for(auto b:available){checked(cudaFree(b.p));allocated-=b.bytes;}available.clear();
+      if(allocated+bytes>limit)throw std::runtime_error("raw CUDA task workspace budget exceeded");
+    }
+    void *p=nullptr;checked(cudaMalloc(&p,bytes));allocated+=bytes;return p;
   }
   void release(void *p,size_t bytes) {available.push_back({p,bytes});}
   ~DeviceArena() {for(auto b:available)cudaFree(b.p);}
@@ -61,7 +83,7 @@ template <class T> struct Buffer {
   }
   explicit Buffer(const std::vector<T> &v) : Buffer(v.size()) {
     if (n)
-      checked(cudaMemcpy(p, v.data(), n * sizeof(T), cudaMemcpyHostToDevice));
+      checked(streamCopy(p, v.data(), n * sizeof(T), cudaMemcpyHostToDevice));
   }
   ~Buffer() {
     if (p) {
@@ -74,7 +96,7 @@ template <class T> struct Buffer {
   std::vector<T> read() const {
     std::vector<T> v(n);
     if (n)
-      checked(cudaMemcpy(v.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost));
+      checked(streamCopy(v.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost));
     return v;
   }
 };
@@ -101,6 +123,7 @@ struct MeshView {
   int *ids;
   int *faceEdges;
   int nv, nf, ne;
+  bool freezeBoundary=false;
 };
 uint64_t key(int a, int b) {
   if (a > b)
@@ -113,6 +136,7 @@ __global__ void updateTargets(Vertex *v, int n, ReferenceSurfaceGpu ref) {
   if (i < n)
     v[i].target = sizingAt(ref, v[i].p);
 }
+thread_local bool freezeBoundary=false;
 struct DeviceMesh {
   Buffer<Vertex> vertices;
   Buffer<Triangle> faces;
@@ -182,12 +206,12 @@ struct DeviceMesh {
   explicit DeviceMesh(const SemanticMesh &m, ReferenceSurfaceGpu ref)
       : vertices(verts(m)), faces(tris(m)), edges(eds(m)), offsets(offs(m)),
         ids(adjacency(m)), faceEdges(fe(m)) {
-    updateTargets<<<(m.vertexCount() + 127) / 128, 128>>>(vertices.p,
+    updateTargets<<<(m.vertexCount() + 127) / 128, 128,0,executionStream>>>(vertices.p,
                                                           m.vertexCount(), ref);
   }
   MeshView view() {
     return {vertices.p,  faces.p,         edges.p,      offsets.p,   ids.p,
-            faceEdges.p, int(vertices.n), int(faces.n), int(edges.n)};
+            faceEdges.p, int(vertices.n), int(faces.n), int(edges.n), freezeBoundary};
   }
 };
 __device__ int other(Edge e, int v) { return e.a == v ? e.b : e.a; }
@@ -286,7 +310,7 @@ __global__ void splitVertices(MeshView m, Vertex *out, int *marked, float high,
               ? fminf(target, .5f * (m.v[e.a].target + m.v[e.b].target)) /
                     ref.regularLength
               : 1.f;
-  marked[i] = dist2(m.v[e.a].p, m.v[e.b].p) > high * high;
+  marked[i] = !(m.freezeBoundary && (e.f1<0 || (e.feature && m.v[e.a].constraint>=4 && m.v[e.b].constraint>=4))) && dist2(m.v[e.a].p, m.v[e.b].p) > high * high;
   out[m.nv + i] = {midpoint, e.feature ? 2 : 1, target};
 }
 __global__ void splitFaces(MeshView m, const Vertex *verts, const int *marked,
@@ -344,13 +368,30 @@ __global__ void collapseCandidates(MeshView m, Candidate *out, float low,
                  .5f * (m.v[a].target + m.v[b].target)) /
            ref.regularLength;
   }
-  bool ma = movable(m, a, id), mb = movable(m, b, id);
-  if (!ma && !mb)
-    return;
+  const float edgeDist2 = dist2(m.v[a].p, m.v[b].p);
+  // Cheap rejection first. movable() walks the complete feature star, so do
+  // not pay for it on ordinary edges that are already above the collapse
+  // threshold and have sufficient adjacent area. This preserves the exact
+  // acceptance rule below; it only changes evaluation order.
+  if (!relaxed && edgeDist2 >= low * low) {
+    auto t0 = m.f[e.f0];
+    auto n0 = normal3(m.v[t0.v[0]].p, m.v[t0.v[1]].p, m.v[t0.v[2]].p);
+    float minArea = .5f * sqrtf(dot3(n0, n0));
+    if (e.f1 >= 0) {
+      auto t1 = m.f[e.f1];
+      auto n1 = normal3(m.v[t1.v[0]].p, m.v[t1.v[1]].p, m.v[t1.v[2]].p);
+      minArea = fminf(minArea, .5f * sqrtf(dot3(n1, n1)));
+    }
+    if (minArea >= low * low / 100.f)
+      return;
+  }
   int da = m.offsets[a + 1] - m.offsets[a],
       db = m.offsets[b + 1] - m.offsets[b];
   if (relaxed && !((da == 3 || da == 4) && m.v[a].constraint < 2) &&
       !((db == 3 || db == 4) && m.v[b].constraint < 2))
+    return;
+  bool ma = movable(m, a, id), mb = movable(m, b, id);
+  if (!ma && !mb)
     return;
   int common = 0;
   for (int i = m.offsets[a]; i < m.offsets[a + 1]; ++i)
@@ -612,20 +653,20 @@ __global__ void revertProjection(MeshView m,Vertex *proposal,const int *reject,i
 int safeProject(MeshView m,ReferenceSurfaceGpu ref,int *errorRejects=nullptr) {
   Buffer<Vertex> proposal(m.nv);
   Buffer<int> reject(m.nv),bad(2),rejected(1);
-  checked(cudaMemset(rejected.p,0,sizeof(int)));
-  proposeProjection<<<(m.nv+127)/128,128>>>(m,proposal.p,ref);
+  checked(streamZero(rejected.p,0,sizeof(int)));
+  proposeProjection<<<(m.nv+127)/128,128,0,executionStream>>>(m,proposal.p,ref);
   for(int pass=0;pass<16;++pass) {
-    checked(cudaMemset(reject.p,0,m.nv*sizeof(int)));
-    checked(cudaMemset(bad.p,0,2*sizeof(int)));
-    checkProjectionFaces<<<(m.nf+127)/128,128>>>(m,proposal.p,ref,reject.p,bad.p);
+    checked(streamZero(reject.p,0,m.nv*sizeof(int)));
+    checked(streamZero(bad.p,0,2*sizeof(int)));
+    checkProjectionFaces<<<(m.nf+127)/128,128,0,executionStream>>>(m,proposal.p,ref,reject.p,bad.p);
     sync();
     const auto counts=bad.read();
     if(errorRejects)*errorRejects+=counts[1];
     if(counts[0]==0) {
-      checked(cudaMemcpy(m.v,proposal.p,m.nv*sizeof(Vertex),cudaMemcpyDeviceToDevice));
+      checked(streamCopy(m.v,proposal.p,m.nv*sizeof(Vertex),cudaMemcpyDeviceToDevice));
       return rejected.read()[0];
     }
-    revertProjection<<<(m.nv+127)/128,128>>>(m,proposal.p,reject.p,rejected.p);
+    revertProjection<<<(m.nv+127)/128,128,0,executionStream>>>(m,proposal.p,reject.p,rejected.p);
   }
   sync();
   // No proposal is committed. The original positions remain valid.
@@ -655,6 +696,55 @@ __global__ void auditGeometry(MeshView m, ReferenceSurfaceGpu ref,
   }
 }
 
+// Raw single-patch CUDA path only needs the edge table between GPU passes.
+// Avoid rebuilding per-vertex incidentFaces: that structure is unused by the
+// raw CUDA operators and caused hundreds of thousands of small host allocations.
+void rebuildRawTopology(SemanticMesh &mesh) {
+  mesh.incidentFaces.clear();
+  mesh.edges.clear();
+  mesh.edges.reserve(size_t(mesh.faceCount()) * 3 / 2 + 16);
+  size_t capacity=8;
+  while(capacity<size_t(mesh.faceCount())*6) capacity*=2;
+  std::vector<int> index(capacity,-1);
+  const auto slotHash=[&](uint64_t x) {
+    x^=x>>33;x*=0xff51afd7ed558ccdULL;x^=x>>33;
+    return size_t(x)&(capacity-1);
+  };
+  for(int f=0;f<mesh.faceCount();++f) {
+    if(!mesh.faceAlive[f]) continue;
+    const uint32_t v[3]={mesh.i0[f],mesh.i1[f],mesh.i2[f]};
+    for(int k=0;k<3;++k) {
+      const uint32_t a=v[k],b=v[(k+1)%3];
+      const uint64_t edgeKey=key(int(a),int(b));
+      size_t slot=slotHash(edgeKey);
+      while(index[slot]>=0 && key(int(mesh.edges[index[slot]].v0),int(mesh.edges[index[slot]].v1))!=edgeKey)
+        slot=(slot+1)&(capacity-1);
+      if(index[slot]<0) {
+        EdgeRec e;
+        e.v0=std::min(a,b);e.v1=std::max(a,b);
+        e.face0=f;e.patchLeft=mesh.facePatchId[f];
+        mesh.edges.push_back(e);
+        index[slot]=int(mesh.edges.size())-1;
+      } else {
+        auto &e=mesh.edges[index[slot]];
+        if(e.face1<0) {e.face1=f;e.patchRight=mesh.facePatchId[f];}
+        else e.flags=uint8_t(e.flags|EdgeProtected);
+      }
+    }
+  }
+  for(auto &e:mesh.edges) {
+    const auto fit=mesh.featureEdges.find(key(int(e.v0),int(e.v1)));
+    if(fit!=mesh.featureEdges.end()) {
+      e.flags=uint8_t(e.flags|EdgeSharp|EdgeProtected);
+      e.featureCurveId=fit->second;
+    }
+    if(e.face1<0) {
+      e.flags=uint8_t(e.flags|EdgeMeshBoundary|EdgeProtected);
+      e.featureCurveId=kOpenBoundaryFeature;
+    }
+  }
+}
+
 void rebuild(SemanticMesh &mesh, const std::vector<Vertex> &vertices,
              const std::vector<Triangle> &faces,
              const std::unordered_map<uint64_t, uint32_t> &features, float h) {
@@ -681,7 +771,7 @@ void rebuild(SemanticMesh &mesh, const std::vector<Vertex> &vertices,
         map[b] >= 0 && map[a] != map[b])
       out.featureEdges[key(map[a], map[b])] = kv.second;
   }
-  out.rebuildTopology();
+  rebuildRawTopology(out);
   mesh = std::move(out);
 }
 __global__ void rejectSplitFaces(MeshView m,const Vertex *v,const Triangle *faces,
@@ -704,7 +794,7 @@ int split(SemanticMesh &mesh, float h, float high, ReferenceSurfaceGpu ref,Remes
   Buffer<Vertex> v(m.nv + m.ne);
   Buffer<Triangle> f(4 * m.nf);
   Buffer<int> marked(m.ne);
-  splitVertices<<<(std::max(m.nv, m.ne) + 127) / 128, 128>>>(m, v.p, marked.p,
+  splitVertices<<<(std::max(m.nv, m.ne) + 127) / 128, 128,0,executionStream>>>(m, v.p, marked.p,
                                                              high, ref);
   Buffer<int> bad(1);
   // Read/write split masks are separate: neighboring threads may cancel the
@@ -712,13 +802,13 @@ int split(SemanticMesh &mesh, float h, float high, ReferenceSurfaceGpu ref,Remes
   Buffer<int> checkedMask(m.ne);
   bool stable=false;
   for(int pass=0;pass<16;++pass) {
-    splitFaces<<<(m.nf+127)/128,128>>>(m,v.p,marked.p,f.p);
-    checked(cudaMemcpy(checkedMask.p,marked.p,m.ne*sizeof(int),cudaMemcpyDeviceToDevice));
-    checked(cudaMemset(bad.p,0,sizeof(int)));
-    rejectSplitFaces<<<(m.nf+127)/128,128>>>(m,v.p,f.p,checkedMask.p,ref,bad.p);
+    splitFaces<<<(m.nf+127)/128,128,0,executionStream>>>(m,v.p,marked.p,f.p);
+    checked(streamCopy(checkedMask.p,marked.p,m.ne*sizeof(int),cudaMemcpyDeviceToDevice));
+    checked(streamZero(bad.p,0,sizeof(int)));
+    rejectSplitFaces<<<(m.nf+127)/128,128,0,executionStream>>>(m,v.p,f.p,checkedMask.p,ref,bad.p);
     sync();const int rejected=bad.read()[0];report.rejectError+=rejected;
     if(!rejected){stable=true;break;}
-    checked(cudaMemcpy(marked.p,checkedMask.p,m.ne*sizeof(int),cudaMemcpyDeviceToDevice));
+    checked(streamCopy(marked.p,checkedMask.p,m.ne*sizeof(int),cudaMemcpyDeviceToDevice));
   }
   if(!stable)return 0;
   auto marks = marked.read();
@@ -740,57 +830,97 @@ __global__ void countCandidates(const Candidate *c,const int *chosen,int n,int *
   int i=blockIdx.x*blockDim.x+threadIdx.x;
   if(i<n) {if(chosen[i])atomicAdd(counts,1);if(c[i].keep>=0)atomicAdd(counts+1,1);}
 }
+struct TopologyTiming {
+  double deviceMesh = 0;
+  double candidate = 0;
+  double schedule = 0;
+  double apply = 0;
+  double mapDownload = 0;
+  double meshDownload = 0;
+  double hostFeatureRemap = 0;
+  double hostRebuild = 0;
+  double downloadRebuild = 0;
+  int calls = 0;
+};
+thread_local TopologyTiming collapseTiming;
+thread_local TopologyTiming flipTiming;
+
 int topology(SemanticMesh &mesh, float h, float low, float high,
              ReferenceSurfaceGpu ref, bool flip, bool relaxed, unsigned seed,
              RemeshReport &report) {
+  using TopologyClock = std::chrono::steady_clock;
+  auto &timing = flip ? flipTiming : collapseTiming;
+  ++timing.calls;
+  auto timingMark = TopologyClock::now();
   DeviceMesh d(mesh, ref);
   auto m = d.view();
+  timing.deviceMesh += std::chrono::duration<double>(TopologyClock::now()-timingMark).count();
+  timingMark = TopologyClock::now();
   Buffer<Candidate> candidates(m.ne);
   Buffer<unsigned long long> claims(m.nv);
   Buffer<int> chosen(m.ne), mapping(m.nv);
   if (flip)
-    flipCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, ref);
+    flipCandidates<<<(m.ne + 127) / 128, 128,0,executionStream>>>(m, candidates.p, ref);
   else
-    collapseCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, low, high,
+    collapseCandidates<<<(m.ne + 127) / 128, 128,0,executionStream>>>(m, candidates.p, low, high,
                                                     ref, relaxed);
-  initClaims<<<(m.nv + 127) / 128, 128>>>(claims.p, m.nv);
-  claimCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, claims.p, flip,
+  sync();
+  timing.candidate += std::chrono::duration<double>(TopologyClock::now()-timingMark).count();
+  timingMark = TopologyClock::now();
+  initClaims<<<(m.nv + 127) / 128, 128,0,executionStream>>>(claims.p, m.nv);
+  claimCandidates<<<(m.ne + 127) / 128, 128,0,executionStream>>>(m, candidates.p, claims.p, flip,
                                                seed);
-  resolveCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, claims.p,
+  resolveCandidates<<<(m.ne + 127) / 128, 128,0,executionStream>>>(m, candidates.p, claims.p,
                                                  chosen.p, flip, seed);
   Buffer<int> counts(2);
-  checked(cudaMemset(counts.p,0,2*sizeof(int)));
-  countCandidates<<<(m.ne+127)/128,128>>>(candidates.p,chosen.p,m.ne,counts.p);
+  checked(streamZero(counts.p,0,2*sizeof(int)));
+  countCandidates<<<(m.ne+127)/128,128,0,executionStream>>>(candidates.p,chosen.p,m.ne,counts.p);
   sync();
   const auto totals=counts.read();
+  timing.schedule += std::chrono::duration<double>(TopologyClock::now()-timingMark).count();
   const int count=totals[0];
   if(flip)report.flipCandidates+=totals[1];else report.collapseCandidates+=totals[1];
   if (!count)
     return 0;
-  if(!flip) initMap<<<(m.nv + 127) / 128, 128>>>(mapping.p, m.nv);
-  applyCandidates<<<(m.ne + 127) / 128, 128>>>(m, candidates.p, chosen.p,
+  timingMark = TopologyClock::now();
+  if(!flip) initMap<<<(m.nv + 127) / 128, 128,0,executionStream>>>(mapping.p, m.nv);
+  applyCandidates<<<(m.ne + 127) / 128, 128,0,executionStream>>>(m, candidates.p, chosen.p,
                                                mapping.p, flip);
   if (!flip)
-    remapFaces<<<(m.nf + 127) / 128, 128>>>(m, mapping.p);
+    remapFaces<<<(m.nf + 127) / 128, 128,0,executionStream>>>(m, mapping.p);
   sync();
+  timing.apply += std::chrono::duration<double>(TopologyClock::now()-timingMark).count();
+  timingMark = TopologyClock::now();
   if(flip) {
     // Flips neither delete vertices nor change coordinates/feature identities.
     const auto faces=d.faces.read();
     for(int f=0;f<m.nf;++f) {mesh.i0[f]=faces[f].v[0];mesh.i1[f]=faces[f].v[1];mesh.i2[f]=faces[f].v[2];}
-    mesh.rebuildTopology();
+    rebuildRawTopology(mesh);
+    timing.downloadRebuild += std::chrono::duration<double>(TopologyClock::now()-timingMark).count();
     return count;
   }
   auto features = mesh.featureEdges;
   if (!flip) {
+    auto subMark=TopologyClock::now();
     auto map = mapping.read();
+    timing.mapDownload += std::chrono::duration<double>(TopologyClock::now()-subMark).count();
+    subMark=TopologyClock::now();
     features.clear();
     for (auto kv : mesh.featureEdges) {
       int a = map[kv.first >> 32], b = map[uint32_t(kv.first)];
       if (a != b)
         features[key(a, b)] = kv.second;
     }
+    timing.hostFeatureRemap += std::chrono::duration<double>(TopologyClock::now()-subMark).count();
   }
-  rebuild(mesh, d.vertices.read(), d.faces.read(), features, h);
+  auto subMark=TopologyClock::now();
+  auto hostVertices=d.vertices.read();
+  auto hostFaces=d.faces.read();
+  timing.meshDownload += std::chrono::duration<double>(TopologyClock::now()-subMark).count();
+  subMark=TopologyClock::now();
+  rebuild(mesh, hostVertices, hostFaces, features, h);
+  timing.hostRebuild += std::chrono::duration<double>(TopologyClock::now()-subMark).count();
+  timing.downloadRebuild += std::chrono::duration<double>(TopologyClock::now()-timingMark).count();
   return count;
 }
 int smooth(SemanticMesh &mesh, ReferenceSurfaceGpu ref, float lambda,
@@ -799,16 +929,16 @@ int smooth(SemanticMesh &mesh, ReferenceSurfaceGpu ref, float lambda,
   auto m = d.view();
   Buffer<Vertex> next(m.nv);
   Buffer<int> moved(1);
-  checked(cudaMemset(moved.p, 0, sizeof(int)));
+  checked(streamZero(moved.p, 0, sizeof(int)));
   for (int pass = 0; pass < 12; ++pass) {
-    smoothVertices<<<(m.nv + 127) / 128, 128>>>(m, next.p, ref, lambda,
+    smoothVertices<<<(m.nv + 127) / 128, 128,0,executionStream>>>(m, next.p, ref, lambda,
                                                 seed + pass, moved.p);
     std::swap(m.v, next.p);
   }
   report.rejectQuality += safeProject(m,ref,&report.rejectError);
   sync();
   std::vector<Vertex> verts(m.nv);
-  checked(cudaMemcpy(verts.data(), m.v, m.nv * sizeof(Vertex),
+  checked(streamCopy(verts.data(), m.v, m.nv * sizeof(Vertex),
                      cudaMemcpyDeviceToHost));
   for (int i = 0; i < m.nv; ++i) {
     auto p = verts[i].p;
@@ -845,14 +975,23 @@ void buildReferenceBvh(const std::vector<ReferenceTriangleGpu> &triangles,float 
 }
 } // namespace raw
 
+bool remeshRawCuda(SemanticMesh &m,const RemeshConfig &c,RemeshReport &r) {
+  return remeshRawCuda(m,c,r,{});
+}
+
 bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
-                   RemeshReport &report) {
+                   RemeshReport &report, const RawCudaOptions &options) {
   using namespace raw;
   using Clock = std::chrono::steady_clock;
   auto start = Clock::now();
-  DeviceArena arena;
+  StreamScope streamScope(options.independentStream);
+  struct BoundaryScope {bool old=freezeBoundary;~BoundaryScope(){freezeBoundary=old;}} boundaryScope;
+  freezeBoundary=options.freezeBoundary;
+  DeviceArena arena;arena.limit=options.workspaceBytes;
   ArenaScope arenaScope(arena);
   report = {};
+  collapseTiming = {};
+  flipTiming = {};
   try {
     if (mesh.LocalSizing || (cfg.adaptive && !(cfg.featureEdgeLength > 0)))
       throw std::runtime_error(
@@ -985,15 +1124,15 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
                             band};
     ref.sizingNodes=sizingBvh.p;ref.sizingNodeCount=int(sizeTree.size());ref.sizingIds=sizingIds.p;
     ref.nodes=bvh.p;ref.nodeCount=int(tree.size());ref.triangleIds=triangleIds.p;
-    std::cout<<"reference_query=bvh nodes="<<ref.nodeCount<<std::endl;
-    std::cout << "raw_sizing="
+    if(!options.quiet) std::cout<<"reference_query=bvh nodes="<<ref.nodeCount<<std::endl;
+    if(!options.quiet) std::cout << "raw_sizing="
               << (refine ? "curvature_only" : "uniform")
               << " seeds=" << seeds.size()
               << " feature_length=" << (refine ? fine : h)
               << " transition_band=" << band << std::endl;
     report.secondsSetup =
         std::chrono::duration<double>(Clock::now() - start).count();
-    std::cout << "raw_gpu_policy=triangle_templates reference_faces="
+    if(!options.quiet) std::cout << "raw_gpu_policy=triangle_templates reference_faces="
               << triangles.size()
               << " feature_edges=" << mesh.featureEdges.size()
               << " host_adjacency=true" << std::endl;
@@ -1070,7 +1209,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       validate();
       report.secondsSmooth +=
           std::chrono::duration<double>(Clock::now() - mark).count();
-      std::cout << "raw_gpu_cycle=" << cycle << " faces=" << mesh.faceCount()
+      if(!options.quiet) std::cout << "raw_gpu_cycle=" << cycle << " faces=" << mesh.faceCount()
                 << " split=" << ns << " collapse=" << nc << " flip=" << nf
                 << " smooth=" << nm << std::endl;
     }
@@ -1080,13 +1219,13 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       DeviceMesh d(mesh, ref);
       auto m = d.view();
       Buffer<unsigned int> maximum(2);
-      checked(cudaMemset(maximum.p, 0, 2*sizeof(unsigned int)));
-      auditGeometry<<<(m.nf + 127) / 128, 128>>>(m, ref, maximum.p);
+      checked(streamZero(maximum.p, 0, 2*sizeof(unsigned int)));
+      auditGeometry<<<(m.nf + 127) / 128, 128,0,executionStream>>>(m, ref, maximum.p);
       sync();
       auto audit = maximum.read();
       auto bits = audit[0];
       std::memcpy(&localErrorRatio,&audit[1],sizeof(float));
-      if(refine) std::cout<<"raw_local_error_ratio="<<localErrorRatio<<std::endl;
+      if(refine && !options.quiet) std::cout<<"raw_local_error_ratio="<<localErrorRatio<<std::endl;
       static_assert(sizeof(bits) == sizeof(report.geometryErrorMax));
       std::memcpy(&report.geometryErrorMax, &bits, sizeof(bits));
     }
@@ -1115,9 +1254,30 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
             cfg.maxGeometryError + mesh.bboxDiagonal() * 1.e-6f;
     report.seconds =
         std::chrono::duration<double>(Clock::now() - start).count();
+    if(!options.quiet) {
+      const auto printTopologyTiming=[](const char *name,const TopologyTiming &t) {
+        std::cout << "raw_gpu_topology_timing stage=" << name
+                  << " calls=" << t.calls
+                  << " device_mesh=" << t.deviceMesh
+                  << " candidate=" << t.candidate
+                  << " schedule=" << t.schedule
+                  << " apply=" << t.apply
+                  << " map_download=" << t.mapDownload
+                  << " mesh_download=" << t.meshDownload
+                  << " host_feature_remap=" << t.hostFeatureRemap
+                  << " host_rebuild=" << t.hostRebuild
+                  << " download_rebuild=" << t.downloadRebuild
+                  << " total=" << (t.deviceMesh+t.candidate+t.schedule+t.apply+t.downloadRebuild)
+                  << std::endl;
+      };
+      printTopologyTiming("collapse",collapseTiming);
+      printTopologyTiming("flip",flipTiming);
+    }
+    if(!report.constraintsHeld && options.error)*options.error="final raw CUDA geometry or locked-vertex constraints failed";
     return report.constraintsHeld;
   } catch (const std::exception &e) {
-    std::cerr << "[raw CUDA] " << e.what() << '\n';
+    if(options.error)*options.error=e.what();
+    if(!options.quiet) std::cerr << "[raw CUDA] " << e.what() << '\n';
     report.seconds =
         std::chrono::duration<double>(Clock::now() - start).count();
     return false;
