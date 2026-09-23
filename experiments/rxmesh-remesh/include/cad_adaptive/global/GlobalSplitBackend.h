@@ -1,11 +1,13 @@
 #pragma once
 
 #include "cad_adaptive/SemanticMesh.h"
+#include "cad_adaptive/gpu/ReferenceSurfaceGpu.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace cad_adaptive::global {
 
@@ -67,6 +69,13 @@ struct GlobalTriangleRefineReport {
 
   size_t globalMemoryBytes = 0;
   size_t dynamicSharedMemoryBytes = 0;
+};
+
+struct GlobalRawCollapseProbeReport {
+  uint32_t prefilterCount = 0;
+  uint32_t candidateCount = 0;
+  double prefilterMs = 0;
+  double candidateMs = 0;
 };
 
 struct GlobalCollapseReport {
@@ -143,14 +152,31 @@ public:
   GlobalSplitBackend &operator=(const GlobalSplitBackend &) = delete;
 
   bool Initialize(const SemanticMesh &mesh, float capacityFactor, std::string *error = nullptr);
+  // Exact import for Raw migration/probing: preserve existing topology, IDs,
+  // target lengths, constraints and feature flags without rebuilding/reapplying sizing.
+  bool initializeExactTopology(const SemanticMesh &mesh, float capacityFactor,
+                               std::string *error = nullptr);
   // Call after Initialize: absolute tolerances against immutable CAD patches.
   bool configure(const RemeshConfig &config, std::string *error = nullptr);
+  // Upload an immutable raw-triangle reference/sizing surface for experimental
+  // persistent-topology operators. This does not change the existing Global policy.
+  bool configureRawReference(const gpu::ReferenceSurfaceGpu &reference,
+                             std::string *error = nullptr);
+  // Host-data overload used by Raw migration probes; uploads immutable reference data.
+  bool configureRawReferenceHost(const std::vector<gpu::ReferenceTriangleGpu> &triangles,
+      const std::vector<gpu::SizingSegmentGpu> &sizing,
+      const std::vector<gpu::ReferenceBvhNode> &nodes, const std::vector<int> &triangleIds,
+      const std::vector<gpu::ReferenceBvhNode> &sizingNodes, const std::vector<int> &sizingIds,
+      float tolerance, float regularLength, float band, std::string *error = nullptr);
   bool RunTriangleRefinePass(float refineRatio, GlobalTriangleRefineReport &report, std::string *error = nullptr);
   bool RunSplitPass(float splitRatio, GlobalSplitReport &report,
                     std::string *error = nullptr,
                     float maxRatio = std::numeric_limits<float>::infinity());
   bool RunCollapsePass(float collapseRatio, GlobalCollapseReport &report,
                        std::string *error = nullptr);
+  bool probeRawCollapseCandidates(float collapseRatio, float splitRatio, bool relaxed,
+                                  GlobalRawCollapseProbeReport &report,
+                                  std::string *error = nullptr);
   bool RunFlipPass(float minQualityGain, float collapseRatio,
                    GlobalFlipReport &report, std::string *error = nullptr);
   bool RunSmoothPass(float lambda, GlobalSmoothReport &report,

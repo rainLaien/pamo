@@ -44,7 +44,6 @@ int refinePartitionBoundary(SemanticMesh &mesh, float maxLength) {
 
 
 int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
-  if(!mesh.LocalSizing) return refinePartitionBoundary(mesh,config.splitRatio*config.constantLength);
   int total=0;
   for(int round=0;round<64;++round) {
     mesh.rebuildTopology();
@@ -54,7 +53,7 @@ int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
       if(!(e.flags & (EdgePatchBoundary|EdgeMeshBoundary))) continue;
       const Vec3 a=mesh.position(e.v0),b=mesh.position(e.v1),mid=(a+b)*0.5f;
       float target=config.constantLength;
-      for(uint32_t p:{e.patchLeft,e.patchRight}) if(p<mesh.patches.size()) {
+      for(uint32_t p:{e.patchLeft,e.patchRight}) if(mesh.LocalSizing && p<mesh.patches.size()) {
         target=std::min(target,mesh.LocalSizing->evaluate(p,a));
         target=std::min(target,mesh.LocalSizing->evaluate(p,b));
         target=std::min(target,mesh.LocalSizing->evaluate(p,mid));
@@ -66,7 +65,7 @@ int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
       if(e.face1>=0) claimed[e.face1]=1;
     }
     if(selected.empty()) {
-      mesh.compact(); mesh.LocalSizing->apply(mesh); mesh.computeVertexNormals();
+      mesh.compact(); if(mesh.LocalSizing) mesh.LocalSizing->apply(mesh); mesh.computeVertexNormals();
       return total;
     }
     if(size_t(total)+selected.size()>100000u) throw std::runtime_error("local boundary subdivision budget exceeded");
@@ -172,7 +171,7 @@ bool validatePartitionOutput(const SemanticMesh &source, const SemanticMesh &out
   return true;
 }
 
-bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string *error) {
+bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string *error, bool referenceOnly) {
   try {
     std::ifstream in(path, std::ios::binary);
     auto read = [&](auto &value) {
@@ -208,7 +207,8 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
       if (h[3]!=counts[p] || h[4]>np) throw std::runtime_error("partition ownership mismatch");
       for (uint32_t s=0;s<h[4];++s) { uint32_t id; read(id); if(id>=np) throw std::runtime_error("invalid support patch"); }
       double params[9]; read(params);
-      if (h[1]!=1 || (h[0]!=uint32_t(PatchType::Plane) && h[0]!=uint32_t(PatchType::Cylinder)))
+      if (h[0]>uint32_t(PatchType::Freeform) || h[1]>1) throw std::runtime_error("invalid patch type or target");
+      if (!referenceOnly && (h[1]!=1 || (h[0]!=uint32_t(PatchType::Plane) && h[0]!=uint32_t(PatchType::Cylinder))))
         throw std::runtime_error("partition requires unsupported projection (only analytic plane/cylinder supported)");
       for (double x:params) if (!std::isfinite(x)) throw std::runtime_error("invalid surface parameters");
       PatchRecord rec;
@@ -216,7 +216,7 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
       rec.origin={float(params[0]),float(params[1]),float(params[2])};
       rec.axis={float(params[3]),float(params[4]),float(params[5])};
       rec.radius=float(params[6]);
-      if (length2(rec.axis)<1e-12f || (rec.type==PatchType::Cylinder && !(rec.radius>0)))
+      if (!referenceOnly && (length2(rec.axis)<1e-12f || (rec.type==PatchType::Cylinder && !(rec.radius>0))))
         throw std::runtime_error("invalid analytic surface");
       result.patches.push_back(rec);
     }
@@ -228,6 +228,7 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
       result.vertexConstraint[r[1]]=uint8_t(VertexConstraint::Locked);
       result.vertexConstraint[r[2]]=uint8_t(VertexConstraint::Locked);
       featureEdges.push_back({r[1],r[2]});
+      if(referenceOnly) result.featureEdges[(uint64_t(std::min(r[1],r[2]))<<32)|std::max(r[1],r[2])]=r[0];
     }
     if (in.peek()!=std::char_traits<char>::eof()) throw std::runtime_error("trailing partition data");
     for(uint32_t f=0;f<nf;++f) result.facePatchType[f]=uint8_t(result.patches[result.facePatchId[f]].type);
@@ -237,7 +238,7 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
       for (const auto &e : result.edges) {
         if (e.v0!=std::min(ends[0],ends[1]) || e.v1!=std::max(ends[0],ends[1])) continue;
         found=true;
-        if (!(e.flags & (EdgePatchBoundary|EdgeMeshBoundary)))
+        if (!referenceOnly && !(e.flags & (EdgePatchBoundary|EdgeMeshBoundary)))
           throw std::runtime_error("feature within one patch requires an explicit curve constraint; refusing unprotected remesh");
         break;
       }

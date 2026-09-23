@@ -1,5 +1,7 @@
 #include "cad_adaptive/global/GlobalSplitBackend.h"
 #include "cad_adaptive/BoundarySizingField.h"
+#include "cad_adaptive/global/GlobalSplitBackend.h"
+#include "cad_adaptive/gpu/ReferenceSurfaceGpu.cuh"
 
 #include <cuda_runtime.h>
 #include <cub/device/device_scan.cuh>
@@ -9,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -276,6 +279,62 @@ __device__ inline void ReplaceIncidentFace(GEdge &e, int32_t oldFace, int32_t ne
     e.f1 = newFace;
 }
 
+__device__ inline bool RawEdgeFeature(const GEdge &e) {
+  return (e.flags & uint8_t(EdgeSharp | EdgeMeshBoundary)) != 0;
+}
+__device__ inline uint32_t RawOther(const GEdge &e,uint32_t v) { return e.v0==v?e.v1:e.v0; }
+__device__ inline bool RawNeighbor(const GEdge *edges,const uint32_t *offsets,const uint32_t *ids,
+                                   uint32_t a,uint32_t b) {
+  for(uint32_t i=offsets[a];i<offsets[a+1];++i)
+    if(RawOther(edges[ids[i]],a)==b)return true;
+  return false;
+}
+__device__ inline bool RawMovable(const GVertex *vertices,const GEdge *edges,
+                                  const uint32_t *offsets,const uint32_t *ids,
+                                  uint32_t v,uint32_t edge) {
+  if(vertices[v].constraint>=4)return false;
+  int count=0; float3 directions[2];
+  const float3 pv=make_float3(vertices[v].x,vertices[v].y,vertices[v].z);
+  for(uint32_t i=offsets[v];i<offsets[v+1];++i) {
+    const auto e=edges[ids[i]]; if(!e.alive || !RawEdgeFeature(e))continue;
+    if(count==2)return false;
+    const auto &ov=vertices[RawOther(e,v)];
+    directions[count++]=gpu::sub3(make_float3(ov.x,ov.y,ov.z),pv);
+  }
+  if(!count)return true;
+  if(!RawEdgeFeature(edges[edge]) || count!=2)return false;
+  return gpu::dot3(directions[0],directions[1])<=-.9f*sqrtf(
+      gpu::dot3(directions[0],directions[0])*gpu::dot3(directions[1],directions[1]));
+}
+__global__ void ProbeRawCollapseCandidates(const GVertex *vertices,const GEdge *edges,
+    const GFace *faces,uint32_t edgeCount,const uint32_t *offsets,const uint32_t *ids,
+    float collapseRatio,gpu::ReferenceSurfaceGpu ref,bool relaxed,
+    uint32_t *prefilterCount,uint32_t *candidateCount) {
+  const uint32_t id=blockIdx.x*blockDim.x+threadIdx.x;if(id>=edgeCount)return;
+  const auto e=edges[id];if(!e.alive || e.f0<0)return;
+  const uint32_t a=e.v0,b=e.v1; float low=collapseRatio*ref.regularLength;
+  const float3 pa=make_float3(vertices[a].x,vertices[a].y,vertices[a].z);
+  const float3 pb=make_float3(vertices[b].x,vertices[b].y,vertices[b].z);
+  if(ref.sizingCount) low*=fminf(gpu::sizingAt(ref,gpu::mul3(gpu::add3(pa,pb),.5f)),
+      .5f*(vertices[a].targetLength+vertices[b].targetLength))/ref.regularLength;
+  const float3 d=gpu::sub3(pa,pb);const float edgeDist2=gpu::dot3(d,d);
+  if(!relaxed && edgeDist2>=low*low) {
+    auto f=faces[e.f0]; auto n=gpu::normal3(make_float3(vertices[f.v0].x,vertices[f.v0].y,vertices[f.v0].z),
+      make_float3(vertices[f.v1].x,vertices[f.v1].y,vertices[f.v1].z),make_float3(vertices[f.v2].x,vertices[f.v2].y,vertices[f.v2].z));
+    float area=.5f*sqrtf(gpu::dot3(n,n));
+    if(e.f1>=0){f=faces[e.f1];n=gpu::normal3(make_float3(vertices[f.v0].x,vertices[f.v0].y,vertices[f.v0].z),make_float3(vertices[f.v1].x,vertices[f.v1].y,vertices[f.v1].z),make_float3(vertices[f.v2].x,vertices[f.v2].y,vertices[f.v2].z));area=fminf(area,.5f*sqrtf(gpu::dot3(n,n)));}
+    if(area>=low*low/100.f)return;
+  }
+  const uint32_t da=offsets[a+1]-offsets[a],db=offsets[b+1]-offsets[b];
+  if(relaxed && !((da==3||da==4)&&vertices[a].constraint<2) && !((db==3||db==4)&&vertices[b].constraint<2))return;
+  atomicAdd(prefilterCount,1u);
+  const bool ma=RawMovable(vertices,edges,offsets,ids,a,id),mb=RawMovable(vertices,edges,offsets,ids,b,id);
+  if(!ma&&!mb)return;
+  uint32_t common=0;for(uint32_t i=offsets[a];i<offsets[a+1];++i)
+    if(RawNeighbor(edges,offsets,ids,b,RawOther(edges[ids[i]],a)))++common;
+  if(common!=(e.f1<0?1u:2u)||(da==3&&db==3&&e.f1>=0))return;
+  atomicAdd(candidateCount,1u);
+}
 __device__ inline uint64_t DeviceEdgeKey(uint32_t a, uint32_t b) {
   if (a > b) { const uint32_t t = a; a = b; b = t; }
   return ((uint64_t(a) << 32) | uint64_t(b)) + 1ull;
@@ -2169,6 +2228,13 @@ __global__ void EndSchedulerRound(HostControlBlock *control) {
 
 struct GlobalSplitBackend::Impl {
   std::shared_ptr<const BoundarySizingField> mLocalSizing;
+  gpu::ReferenceTriangleGpu *mRawReferenceTriangles = nullptr;
+  gpu::SizingSegmentGpu *mRawSizing = nullptr;
+  gpu::ReferenceBvhNode *mRawReferenceNodes = nullptr;
+  gpu::ReferenceBvhNode *mRawSizingNodes = nullptr;
+  int *mRawTriangleIds = nullptr;
+  int *mRawSizingIds = nullptr;
+  gpu::ReferenceSurfaceGpu mRawReference{};
   BoundarySizingNode *mSizingNodes = nullptr;
   BoundarySizingSeed *mSizingSeeds = nullptr;
   HostControlBlock *mControl = nullptr;
@@ -2349,6 +2415,12 @@ struct GlobalSplitBackend::Impl {
   }
 
   ~Impl() {
+    cudaFree(mRawReferenceTriangles);
+    cudaFree(mRawSizing);
+    cudaFree(mRawReferenceNodes);
+    cudaFree(mRawSizingNodes);
+    cudaFree(mRawTriangleIds);
+    cudaFree(mRawSizingIds);
     cudaFree(mSizingNodes);
     cudaFree(mSizingSeeds);
     cudaFree(vertices);
@@ -2406,6 +2478,210 @@ GlobalSplitBackend::~GlobalSplitBackend() = default;
 
 bool GlobalSplitBackend::Initialize(const SemanticMesh &mesh, float capacityFactor,
                                     std::string *error) {
+  // Normal Global initialization intentionally normalizes topology/sizing.
+
+  try {
+    mImpl = std::make_unique<Impl>();
+    SemanticMesh src = mesh;
+    src.rebuildTopology();
+    if(src.LocalSizing) src.LocalSizing->apply(src);
+    if (src.vertexCount() == 0 || src.faceCount() == 0)
+      throw std::runtime_error("empty mesh");
+    if (!(capacityFactor >= 1.5f)) capacityFactor = 2.0f;
+
+    const uint32_t nv = uint32_t(src.vertexCount());
+    const uint32_t ne = uint32_t(src.edges.size());
+    const uint32_t nf = uint32_t(src.faceCount());
+    mImpl->vertexCapacity = std::max(nv + 1024u, uint32_t(std::ceil(nv * capacityFactor)));
+    mImpl->edgeCapacity = std::max(ne + 3072u, uint32_t(std::ceil(ne * capacityFactor)));
+    mImpl->faceCapacity = std::max(nf + 2048u, uint32_t(std::ceil(nf * capacityFactor)));
+    mImpl->candidateCapacity = mImpl->edgeCapacity;
+    mImpl->edgeHashCapacity = 1u;
+    while (mImpl->edgeHashCapacity < mImpl->edgeCapacity * 2u) mImpl->edgeHashCapacity <<= 1u;
+    mImpl->fallbackTargetLength = std::max(1e-6f, src.bboxDiagonal() * 0.01f);
+    mImpl->patches = src.patches;
+    mImpl->mLocalSizing = src.LocalSizing;
+    if(src.LocalSizing) {
+      const auto &nodes=src.LocalSizing->nodes();
+      const auto &seeds=src.LocalSizing->seeds();
+      if(!nodes.empty()) {
+        mImpl->mSizingNodes=AllocDevice<BoundarySizingNode>(nodes.size());
+        CheckCuda(cudaMemcpy(mImpl->mSizingNodes,nodes.data(),nodes.size()*sizeof(BoundarySizingNode),cudaMemcpyHostToDevice),"upload sizing nodes");
+      }
+      if(!seeds.empty()) {
+        mImpl->mSizingSeeds=AllocDevice<BoundarySizingSeed>(seeds.size());
+        CheckCuda(cudaMemcpy(mImpl->mSizingSeeds,seeds.data(),seeds.size()*sizeof(BoundarySizingSeed),cudaMemcpyHostToDevice),"upload sizing seeds");
+      }
+    }
+
+    mImpl->vertices = AllocDevice<GVertex>(mImpl->vertexCapacity);
+    mImpl->edges = AllocDevice<GEdge>(mImpl->edgeCapacity);
+    mImpl->faces = AllocDevice<GFace>(mImpl->faceCapacity);
+    mImpl->gpuPatchCount = uint32_t(src.patches.size());
+    if (mImpl->gpuPatchCount > 0) mImpl->gpuPatches = AllocDevice<GPatch>(mImpl->gpuPatchCount);
+    mImpl->candidates = AllocDevice<SplitCandidate>(mImpl->candidateCapacity);
+    mImpl->flipCandidates = AllocDevice<FlipCandidate>(mImpl->candidateCapacity);
+    mImpl->collapseCandidates = AllocDevice<CollapseCandidate>(mImpl->candidateCapacity);
+    mImpl->smoothCandidates = AllocDevice<SmoothCandidate>(mImpl->candidateCapacity);
+    mImpl->triangleCandidates = AllocDevice<TriangleRefineCandidate>(mImpl->candidateCapacity);
+    mImpl->edgeHashKeys = AllocDevice<unsigned long long>(mImpl->edgeHashCapacity);
+    mImpl->edgeOwner = AllocDevice<uint32_t>(mImpl->edgeCapacity);
+    mImpl->faceOwner = AllocDevice<uint32_t>(mImpl->faceCapacity);
+    mImpl->vertexOwner = AllocDevice<uint32_t>(mImpl->vertexCapacity);
+    mImpl->splitEdgeWinner = AllocDevice<unsigned long long>(mImpl->edgeCapacity);
+    mImpl->splitFaceWinner = AllocDevice<unsigned long long>(mImpl->faceCapacity);
+    mImpl->splitVertexWinner = AllocDevice<unsigned long long>(mImpl->vertexCapacity);
+    mImpl->edgeBlocked = AllocDevice<uint8_t>(mImpl->edgeCapacity);
+    mImpl->faceBlocked = AllocDevice<uint8_t>(mImpl->faceCapacity);
+    mImpl->vertexBlocked = AllocDevice<uint8_t>(mImpl->vertexCapacity);
+    mImpl->activeQueueA = AllocDevice<uint32_t>(mImpl->candidateCapacity);
+    mImpl->activeQueueB = AllocDevice<uint32_t>(mImpl->candidateCapacity);
+    CheckCuda(cudaMallocHost(reinterpret_cast<void **>(&mImpl->mControl), sizeof(HostControlBlock)), "allocate host control mirror");
+    mImpl->mDeviceControl = AllocDevice<HostControlBlock>(1);
+    *mImpl->mControl = {};
+    mImpl->validation = &mImpl->mControl->Validation;
+    mImpl->vertexCount = &mImpl->mControl->VertexCount;
+    mImpl->edgeCount = &mImpl->mControl->EdgeCount;
+    mImpl->faceCount = &mImpl->mControl->FaceCount;
+    mImpl->candidateCount = &mImpl->mControl->CandidateCount;
+    mImpl->acceptedCount = &mImpl->mControl->AcceptedCount;
+    mImpl->roundAccepted = &mImpl->mControl->RoundAccepted;
+    mImpl->activeCount = &mImpl->mControl->ActiveCount;
+    mImpl->nextActiveCount = &mImpl->mControl->NextActiveCount;
+    mImpl->staleRejected = &mImpl->mControl->StaleRejected;
+    mImpl->capacityRejected = &mImpl->mControl->CapacityRejected;
+    mImpl->semanticRejected = &mImpl->mControl->SemanticRejected;
+    mImpl->qualityRejected = &mImpl->mControl->QualityRejected;
+    mImpl->collapseTopologyRejected = &mImpl->mControl->CollapseTopologyRejected;
+    mImpl->projectionApplied = &mImpl->mControl->ProjectionApplied;
+    mImpl->projectionFailed = &mImpl->mControl->ProjectionFailed;
+    mImpl->triangleRejectCounters = mImpl->mControl->TriangleRejectCounters;
+    mImpl->triangleEditableHistogram = mImpl->mControl->TriangleEditableHistogram;
+    mImpl->splitNewVertexCount = &mImpl->mControl->SplitNewVertexCount;
+    mImpl->vertexEdgeCounts = AllocDevice<uint32_t>(size_t(mImpl->vertexCapacity)+1u);
+    mImpl->vertexEdgeOffsets = AllocDevice<uint32_t>(size_t(mImpl->vertexCapacity)+1u);
+    mImpl->vertexEdgeCursor = AllocDevice<uint32_t>(mImpl->vertexCapacity);
+    mImpl->vertexEdgeIds = AllocDevice<uint32_t>(size_t(mImpl->edgeCapacity)*2u);
+
+    *mImpl->vertexCount = nv;
+    *mImpl->edgeCount = ne;
+    *mImpl->faceCount = nf;
+    *mImpl->candidateCount = 0;
+    *mImpl->acceptedCount = 0;
+    *mImpl->roundAccepted = 0;
+    *mImpl->activeCount = 0;
+    *mImpl->nextActiveCount = 0;
+    *mImpl->staleRejected = 0;
+    *mImpl->capacityRejected = 0;
+    *mImpl->semanticRejected = 0;
+    *mImpl->qualityRejected = 0;
+    *mImpl->collapseTopologyRejected = 0;
+    *mImpl->projectionApplied = 0;
+    *mImpl->projectionFailed = 0;
+    for (int i = 0; i < 4; ++i) { mImpl->triangleRejectCounters[i] = 0; mImpl->triangleEditableHistogram[i] = 0; }
+    *mImpl->splitNewVertexCount = 0;
+
+    std::vector<GVertex> hostVertices(nv);
+    std::vector<GEdge> hostEdges(ne);
+    std::vector<GFace> hostFaces(nf);
+    mImpl->mHostPatches.resize(mImpl->gpuPatchCount);
+    std::vector<float> patchOrientation(mImpl->gpuPatchCount, 0.0f);
+    for (uint32_t f = 0; f < uint32_t(src.faceCount()); ++f) {
+      if (!src.faceAlive[f]) continue;
+      const uint32_t patchId = src.facePatchId[f];
+      if (patchId >= src.patches.size()) continue;
+      const PatchRecord &p = src.patches[patchId];
+      Vec3 an{};
+      const Vec3 a = src.facePoint(int(f), 0);
+      const Vec3 b = src.facePoint(int(f), 1);
+      const Vec3 c = src.facePoint(int(f), 2);
+      const Vec3 mid = centroid3(a, b, c);
+      if (p.type == PatchType::Plane) {
+        an = normalize(p.axis, {0, 0, 1});
+      } else if (p.type == PatchType::Cylinder) {
+        const Vec3 axis = normalize(p.axis, {0, 0, 1});
+        const Vec3 off = mid - p.origin;
+        an = normalize(off - axis * dot(off, axis), {0, 0, 0});
+      }
+      if (length2(an) > 0.0f)
+        patchOrientation[patchId] += dot(cross(b - a, c - a), an);
+    }
+
+    for (uint32_t i = 0; i < mImpl->gpuPatchCount; ++i) {
+      const PatchRecord &p = src.patches[i];
+      const float ax=p.axis.x, ay=p.axis.y, az=p.axis.z;
+      const float n=std::sqrt(ax*ax+ay*ay+az*az);
+      const float inv=n>1e-20f ? 1.0f/n : 1.0f;
+      const float orientationSign = patchOrientation[i] < 0.0f ? -1.0f : 1.0f;
+      mImpl->mHostPatches[i] = {p.origin.x,p.origin.y,p.origin.z,
+                              n>1e-20f?ax*inv:0.0f,
+                              n>1e-20f?ay*inv:0.0f,
+                              n>1e-20f?az*inv:1.0f,
+                              p.radius,orientationSign,uint8_t(p.type),{0,0,0}};
+      if(src.LocalSizing) {
+        GPatch &gp=mImpl->mHostPatches[i];
+        gp.Sizing=src.LocalSizing->patches()[i];
+        gp.SizingNodes=mImpl->mSizingNodes; gp.SizingSeeds=mImpl->mSizingSeeds;
+        gp.Gradation=src.LocalSizing->gradation();
+      }
+    }
+
+    for (uint32_t v = 0; v < nv; ++v) {
+      const float h = v < src.targetLength.size() && src.targetLength[v] > 0
+                          ? src.targetLength[v]
+                          : mImpl->fallbackTargetLength;
+      hostVertices[v] = {src.px[v], src.py[v], src.pz[v], h,
+                            v < src.vertexPatchId.size() ? src.vertexPatchId[v] : 0u,
+                            1u,
+                            uint8_t(v < src.vertexConstraint.size() ? src.vertexConstraint[v] : 0u),
+                            1u,
+                            0u};
+    }
+    std::unordered_map<uint64_t, uint32_t> edgeMap;
+    edgeMap.reserve(src.edges.size() * 2);
+    for (uint32_t e = 0; e < ne; ++e) {
+      const EdgeRec &se = src.edges[e];
+      hostEdges[e] = {se.v0, se.v1, se.face0, se.face1, 1u, se.flags, 1u, 0u};
+      edgeMap.emplace(EdgeKey(se.v0, se.v1), e);
+    }
+
+    for (uint32_t f = 0; f < nf; ++f) {
+      const uint32_t a = src.i0[f], b = src.i1[f], c = src.i2[f];
+      const auto it0 = edgeMap.find(EdgeKey(a, b));
+      const auto it1 = edgeMap.find(EdgeKey(b, c));
+      const auto it2 = edgeMap.find(EdgeKey(c, a));
+      if (it0 == edgeMap.end() || it1 == edgeMap.end() || it2 == edgeMap.end())
+        throw std::runtime_error("face edge lookup failed");
+      hostFaces[f] = {a, b, c, it0->second, it1->second, it2->second,
+                         f < src.facePatchId.size() ? src.facePatchId[f] : 0u,
+                         1u,
+                         uint8_t(f < src.faceAlive.size() ? src.faceAlive[f] : 1u),
+                         {0, 0, 0}};
+    }
+
+    CheckCuda(cudaMemcpy(mImpl->vertices, hostVertices.data(), sizeof(GVertex)*nv,
+                         cudaMemcpyHostToDevice), "upload vertices");
+    CheckCuda(cudaMemcpy(mImpl->edges, hostEdges.data(), sizeof(GEdge)*ne,
+                         cudaMemcpyHostToDevice), "upload edges");
+    CheckCuda(cudaMemcpy(mImpl->faces, hostFaces.data(), sizeof(GFace)*nf,
+                         cudaMemcpyHostToDevice), "upload faces");
+    if (mImpl->gpuPatchCount > 0)
+      CheckCuda(cudaMemcpy(mImpl->gpuPatches, mImpl->mHostPatches.data(),
+                           sizeof(GPatch) * mImpl->gpuPatchCount, cudaMemcpyHostToDevice),
+                "upload analytic patches");
+    mImpl->UploadControl();
+    CheckCuda(cudaDeviceSynchronize(), "Initialize synchronize");
+    return true;
+  } catch (const std::exception &e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+bool GlobalSplitBackend::initializeExactTopology(const SemanticMesh &mesh, float capacityFactor,
+                                    std::string *error) {
+  // Normal Global initialization intentionally normalizes topology/sizing.
+
   try {
     mImpl = std::make_unique<Impl>();
     SemanticMesh src = mesh;
@@ -2632,6 +2908,67 @@ bool GlobalSplitBackend::configure(const RemeshConfig &config, std::string *erro
   }
 }
 
+bool GlobalSplitBackend::configureRawReferenceHost(
+    const std::vector<gpu::ReferenceTriangleGpu> &triangles,
+    const std::vector<gpu::SizingSegmentGpu> &sizing,
+    const std::vector<gpu::ReferenceBvhNode> &nodes,const std::vector<int> &triangleIds,
+    const std::vector<gpu::ReferenceBvhNode> &sizingNodes,const std::vector<int> &sizingIds,
+    float tolerance,float regularLength,float band,std::string *error) {
+  try {
+    if(!mImpl->vertices)throw std::runtime_error("backend not initialized");
+    auto upload=[](auto *&dst,const auto &src,const char *where) {
+      using T=typename std::decay_t<decltype(src)>::value_type;
+      cudaFree(dst);dst=nullptr;if(src.empty())return;
+      CheckCuda(cudaMalloc(&dst,src.size()*sizeof(T)),where);
+      CheckCuda(cudaMemcpy(dst,src.data(),src.size()*sizeof(T),cudaMemcpyHostToDevice),where);
+    };
+    upload(mImpl->mRawReferenceTriangles,triangles,"upload host raw triangles");
+    upload(mImpl->mRawSizing,sizing,"upload host raw sizing");
+    upload(mImpl->mRawReferenceNodes,nodes,"upload host raw bvh");
+    upload(mImpl->mRawSizingNodes,sizingNodes,"upload host raw sizing bvh");
+    upload(mImpl->mRawTriangleIds,triangleIds,"upload host raw triangle ids");
+    upload(mImpl->mRawSizingIds,sizingIds,"upload host raw sizing ids");
+    mImpl->mRawReference={mImpl->mRawReferenceTriangles,int(triangles.size()),tolerance,
+      mImpl->mRawSizing,int(sizing.size()),regularLength,band};
+    mImpl->mRawReference.nodes=mImpl->mRawReferenceNodes;
+    mImpl->mRawReference.triangleIds=mImpl->mRawTriangleIds;
+    mImpl->mRawReference.nodeCount=int(nodes.size());
+    mImpl->mRawReference.sizingNodes=mImpl->mRawSizingNodes;
+    mImpl->mRawReference.sizingIds=mImpl->mRawSizingIds;
+    mImpl->mRawReference.sizingNodeCount=int(sizingNodes.size());
+    return true;
+  } catch(const std::exception &e){if(error)*error=e.what();return false;}
+}
+bool GlobalSplitBackend::configureRawReference(const gpu::ReferenceSurfaceGpu &reference,
+                                               std::string *error) {
+  try {
+    if (!mImpl->vertices) throw std::runtime_error("backend not initialized");
+    auto upload = [](auto *&dst, const auto *src, size_t count, const char *where) {
+      using T = std::remove_pointer_t<std::decay_t<decltype(dst)>>;
+      cudaFree(dst); dst = nullptr;
+      if (!src || count == 0) return;
+      CheckCuda(cudaMalloc(&dst, count * sizeof(T)), where);
+      CheckCuda(cudaMemcpy(dst, src, count * sizeof(T), cudaMemcpyDeviceToDevice), where);
+    };
+    upload(mImpl->mRawReferenceTriangles, reference.triangles, size_t(reference.count), "upload raw reference triangles");
+    upload(mImpl->mRawSizing, reference.sizing, size_t(reference.sizingCount), "upload raw sizing segments");
+    upload(mImpl->mRawReferenceNodes, reference.nodes, size_t(reference.nodeCount), "upload raw reference bvh");
+    upload(mImpl->mRawSizingNodes, reference.sizingNodes, size_t(reference.sizingNodeCount), "upload raw sizing bvh");
+    upload(mImpl->mRawTriangleIds, reference.triangleIds, size_t(reference.count), "upload raw triangle ids");
+    upload(mImpl->mRawSizingIds, reference.sizingIds, size_t(reference.sizingCount), "upload raw sizing ids");
+    mImpl->mRawReference = reference;
+    mImpl->mRawReference.triangles = mImpl->mRawReferenceTriangles;
+    mImpl->mRawReference.sizing = mImpl->mRawSizing;
+    mImpl->mRawReference.nodes = mImpl->mRawReferenceNodes;
+    mImpl->mRawReference.sizingNodes = mImpl->mRawSizingNodes;
+    mImpl->mRawReference.triangleIds = mImpl->mRawTriangleIds;
+    mImpl->mRawReference.sizingIds = mImpl->mRawSizingIds;
+    return true;
+  } catch (const std::exception &e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
 bool GlobalSplitBackend::RunTriangleRefinePass(float refineRatio,
                                                 GlobalTriangleRefineReport &report,
                                                 std::string *error) {
@@ -2910,6 +3247,26 @@ bool GlobalSplitBackend::RunSplitPass(float splitRatio, GlobalSplitReport &repor
   }
 }
 
+bool GlobalSplitBackend::probeRawCollapseCandidates(float collapseRatio,float splitRatio,bool relaxed,
+    GlobalRawCollapseProbeReport &report,std::string *error) {
+  report={}; (void)splitRatio;
+  try {
+    if(!mImpl->vertices)throw std::runtime_error("backend not initialized");
+    if(!mImpl->mRawReference.triangles)throw std::runtime_error("raw reference not configured");
+    mImpl->BuildVertexEdgeAdjacency();
+    uint32_t *counts=nullptr; CheckCuda(cudaMallocManaged(&counts,2*sizeof(uint32_t)),"alloc raw probe counts");
+    counts[0]=counts[1]=0;
+    const uint32_t ne=*mImpl->edgeCount,threads=256,blocks=(ne+threads-1u)/threads;
+    const auto mark=std::chrono::steady_clock::now();
+    ProbeRawCollapseCandidates<<<blocks,threads>>>(mImpl->vertices,mImpl->edges,mImpl->faces,ne,
+      mImpl->vertexEdgeOffsets,mImpl->vertexEdgeIds,collapseRatio,mImpl->mRawReference,relaxed,counts,counts+1);
+    CheckCuda(cudaGetLastError(),"ProbeRawCollapseCandidates launch");
+    CheckCuda(cudaDeviceSynchronize(),"ProbeRawCollapseCandidates sync");
+    report.prefilterCount=counts[0]; report.candidateCount=counts[1];
+    report.candidateMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-mark).count();
+    cudaFree(counts); return true;
+  } catch(const std::exception &e) {if(error)*error=e.what();return false;}
+}
 bool GlobalSplitBackend::RunCollapsePass(float collapseRatio, GlobalCollapseReport &report,
                                          std::string *error) {
   report = {};

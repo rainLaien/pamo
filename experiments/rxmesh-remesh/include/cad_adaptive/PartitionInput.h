@@ -4,7 +4,7 @@
 namespace cad_adaptive {
 // Read the indexed CADPART1 handoff produced by PAMO's snapshot packager.
 // Unsupported projection surfaces fail explicitly rather than remeshing freely.
-bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string *error);
+bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string *error, bool referenceOnly=false);
 int refinePartitionBoundary(SemanticMesh &mesh, float maxLength);
 // Fixed input polyline, shared by both incident patches. Never regenerate seeds
 // from the newly split segments, which would cause recursive oversubdivision.

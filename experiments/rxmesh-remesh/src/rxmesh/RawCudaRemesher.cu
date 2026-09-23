@@ -4,7 +4,7 @@
 // CUDA conflict selection, storage and orchestration are implemented here.
 #include "cad_adaptive/RawCudaRemesher.h"
 #include "cad_adaptive/RemeshMetrics.h"
-#include "raw_reference.cuh"
+#include "cad_adaptive/gpu/ReferenceSurfaceGpu.cuh"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -352,84 +352,78 @@ __global__ void splitFaces(MeshView m, const Vertex *verts, const int *marked,
   for (int q = 0; q < 4; ++q)
     out[4 * f + q] = local[q];
 }
-__global__ void collapseCandidates(MeshView m, Candidate *out, float low,
-                                   float high, ReferenceSurfaceGpu ref,
-                                   bool relaxed) {
-  int id = blockIdx.x * blockDim.x + threadIdx.x;
-  if (id >= m.ne)
-    return;
-  out[id].keep = -1;
-  auto e = m.e[id];
-  if (e.f0 < 0)
-    return;
-  int a = e.a, b = e.b;
-  if (ref.sizingCount) {
-    low *= fminf(sizingAt(ref, mul3(add3(m.v[a].p, m.v[b].p), .5f)),
-                 .5f * (m.v[a].target + m.v[b].target)) /
-           ref.regularLength;
+__global__ void collapsePrefilter(MeshView m, Candidate *out, int *flags,
+                                  float *localLow, float low,
+                                  ReferenceSurfaceGpu ref, bool relaxed) {
+  int id=blockIdx.x*blockDim.x+threadIdx.x;
+  if(id>=m.ne)return;
+  out[id].keep=-1; flags[id]=0;
+  auto e=m.e[id];
+  if(e.f0<0)return;
+  int a=e.a,b=e.b;
+  float edgeLow=low;
+  if(ref.sizingCount) {
+    edgeLow*=fminf(sizingAt(ref,mul3(add3(m.v[a].p,m.v[b].p),.5f)),
+                   .5f*(m.v[a].target+m.v[b].target))/ref.regularLength;
   }
-  const float edgeDist2 = dist2(m.v[a].p, m.v[b].p);
-  // Cheap rejection first. movable() walks the complete feature star, so do
-  // not pay for it on ordinary edges that are already above the collapse
-  // threshold and have sufficient adjacent area. This preserves the exact
-  // acceptance rule below; it only changes evaluation order.
-  if (!relaxed && edgeDist2 >= low * low) {
-    auto t0 = m.f[e.f0];
-    auto n0 = normal3(m.v[t0.v[0]].p, m.v[t0.v[1]].p, m.v[t0.v[2]].p);
-    float minArea = .5f * sqrtf(dot3(n0, n0));
-    if (e.f1 >= 0) {
-      auto t1 = m.f[e.f1];
-      auto n1 = normal3(m.v[t1.v[0]].p, m.v[t1.v[1]].p, m.v[t1.v[2]].p);
-      minArea = fminf(minArea, .5f * sqrtf(dot3(n1, n1)));
+  localLow[id]=edgeLow;
+  const float edgeDist2=dist2(m.v[a].p,m.v[b].p);
+  if(!relaxed && edgeDist2>=edgeLow*edgeLow) {
+    auto t0=m.f[e.f0];
+    auto n0=normal3(m.v[t0.v[0]].p,m.v[t0.v[1]].p,m.v[t0.v[2]].p);
+    float minArea=.5f*sqrtf(dot3(n0,n0));
+    if(e.f1>=0) {
+      auto t1=m.f[e.f1];
+      auto n1=normal3(m.v[t1.v[0]].p,m.v[t1.v[1]].p,m.v[t1.v[2]].p);
+      minArea=fminf(minArea,.5f*sqrtf(dot3(n1,n1)));
     }
-    if (minArea >= low * low / 100.f)
-      return;
+    if(minArea>=edgeLow*edgeLow/100.f)return;
   }
-  int da = m.offsets[a + 1] - m.offsets[a],
-      db = m.offsets[b + 1] - m.offsets[b];
-  if (relaxed && !((da == 3 || da == 4) && m.v[a].constraint < 2) &&
-      !((db == 3 || db == 4) && m.v[b].constraint < 2))
-    return;
-  bool ma = movable(m, a, id), mb = movable(m, b, id);
-  if (!ma && !mb)
-    return;
-  int common = 0;
-  for (int i = m.offsets[a]; i < m.offsets[a + 1]; ++i)
-    if (neighbor(m, b, other(m.e[m.ids[i]], a)))
-      ++common;
-  if (common != (e.f1 < 0 ? 1 : 2) || (da == 3 && db == 3 && e.f1 >= 0))
-    return;
-  auto tri = m.f[e.f0];
-  auto n = normal3(m.v[tri.v[0]].p, m.v[tri.v[1]].p, m.v[tri.v[2]].p);
-  float area = .5f * sqrtf(dot3(n, n));
-  if (e.f1 >= 0) {
-    tri = m.f[e.f1];
-    n = normal3(m.v[tri.v[0]].p, m.v[tri.v[1]].p, m.v[tri.v[2]].p);
-    area = fminf(area, .5f * sqrtf(dot3(n, n)));
-  }
-  if (!relaxed && dist2(m.v[a].p, m.v[b].p) >= low * low &&
-      area >= low * low / 100.f)
-    return;
-  int keep = ma && !mb ? b : a, remove = keep == a ? b : a;
-  float3 dest = ma && mb ? mul3(add3(m.v[a].p, m.v[b].p), .5f) : m.v[keep].p;
-  if (!referenceNear(ref, 0, dest))
-    return;
-  // Midpoints stay on the source edge until the cycle's reprojection, matching
-  // VCGLib's collapse placement. Test the unprojected surviving triangles.
-  for (int side = 0; side < 2; ++side) {
-    int v = side ? a : b;
-    for (int i = m.offsets[v]; i < m.offsets[v + 1]; ++i) {
-      auto x = m.e[m.ids[i]];
-      if (x.f0 >= 0 && ownsFace(m.f[x.f0],x,v) &&
-          !changedFaceSafe(m, m.f[x.f0], a, b, dest, high, ref, relaxed))
-        return;
-      if (x.f1 >= 0 && ownsFace(m.f[x.f1],x,v) &&
-          !changedFaceSafe(m, m.f[x.f1], a, b, dest, high, ref, relaxed))
-        return;
-    }
-  }
-  out[id] = {keep, remove, -1, -1, dest};
+  int da=m.offsets[a+1]-m.offsets[a],db=m.offsets[b+1]-m.offsets[b];
+  if(relaxed && !((da==3||da==4)&&m.v[a].constraint<2) &&
+      !((db==3||db==4)&&m.v[b].constraint<2))return;
+  flags[id]=1;
 }
+__global__ void countRawCollapseStages(const Candidate *c,const int *flags,int n,int *counts) {
+  const int id=blockIdx.x*blockDim.x+threadIdx.x;if(id>=n)return;
+  if(flags[id])atomicAdd(counts,1);
+  if(c[id].keep>=0)atomicAdd(counts+1,1);
+}__global__ void collapseCandidatesActive(MeshView m, Candidate *out,
+                                         const int *flags,const float *localLow,float high,
+                                         ReferenceSurfaceGpu ref,bool relaxed) {
+  int id=blockIdx.x*blockDim.x+threadIdx.x;
+  if(id>=m.ne || !flags[id])return;
+  auto e=m.e[id]; int a=e.a,b=e.b;
+  const float low=localLow[id];  int da=m.offsets[a+1]-m.offsets[a],db=m.offsets[b+1]-m.offsets[b];
+  bool ma=movable(m,a,id),mb=movable(m,b,id);
+  if(!ma && !mb)return;
+  int common=0;
+  for(int i=m.offsets[a];i<m.offsets[a+1];++i)
+    if(neighbor(m,b,other(m.e[m.ids[i]],a)))++common;
+  if(common!=(e.f1<0?1:2) || (da==3 && db==3 && e.f1>=0))return;
+  auto tri=m.f[e.f0];
+  auto n=normal3(m.v[tri.v[0]].p,m.v[tri.v[1]].p,m.v[tri.v[2]].p);
+  float area=.5f*sqrtf(dot3(n,n));
+  if(e.f1>=0) {
+    tri=m.f[e.f1];
+    n=normal3(m.v[tri.v[0]].p,m.v[tri.v[1]].p,m.v[tri.v[2]].p);
+    area=fminf(area,.5f*sqrtf(dot3(n,n)));
+  }
+  if(!relaxed && dist2(m.v[a].p,m.v[b].p)>=low*low && area>=low*low/100.f)return;
+  int keep=ma && !mb?b:a,remove=keep==a?b:a;
+  float3 dest=ma && mb?mul3(add3(m.v[a].p,m.v[b].p),.5f):m.v[keep].p;
+  if(!referenceNear(ref,0,dest))return;
+  for(int side=0;side<2;++side) {
+    int v=side?a:b;
+    for(int i=m.offsets[v];i<m.offsets[v+1];++i) {
+      auto x=m.e[m.ids[i]];
+      if(x.f0>=0 && ownsFace(m.f[x.f0],x,v) &&
+         !changedFaceSafe(m,m.f[x.f0],a,b,dest,high,ref,relaxed))return;
+      if(x.f1>=0 && ownsFace(m.f[x.f1],x,v) &&
+         !changedFaceSafe(m,m.f[x.f1],a,b,dest,high,ref,relaxed))return;
+    }
+  }
+  out[id]={keep,remove,-1,-1,dest};}
 __global__ void flipCandidates(MeshView m, Candidate *out,
                                ReferenceSurfaceGpu ref) {
   int id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -714,14 +708,13 @@ void rebuildRawTopology(SemanticMesh &mesh) {
     if(!mesh.faceAlive[f]) continue;
     const uint32_t v[3]={mesh.i0[f],mesh.i1[f],mesh.i2[f]};
     for(int k=0;k<3;++k) {
-      const uint32_t a=v[k],b=v[(k+1)%3];
-      const uint64_t edgeKey=key(int(a),int(b));
-      size_t slot=slotHash(edgeKey);
-      while(index[slot]>=0 && key(int(mesh.edges[index[slot]].v0),int(mesh.edges[index[slot]].v1))!=edgeKey)
+      const uint32_t va=v[k],vb=v[(k+1)%3];
+      const uint64_t edgeKey=key(int(va),int(vb));
+      size_t slot=slotHash(edgeKey);      while(index[slot]>=0 && key(int(mesh.edges[index[slot]].v0),int(mesh.edges[index[slot]].v1))!=edgeKey)
         slot=(slot+1)&(capacity-1);
       if(index[slot]<0) {
         EdgeRec e;
-        e.v0=std::min(a,b);e.v1=std::max(a,b);
+        e.v0=std::min(va,vb);e.v1=std::max(va,vb);
         e.face0=f;e.patchLeft=mesh.facePatchId[f];
         mesh.edges.push_back(e);
         index[slot]=int(mesh.edges.size())-1;
@@ -859,11 +852,24 @@ int topology(SemanticMesh &mesh, float h, float low, float high,
   Buffer<Candidate> candidates(m.ne);
   Buffer<unsigned long long> claims(m.nv);
   Buffer<int> chosen(m.ne), mapping(m.nv);
-  if (flip)
+  if (flip) {
     flipCandidates<<<(m.ne + 127) / 128, 128,0,executionStream>>>(m, candidates.p, ref);
-  else
-    collapseCandidates<<<(m.ne + 127) / 128, 128,0,executionStream>>>(m, candidates.p, low, high,
-                                                    ref, relaxed);
+  } else {
+    Buffer<int> flags(m.ne);
+    Buffer<float> localLow(m.ne);
+    collapsePrefilter<<<(m.ne + 127) / 128, 128,0,executionStream>>>(
+        m,candidates.p,flags.p,localLow.p,low,ref,relaxed);
+    collapseCandidatesActive<<<(m.ne + 127) / 128, 128,0,executionStream>>>(
+        m,candidates.p,flags.p,localLow.p,high,ref,relaxed);
+    Buffer<int> stageCounts(2);
+    checked(streamZero(stageCounts.p,0,2*sizeof(int)));
+    countRawCollapseStages<<<(m.ne+127)/128,128,0,executionStream>>>(candidates.p,flags.p,m.ne,stageCounts.p);
+    const auto stageTotals=stageCounts.read();
+    if(!relaxed && !flip && !freezeBoundary) {
+      std::cout << "raw_collapse_probe prefilter=" << stageTotals[0]
+                << " candidate=" << stageTotals[1] << std::endl;
+    }
+  }
   sync();
   timing.candidate += std::chrono::duration<double>(TopologyClock::now()-timingMark).count();
   timingMark = TopologyClock::now();
@@ -1159,11 +1165,13 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       stage="collapse";
       if (cfg.enableCollapse) {
         for (int pass = 0; pass < 8; ++pass) {
+          const size_t edgesBefore=mesh.edges.size();
           int n =
               topology(mesh, h, cfg.collapseRatio * h, cfg.splitRatio * h, ref,
                        false, false, unsigned(cycle * 31 + pass + 1), report);
           nc += n;
-          if (!n)
+          const double acceptRatio=edgesBefore?double(n)/double(edgesBefore):0.0;
+          if (!n || (pass>=2 && acceptRatio<5.0e-4))
             break;
         }
         int n = topology(mesh, h, cfg.collapseRatio * h, cfg.splitRatio * h,

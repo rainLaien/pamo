@@ -181,6 +181,67 @@ a BVH, against brute-force nearest-point acceptance across patches, tolerance
 boundaries and spatial sizing. The larger remaining work is persistent GPU
 topology/compaction to reduce per-pass host adjacency rebuilds and transfers.
 
+## Experimental PAMO partition + raw CUDA batch backend
+
+The single-mesh `--gpu` entry remains available. To use PAMO's actual partitioner
+with the raw CUDA operators (including reference-only/nonanalytic patches):
+
+```powershell
+.\experiments\rxmesh-remesh\run_raw_partition.ps1 `
+  -InputMesh 'F:\work\sunjie\Apollo\Apollo\test_data\浇道.stl' `
+  -OutputDirectory '.\experiments\rxmesh-remesh\results\runner-batch' `
+  -Workers 4 -Iterations 20 -FeatureRefine
+```
+
+For repeatable debugging, reuse `input.cadpart` with `-SavedPartition`, or call:
+
+```powershell
+.\experiments\rxmesh-remesh\build_rx\Release\cad_raw_partition_cli.exe input.cadpart out.ply --workers 4 --iters 20 --feature-refine
+```
+
+`--workers 1` executes the same patch algorithm serially. `--memory-mb` limits
+aggregate reserved device workspace; the default is 60% of free GPU memory.
+The scheduler reuses PAMO's `RemeshWorkerPool`, estimates task size from source
+faces, surface area and the finest requested length, and selects large ready
+tasks that fit the remaining budget. Each task has a nonblocking CUDA stream;
+each raw kernel still launches as many blocks as its current element count
+requires. A large region is not restricted to one block. Admission reservations
+are conservative estimates; actual cached buffer allocation has a hard cap per
+task. Exceeding it retains that region's source mesh and reports the failure.
+
+Shared boundaries are subdivided globally before workers start, using common
+vertex IDs. Independent tasks cannot split, collapse or move those boundaries.
+Locked vertices are mapped back by exact coordinates with uniqueness checks;
+ambiguous identities reject the region. Workers read immutable input, and results
+are assembled in patch order. Each patch passes the raw topology and sampled
+reference-distance checks; assembly verifies shared edges and mesh topology.
+Failed regions retain their prepared source geometry. Exit 3 explicitly denotes
+this partial result; exit 0 requires every region to be accepted. `out.ply.json`
+records per-region timings, allocation caps, acceptance and failure reasons.
+The wrapper also records partition/packaging and end-to-end time in `pipeline.json`.
+
+On the runner fixture, PAMO produced 457 unequal regions. An initial 20-round
+comparison measured 120.37 s with one worker and 37.38 s with four, with identical
+PLY SHA256 `778C3A806B93217448160817894BD166F0FFB648451D53603FB71A48568B1168`.
+All 457 regions were accepted. These batch times include shared-boundary
+preparation and assembly but exclude partitioning (about 1.8 s for this input).
+The final quiet-logging build repeated at 38.27 s with the same PLY hash;
+loading the saved snapshot through the wrapper and exporting took 39.34 s total.
+The 8-region `Unnamed-Body.stl` case took 6.88 s in the batch backend and
+7.80 s end-to-end, slower than its earlier 2.33 s whole-mesh backend timing.
+Partitioning is therefore not enabled automatically for small models.
+
+This is an experimental alternative, not a quality-equivalent replacement for
+whole-mesh remeshing. Fixing all partition seams reduces freedom to improve
+triangles: on this fixture mean/P05 quality changed from 0.9615/0.8461 for the
+whole mesh to 0.9264/0.6064 for the batch output. Curvature sizing is evaluated
+within each source region, so it can also differ near seams. The next geometry
+step is coordinated seam improvement or relaxing non-feature partition seams.
+GPU allocation, host adjacency reconstruction and host readback remain; tiny
+regions are concurrent tasks, not yet packed into one kernel launch. Peak active
+tasks is not a measurement of simultaneous GPU kernel occupancy. There is no
+general self-intersection guarantee or continuous Hausdorff bound.
+
 ## CAD partition handoff
 
 ```powershell
