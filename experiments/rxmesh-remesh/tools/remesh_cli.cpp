@@ -42,7 +42,9 @@ int main(int argc, char **argv) {
               << "       --feature-angle DEG classifies raw STL crease edges (default 30)\n"
               << "       --no-fillet-initialization disables automatic cylindrical fillet seeding\n"
               << "       --save-initial-mesh saves OUTPUT.ply.initial.ply before GPU iterations\n"
-              << "       --detailed-diagnostics enables expensive per-smooth quality statistics\n";
+              << "       --detailed-diagnostics enables expensive per-smooth quality statistics\n"
+              << "       --iters N sets remesh iteration count (default 20)\n"
+              << "       --workers N sets host batch workers (1..32); -Workers/-workers are accepted aliases\n";
     return 2;
   }
   const bool grid = std::strcmp(argv[1], "--grid") == 0;
@@ -56,6 +58,7 @@ int main(int argc, char **argv) {
   float cavityRatio=2.5f;
   float smoothLambda=0.5f;
   int iters = 20;
+  int workers = 8;
   int splitPasses = 4;
   int collapsePasses = 8;
   float targetQualityP05 = 0.20f;
@@ -131,6 +134,10 @@ int main(int argc, char **argv) {
       smoothLambda=std::strtof(argv[++i],nullptr);
     else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc)
       iters = std::atoi(argv[++i]);
+    else if ((std::strcmp(argv[i], "--workers") == 0 ||
+              std::strcmp(argv[i], "-Workers") == 0 ||
+              std::strcmp(argv[i], "-workers") == 0) && i + 1 < argc)
+      workers = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--flip-iters") == 0 && i + 1 < argc)
       flipIters = std::max(0, std::atoi(argv[++i]));
     else if (std::strcmp(argv[i], "--smooth-iters") == 0 && i + 1 < argc)
@@ -148,7 +155,7 @@ int main(int argc, char **argv) {
   }
   if((forceLocalSizing && !useGlobal) || !std::isfinite(boundaryGradation) ||
      boundaryGradation<=0.0f || boundaryGradation>1.0f ||
-     iters<1 || splitPasses<1 || collapsePasses<1 ||
+     iters<1 || workers<1 || workers>32 || splitPasses<1 || collapsePasses<1 ||
      !std::isfinite(target) || target<0 || !std::isfinite(maxError) || maxError<0 ||
      !std::isfinite(cavityRatio) || cavityRatio<=4.0f/3.0f ||
      !std::isfinite(smoothLambda) || smoothLambda<0 || smoothLambda>1 ||
@@ -157,6 +164,8 @@ int main(int argc, char **argv) {
      !std::isfinite(maxSizingOutlierFraction) || maxSizingOutlierFraction<0 || maxSizingOutlierFraction>1) {
     std::cerr << "invalid remesh iteration, quality or constraint parameters\n"; return 2;
   }
+  std::cout << "cli_config iters=" << iters << " workers=" << workers
+            << " workers_scope=" << (useGpu ? "ignored_for_single_gpu" : "host") << '\n';
   SemanticMesh mesh;
   std::string error;
   const char *outPath = grid ? argv[3] : argv[2];
@@ -622,6 +631,13 @@ int main(int argc, char **argv) {
   jsonPath += ".json";
   std::ofstream js(jsonPath);
   if (js) js << json;
+
+  // End-to-end wall-clock time: input loading, preprocessing, remesh,
+  // validation/audits, serialization and report generation.
+  const double secondsTotal = elapsed(mainStart);
+  std::cout << "\ntotal_elapsed_seconds=" << secondsTotal
+            << " total_elapsed_ms=" << (secondsTotal * 1000.0) << '\n';
+
   if(useGlobal && std::strcmp(termination,"converged")!=0) {
     std::cerr << "candidate mesh saved, but targets not reached: " << termination << '\n';
     return 3;
