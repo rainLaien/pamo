@@ -2,6 +2,7 @@
 #include "cad_adaptive/BoundarySizingField.h"
 
 #include <algorithm>
+#include <charconv>
 
 #include <cmath>
 #include <cstdint>
@@ -195,6 +196,7 @@ void SemanticMesh::rebuildTopology() {
   incidentFaces.resize(vertexCount());
   for(auto &faces:incidentFaces)faces.clear();
   edges.clear();
+  faceEdgeIds.assign(size_t(faceCount())*3,-1);
   // Preserve first-seen edge IDs without one heap allocation per hash entry.
   size_t capacity=8;while(capacity<size_t(faceCount())*6)capacity*=2;
   std::vector<int> index(capacity,-1);
@@ -226,6 +228,7 @@ void SemanticMesh::rebuildTopology() {
           e.flags = uint8_t(e.flags | EdgeProtected);
         }
       }
+      faceEdgeIds[size_t(f)*3+k]=index[slot];
     }
   }
   for (auto &e : edges) {
@@ -267,7 +270,7 @@ void SemanticMesh::computeVertexNormals() {
 }
 
 bool SemanticMesh::validate(std::string *error) const {
-  const auto fail = [&](const char *msg) {
+  const auto fail = [&](const std::string &msg) {
     if (error) *error = msg;
     return false;
   };
@@ -293,32 +296,39 @@ bool SemanticMesh::validate(std::string *error) const {
     for (int k = 0; k < 3; ++k) count[edgeKey(uint32_t(v[k]), uint32_t(v[(k + 1) % 3]))]++;
   }
   for (const auto &kv : count) {
-    if (kv.second > 2) return fail("non-manifold edge");
+    if (kv.second > 2) {
+      const uint32_t a=uint32_t(kv.first>>32),b=uint32_t(kv.first);
+      std::string detail="non-manifold edge "+std::to_string(a)+","+std::to_string(b)+
+          " incidents="+std::to_string(kv.second)+" patches=";
+      for(int f=0;f<faceCount();++f)if(faceAlive[f]) {
+        const uint32_t v[3]={i0[f],i1[f],i2[f]};
+        for(int k=0;k<3;++k)if((v[k]==a && v[(k+1)%3]==b) ||
+                               (v[k]==b && v[(k+1)%3]==a)) {
+          detail+=std::to_string(facePatchId[f])+",";
+          break;
+        }
+      }
+      return fail(detail);
+    }
   }
   return true;
 }
 
 void SemanticMesh::compact() {
   std::vector<int> map(vertexCount(), -1);
+  std::vector<uint8_t> used(vertexCount(), 0);
+  for (int f = 0; f < faceCount(); ++f) {
+    if (!faceAlive[f]) continue;
+    used[i0[f]] = 1;
+    used[i1[f]] = 1;
+    used[i2[f]] = 1;
+  }
   int nv = 0;
   SemanticMesh out;
   out.patches = patches;
   out.LocalSizing = LocalSizing;
   for (int v = 0; v < vertexCount(); ++v) {
-    bool used = false;
-    for (int f : incidentFaces.empty() ? std::vector<int>{} : incidentFaces[v]) {
-      if (f >= 0 && f < faceCount() && faceAlive[f]) {
-        used = true;
-        break;
-      }
-    }
-    if (!used) {
-      for (int f = 0; f < faceCount() && !used; ++f) {
-        if (!faceAlive[f]) continue;
-        if (int(i0[f]) == v || int(i1[f]) == v || int(i2[f]) == v) used = true;
-      }
-    }
-    if (!used) continue;
+    if (!used[v]) continue;
     map[v] = nv++;
     out.addVertex(position(v), vertexPatchId[v], VertexConstraint(vertexConstraint[v]));
     out.setNormal(map[v], normal(v));
@@ -476,28 +486,45 @@ bool SemanticMesh::save(const std::string &path, std::string *error) const {
 }
 
 bool SemanticMesh::saveObj(const std::string &path, std::string *error) const {
-  std::ofstream out(path);
+  std::ofstream out(path,std::ios::binary);
   if (!out) {
     if (error) *error = "cannot write " + path;
     return false;
   }
-  out << std::setprecision(9);
-  for (int v = 0; v < vertexCount(); ++v)
-    out << "v " << px[v] << ' ' << py[v] << ' ' << pz[v] << '\n';
+  std::string buffer;
+  buffer.reserve(size_t(vertexCount())*48u + size_t(faceCount())*32u + 1024u);
+  char tmp[64];
+  auto appendFloat=[&](float value) {
+    auto r=std::to_chars(tmp,tmp+sizeof(tmp),value,std::chars_format::general,9);
+    buffer.append(tmp,r.ptr);
+  };
+  auto appendUInt=[&](uint32_t value) {
+    auto r=std::to_chars(tmp,tmp+sizeof(tmp),value);
+    buffer.append(tmp,r.ptr);
+  };
+  for (int v = 0; v < vertexCount(); ++v) {
+    buffer += "v ";appendFloat(px[v]);buffer.push_back(' ');
+    appendFloat(py[v]);buffer.push_back(' ');appendFloat(pz[v]);buffer.push_back('\n');
+  }
   uint32_t previousPatch = kInvalidId;
   for (int f = 0; f < faceCount(); ++f) {
     if (!faceAlive[f]) continue;
     if (facePatchId[f] != previousPatch) {
       previousPatch = facePatchId[f];
-      out << "g patch_" << previousPatch << '\n';
+      buffer += "g patch_";appendUInt(previousPatch);buffer.push_back('\n');
     }
-    out << "f " << i0[f] + 1 << ' ' << i1[f] + 1 << ' ' << i2[f] + 1 << '\n';
+    buffer += "f ";appendUInt(i0[f]+1);buffer.push_back(' ');
+    appendUInt(i1[f]+1);buffer.push_back(' ');appendUInt(i2[f]+1);buffer.push_back('\n');
+  }
+  out.write(buffer.data(),std::streamsize(buffer.size()));
+  if(!out) {
+    if(error)*error="cannot write "+path;
+    return false;
   }
   return true;
 }
-
 bool SemanticMesh::savePly(const std::string &path, std::string *error) const {
-  std::ofstream out(path);
+  std::ofstream out(path,std::ios::binary);
   if (!out) {
     if (error) *error = "cannot write " + path;
     return false;
@@ -506,24 +533,34 @@ bool SemanticMesh::savePly(const std::string &path, std::string *error) const {
   for (int f = 0; f < faceCount(); ++f)
     if (faceAlive[f]) ++liveFaces;
 
-  out << "ply\n"
-      << "format ascii 1.0\n"
-      << "comment coordinate_system raw_xyz_no_transform\n"
-      << "element vertex " << vertexCount() << "\n"
-      << "property float x\n"
-      << "property float y\n"
-      << "property float z\n"
-      << "element face " << liveFaces << "\n"
-      << "property list uchar int vertex_indices\n"
-      << "property uint patch_id\n"
-      << "end_header\n";
-  out << std::setprecision(9);
-  for (int v = 0; v < vertexCount(); ++v)
-    out << px[v] << ' ' << py[v] << ' ' << pz[v] << '\n';
+  std::string buffer;
+  buffer.reserve(size_t(vertexCount())*48u+size_t(liveFaces)*36u+256u);
+  char tmp[64];
+  auto appendFloat=[&](float value) {
+    auto r=std::to_chars(tmp,tmp+sizeof(tmp),value,std::chars_format::general,9);
+    buffer.append(tmp,r.ptr);
+  };
+  auto appendUInt=[&](uint32_t value) {
+    auto r=std::to_chars(tmp,tmp+sizeof(tmp),value);
+    buffer.append(tmp,r.ptr);
+  };
+  buffer+="ply\nformat ascii 1.0\ncomment coordinate_system raw_xyz_no_transform\nelement vertex ";
+  appendUInt(uint32_t(vertexCount()));
+  buffer+="\nproperty float x\nproperty float y\nproperty float z\nelement face ";
+  appendUInt(uint32_t(liveFaces));
+  buffer+="\nproperty list uchar int vertex_indices\nproperty uint patch_id\nend_header\n";
+  for (int v = 0; v < vertexCount(); ++v) {
+    appendFloat(px[v]);buffer.push_back(' ');
+    appendFloat(py[v]);buffer.push_back(' ');appendFloat(pz[v]);buffer.push_back('\n');
+  }
   for (int f = 0; f < faceCount(); ++f) {
     if (!faceAlive[f]) continue;
-    out << "3 " << i0[f] << ' ' << i1[f] << ' ' << i2[f] << ' ' << facePatchId[f] << '\n';
+    buffer+="3 ";appendUInt(i0[f]);buffer.push_back(' ');
+    appendUInt(i1[f]);buffer.push_back(' ');appendUInt(i2[f]);buffer.push_back(' ');
+    appendUInt(facePatchId[f]);buffer.push_back('\n');
   }
+  out.write(buffer.data(),std::streamsize(buffer.size()));
+  if(!out) {if(error)*error="cannot write "+path;return false;}
   return true;
 }
 

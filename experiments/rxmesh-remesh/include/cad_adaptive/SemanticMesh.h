@@ -60,6 +60,8 @@ struct SemanticMesh {
   // persistent face-edge selection semantics.
   std::unordered_map<uint64_t, uint32_t> featureEdges;
   std::vector<EdgeRec> edges;
+  // Optional cached mapping: 3 entries per face, local edge slot -> edges[] id.
+  std::vector<int> faceEdgeIds;
   std::vector<std::vector<int>> incidentFaces;
 
   int vertexCount() const { return int(px.size()); }

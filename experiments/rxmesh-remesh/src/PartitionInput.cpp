@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <set>
+#include <unordered_map>
 
 namespace cad_adaptive {
 int refinePartitionBoundary(SemanticMesh &mesh, float maxLength) {
@@ -24,6 +25,13 @@ int refinePartitionBoundary(SemanticMesh &mesh, float maxLength) {
     const auto &e=selected;
     const int middle=mesh.addVertex((mesh.position(e.v0)+mesh.position(e.v1))*0.5f,
                                     e.patchLeft,VertexConstraint::Locked);
+    const uint64_t originalKey=(uint64_t(e.v0)<<32)|e.v1;
+    if(auto feature=mesh.featureEdges.find(originalKey);feature!=mesh.featureEdges.end()) {
+      const uint32_t id=feature->second;
+      mesh.featureEdges.erase(feature);
+      mesh.featureEdges[(uint64_t(std::min(e.v0,uint32_t(middle)))<<32)|std::max(e.v0,uint32_t(middle))]=id;
+      mesh.featureEdges[(uint64_t(std::min(e.v1,uint32_t(middle)))<<32)|std::max(e.v1,uint32_t(middle))]=id;
+    }
     for(int f:{e.face0,e.face1}) {
       if(f<0) continue;
       auto t=mesh.face(f); auto pid=mesh.facePatchId[f];
@@ -72,6 +80,13 @@ int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
     for(const auto &e:selected) {
       const int middle=mesh.addVertex((mesh.position(e.v0)+mesh.position(e.v1))*0.5f,
                                      e.patchLeft,VertexConstraint::Locked);
+      const uint64_t originalKey=(uint64_t(e.v0)<<32)|e.v1;
+      if(auto feature=mesh.featureEdges.find(originalKey);feature!=mesh.featureEdges.end()) {
+        const uint32_t id=feature->second;
+        mesh.featureEdges.erase(feature);
+        mesh.featureEdges[(uint64_t(std::min(e.v0,uint32_t(middle)))<<32)|std::max(e.v0,uint32_t(middle))]=id;
+        mesh.featureEdges[(uint64_t(std::min(e.v1,uint32_t(middle)))<<32)|std::max(e.v1,uint32_t(middle))]=id;
+      }
       for(int f:{e.face0,e.face1}) {
         if(f<0) continue;
         const auto triangle=mesh.face(f); const uint32_t patch=mesh.facePatchId[f];
@@ -233,16 +248,16 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
     if (in.peek()!=std::char_traits<char>::eof()) throw std::runtime_error("trailing partition data");
     for(uint32_t f=0;f<nf;++f) result.facePatchType[f]=uint8_t(result.patches[result.facePatchId[f]].type);
     result.rebuildTopology();
+    std::unordered_map<uint64_t,uint8_t> edgeFlags;
+    edgeFlags.reserve(result.edges.size());
+    for(const auto &e:result.edges)
+      edgeFlags.emplace((uint64_t(e.v0)<<32)|e.v1,e.flags);
     for (auto ends : featureEdges) {
-      bool found=false;
-      for (const auto &e : result.edges) {
-        if (e.v0!=std::min(ends[0],ends[1]) || e.v1!=std::max(ends[0],ends[1])) continue;
-        found=true;
-        if (!referenceOnly && !(e.flags & (EdgePatchBoundary|EdgeMeshBoundary)))
-          throw std::runtime_error("feature within one patch requires an explicit curve constraint; refusing unprotected remesh");
-        break;
-      }
-      if (!found) throw std::runtime_error("constraint references a missing mesh edge");
+      const uint64_t key=(uint64_t(std::min(ends[0],ends[1]))<<32)|std::max(ends[0],ends[1]);
+      const auto found=edgeFlags.find(key);
+      if(found==edgeFlags.end())throw std::runtime_error("constraint references a missing mesh edge");
+      if(!referenceOnly && !(found->second & (EdgePatchBoundary|EdgeMeshBoundary)))
+        throw std::runtime_error("feature within one patch requires an explicit curve constraint; refusing unprotected remesh");
     }
     for(const auto &e:result.edges) if(e.flags & (EdgePatchBoundary|EdgeMeshBoundary)) {
       result.vertexConstraint[e.v0]=uint8_t(VertexConstraint::Locked);

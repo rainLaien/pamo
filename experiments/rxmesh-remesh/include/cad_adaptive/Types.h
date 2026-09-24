@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -119,10 +120,16 @@ struct RemeshConfig {
 };
 
 struct RemeshReport {
+  int cyclesExecuted = 0;
+  int recoveredCycleFailures = 0;
+  int selectedCycle = -1;
   int splits = 0, collapses = 0, flips = 0, smoothMoves = 0;
   int cavityRefines = 0;
   int splitCandidates = 0, collapseCandidates = 0, flipCandidates = 0;
   int cavityCandidates = 0;
+  std::array<int, 8> collapsePassCalls{}, collapsePassAccepted{};
+  std::array<int, 8> flipPassCalls{}, flipPassAccepted{};
+  std::array<double, 8> collapsePassSeconds{}, flipPassSeconds{};
   int rejectTopology = 0, rejectPatch = 0, rejectFeature = 0;
   int rejectNormal = 0, rejectQuality = 0, rejectError = 0;
   float qualityMean = 0, qualityP05 = 0, qualityMin = 0;
@@ -131,7 +138,7 @@ struct RemeshReport {
   int movedLockedVertices = 0, missingBoundaryEdges = 0;
   double seconds = 0;
   double secondsSetup = 0, secondsCavity = 0, secondsSplit = 0, secondsCollapse = 0,
-         secondsFlip = 0, secondsSmooth = 0;
+         secondsFlip = 0, secondsSmooth = 0, secondsCompact = 0, secondsValidate = 0;
   bool topologyValid = false;
   bool constraintsHeld = false;
 };

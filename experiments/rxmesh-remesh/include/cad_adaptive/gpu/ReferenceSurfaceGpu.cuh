@@ -22,10 +22,12 @@ struct ReferenceTriangleGpu {
 struct SizingSegmentGpu {
   float3 a, b;
   float target;
+  int patch=0;
 };
 struct ReferenceBvhNode {
   float3 lower,upper;
   int first=-1,count=0,escape=0;
+  float minTarget=FLT_MAX; // sizing BVH lower bound; unused by reference-triangle BVH
 };
 struct ReferenceSurfaceGpu {
   const ReferenceTriangleGpu *triangles = nullptr;
@@ -55,34 +57,46 @@ __device__ inline float boxDistance2(float3 p,const ReferenceBvhNode &t) {
 }
 // Immutable source features define a continuous spatial field. Re-evaluating it
 // after every edit prevents collapse/smoothing from erasing the refinement.
-__device__ inline float sizingAt(ReferenceSurfaceGpu ref, float3 p) {
+__device__ inline float sizingAt(ReferenceSurfaceGpu ref, float3 p, int patch=0) {
   float h = ref.regularLength;
   int node=0;
   while(node<(ref.sizingNodeCount ? ref.sizingNodeCount : 1)) {
     int first=0,count=ref.sizingCount;
     if(ref.sizingNodeCount) {
       const auto n=ref.sizingNodes[node];
-      // Beyond the transition band every descendant contributes >= regularLength.
-      if(boxDistance2(p,n)>ref.band*ref.band*1.00001f) {node=n.escape;continue;}
+      const float boxD2=boxDistance2(p,n);
+      if(boxD2>ref.band*ref.band*1.00001f) {node=n.escape;continue;}
+      if(n.minTarget<FLT_MAX) {
+        if(h<=n.minTarget) {node=n.escape;continue;}
+        const float span=ref.regularLength-n.minTarget;
+        if(span>0.f) {
+          const float maxDistance=ref.band*(h-n.minTarget)/span;
+          if(boxD2>=maxDistance*maxDistance) {node=n.escape;continue;}
+        }
+      }
       if(n.first<0){++node;continue;}
       first=n.first;count=n.count;
     }
     for(int k=0;k<count;++k) {
       const int i=ref.sizingNodeCount ? ref.sizingIds[first+k] : k;
-    const auto s = ref.sizing[i];
-    const auto ab = sub3(s.b, s.a);
-    float t = fminf(
-        1.f, fmaxf(0.f, dot3(sub3(p, s.a), ab) / fmaxf(dot3(ab, ab), 1.e-30f)));
-    const auto d = sub3(p, add3(s.a, mul3(ab, t)));
-    h = fminf(h, s.target + (ref.regularLength - s.target) * sqrtf(dot3(d, d)) /
-                                ref.band);
+      const auto seg = ref.sizing[i];
+      if(seg.patch!=patch)continue;
+      const auto ab = sub3(seg.b, seg.a);
+      float t = fminf(1.f, fmaxf(0.f, dot3(sub3(p, seg.a), ab) / fmaxf(dot3(ab, ab), 1.e-30f)));
+      const auto d = sub3(p, add3(seg.a, mul3(ab, t)));
+      const float d2 = dot3(d, d);
+      const float span = ref.regularLength - seg.target;
+      if (span > 0.f && h > seg.target) {
+        const float maxDistance = ref.band * (h - seg.target) / span;
+        if (d2 < maxDistance * maxDistance)
+          h = seg.target + span * sqrtf(d2) / ref.band;
+      }
     }
     ++node;
   }
   return h;
-}
-__device__ inline float toleranceAt(ReferenceSurfaceGpu ref, float3 p) {
-  return ref.sizingCount ? fminf(ref.tolerance, .08f * sizingAt(ref, p))
+}__device__ inline float toleranceAt(ReferenceSurfaceGpu ref, float3 p, int patch=0) {
+  return ref.sizingCount ? fminf(ref.tolerance, .08f * sizingAt(ref, p, patch))
                          : ref.tolerance;
 }
 __device__ inline float qualityVcg(float3 a, float3 b, float3 c) {
@@ -144,15 +158,66 @@ static __device__ __noinline__ bool projectReference(ReferenceSurfaceGpu ref,
   }
   return found;
 }
-static __device__ __noinline__ bool referenceNear(ReferenceSurfaceGpu ref, int patch,
-                                     float3 p) {
-  if (!ref.count)
-    return true;
-  const float tolerance = toleranceAt(ref, p);
+static __device__ __noinline__ bool projectReferenceHinted(ReferenceSurfaceGpu ref,
+                                              int patch,float3 p,float3 &q,int &hintId) {
+  float best=FLT_MAX; int bestId=2147483647; bool found=false;
+  if(hintId>=0 && hintId<ref.count) {
+    const auto t=ref.triangles[hintId];
+    if(t.patch==patch) {
+      const auto hit=closestTriangle(p,t),d=sub3(hit,p);
+      best=dot3(d,d); bestId=hintId; q=hit; found=true;
+    }
+  }
+  int node=0;
+  while(node<(ref.nodeCount ? ref.nodeCount : 1)) {
+    int first=0,count=ref.count;
+    if(ref.nodeCount) {
+      const auto n=ref.nodes[node];
+      if(best<FLT_MAX && boxDistance2(p,n)>best+fmaxf(1.e-10f,best*1.e-5f)) {node=n.escape;continue;}
+      if(n.first<0) {++node;continue;}
+      first=n.first;count=n.count;
+    }
+    for(int k=0;k<count;++k) {
+      const int id=ref.nodeCount ? ref.triangleIds[first+k] : k;
+      const auto t=ref.triangles[id];
+      if(t.patch!=patch)continue;
+      const auto hit=closestTriangle(p,t),d=sub3(hit,p);
+      const float d2=dot3(d,d);
+      if(d2<best || (d2==best && id<bestId)) {best=d2;bestId=id;q=hit;found=true;}
+    }
+    ++node;
+  }
+  hintId=found?bestId:-1;
+  return found;
+}
+// Smoothing makes short successive moves. An interior hit on its previous
+// source triangle is already on the correct immutable reference surface.
+// Boundary hits still use the full BVH so vertices can cross source triangles.
+static __device__ __noinline__ bool projectReferenceHintedLocal(ReferenceSurfaceGpu ref,
+    int patch,float3 p,float tolerance,float3 &q,int &hintId) {
+  if(hintId>=0 && hintId<ref.count) {
+    const auto t=ref.triangles[hintId];
+    if(t.patch==patch) {
+      const auto ab=sub3(t.b,t.a),ac=sub3(t.c,t.a);
+      const float aa=dot3(ab,ab),bb=dot3(ab,ac),cc=dot3(ac,ac);
+      const float det=aa*cc-bb*bb;
+      if(det>1.e-24f) {
+        const auto ap=sub3(p,t.a);
+        const float x=(dot3(ap,ab)*cc-dot3(ap,ac)*bb)/det;
+        const float y=(dot3(ap,ac)*aa-dot3(ap,ab)*bb)/det;
+        if(x>1.e-4f && y>1.e-4f && x+y<.9999f) {
+          const auto hit=add3(t.a,add3(mul3(ab,x),mul3(ac,y)));
+          const auto d=sub3(hit,p);
+          if(dot3(d,d)<=tolerance*tolerance) {q=hit;return true;}
+        }
+      }
+    }
+  }
+  return projectReferenceHinted(ref,patch,p,q,hintId);
+}static __device__ __noinline__ bool referenceNearWithTolerance(ReferenceSurfaceGpu ref, int patch,
+                                                  float3 p, float tolerance) {
+  if (!ref.count) return true;
   const float radius2=tolerance*tolerance;
-  // Feasibility needs any source point inside the original tolerance, not
-  // the exact closest point. Prune with a conservative bound and stop at
-  // the first witness. The actual acceptance predicate is unchanged.
   const float bound=radius2+fmaxf(1.e-10f,radius2*1.e-5f);
   int node=0;
   while(node<(ref.nodeCount ? ref.nodeCount : 1)) {
@@ -173,13 +238,74 @@ static __device__ __noinline__ bool referenceNear(ReferenceSurfaceGpu ref, int p
     ++node;
   }
   return false;
+}static __device__ __noinline__ bool referenceNear(ReferenceSurfaceGpu ref, int patch,
+                                     float3 p) {
+  return referenceNearWithTolerance(ref, patch, p, toleranceAt(ref, p, patch));
+}
+static __device__ __noinline__ bool referenceFacePointsNear4(
+    ReferenceSurfaceGpu ref,int patch,const float3 (&p)[4],const float (&cachedSizing)[4],
+    int skipPoint=-1) {
+  if(!ref.count)return true;
+  float radius2[4],bound[4];
+  bool found[4]={skipPoint==0,skipPoint==1,skipPoint==2,skipPoint==3};
+#ifdef __CUDACC__
+#pragma unroll
+#endif
+  for(int i=0;i<4;++i) {
+    if(i==skipPoint){radius2[i]=0.f;bound[i]=0.f;continue;}
+    const float tolerance=(ref.sizingCount && cachedSizing[i]>=0.f)
+        ? fminf(ref.tolerance,.08f*cachedSizing[i]) : toleranceAt(ref,p[i],patch);
+    radius2[i]=tolerance*tolerance;
+    bound[i]=radius2[i]+fmaxf(1.e-10f,radius2[i]*1.e-5f);
+  }
+  int node=0;
+  while(node<(ref.nodeCount ? ref.nodeCount : 1)) {
+    int first=0,count=ref.count;
+    if(ref.nodeCount) {
+      const auto n=ref.nodes[node];
+      bool any=false;
+#ifdef __CUDACC__
+#pragma unroll
+#endif
+      for(int i=0;i<4;++i) if(!found[i] && boxDistance2(p[i],n)<=bound[i]) {any=true;break;}
+      if(!any){node=n.escape;continue;}
+      if(n.first<0){++node;continue;}
+      first=n.first;count=n.count;
+    }
+    for(int k=0;k<count;++k) {
+      const int id=ref.nodeCount ? ref.triangleIds[first+k] : k;
+      const auto t=ref.triangles[id];
+      if(t.patch!=patch)continue;
+#ifdef __CUDACC__
+#pragma unroll
+#endif
+      for(int i=0;i<4;++i) if(!found[i]) {
+        const auto d=sub3(closestTriangle(p[i],t),p[i]);
+        if(dot3(d,d)<=radius2[i])found[i]=true;
+      }
+      if(found[0]&&found[1]&&found[2]&&found[3])return true;
+    }
+    ++node;
+  }
+  return found[0]&&found[1]&&found[2]&&found[3];
+}static __device__ __noinline__ bool referenceFaceSafeCached(ReferenceSurfaceGpu ref,int patch,
+                                                             float3 a,float3 b,float3 c,
+                                                             float sizingAB,float sizingBC,float sizingCA) {
+  const float3 p[4]={mul3(add3(a,b),.5f),mul3(add3(b,c),.5f),mul3(add3(c,a),.5f),
+                     mul3(add3(add3(a,b),c),1.f/3.f)};
+  const float cached[4]={sizingAB,sizingBC,sizingCA,-1.f};
+  return referenceFacePointsNear4(ref,patch,p,cached);
+}
+static __device__ __noinline__ bool referenceChangedFaceSafeCached(
+    ReferenceSurfaceGpu ref,int patch,float3 a,float3 b,float3 c,int changedIndex,
+    float sizingAB,float sizingBC,float sizingCA) {
+  const float3 p[4]={mul3(add3(a,b),.5f),mul3(add3(b,c),.5f),mul3(add3(c,a),.5f),
+                     mul3(add3(add3(a,b),c),1.f/3.f)};
+  const float cached[4]={sizingAB,sizingBC,sizingCA,-1.f};
+  const int skipPoint=changedIndex==0?1:(changedIndex==1?2:0);
+  return referenceFacePointsNear4(ref,patch,p,cached,skipPoint);
 }
 static __device__ __noinline__ bool referenceFaceSafe(ReferenceSurfaceGpu ref,
-                                               int patch, float3 a, float3 b,
-                                               float3 c) {
-  return referenceNear(ref, patch, mul3(add3(a, b), .5f)) &&
-         referenceNear(ref, patch, mul3(add3(b, c), .5f)) &&
-         referenceNear(ref, patch, mul3(add3(c, a), .5f)) &&
-         referenceNear(ref, patch, mul3(add3(add3(a, b), c), 1.f / 3.f));
-}
-} // namespace cad_adaptive::gpu
+                                               int patch,float3 a,float3 b,float3 c) {
+  return referenceFaceSafeCached(ref,patch,a,b,c,-1.f,-1.f,-1.f);
+}} // namespace cad_adaptive::gpu

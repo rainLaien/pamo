@@ -2,6 +2,7 @@
 #include "cad_adaptive/RemeshMetrics.h"
 #ifdef CAD_ADAPTIVE_RXMESH
 #include "cad_adaptive/RxMeshBackend.h"
+#include "cad_adaptive/RawCudaRemesher.h"
 #endif
 #ifdef CAD_ADAPTIVE_GLOBAL_TOPOLOGY
 #include "cad_adaptive/global/GlobalSplitBackend.h"
@@ -44,7 +45,8 @@ int main(int argc, char **argv) {
               << "       --save-initial-mesh saves OUTPUT.ply.initial.ply before GPU iterations\n"
               << "       --detailed-diagnostics enables expensive per-smooth quality statistics\n"
               << "       --iters N sets remesh iteration count (default 20)\n"
-              << "       --workers N sets host batch workers (1..32); -Workers/-workers are accepted aliases\n";
+              << "       --workers N sets host batch workers (1..32); -Workers/-workers are accepted aliases\n"
+              << "       --raw-smooth-passes N, --raw-smooth-attempts N, --raw-collapse-passes N, --raw-flip-passes N tune raw GPU\n";
     return 2;
   }
   const bool grid = std::strcmp(argv[1], "--grid") == 0;
@@ -59,6 +61,7 @@ int main(int argc, char **argv) {
   float smoothLambda=0.5f;
   int iters = 20;
   int workers = 8;
+  int rawSmoothPasses=12,rawSmoothAttempts=3,rawCollapsePasses=8,rawFlipPasses=8;
   int splitPasses = 4;
   int collapsePasses = 8;
   float targetQualityP05 = 0.20f;
@@ -142,6 +145,14 @@ int main(int argc, char **argv) {
       flipIters = std::max(0, std::atoi(argv[++i]));
     else if (std::strcmp(argv[i], "--smooth-iters") == 0 && i + 1 < argc)
       smoothIters = std::max(0, std::atoi(argv[++i]));
+    else if (std::strcmp(argv[i], "--raw-smooth-passes") == 0 && i + 1 < argc)
+      rawSmoothPasses = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--raw-smooth-attempts") == 0 && i + 1 < argc)
+      rawSmoothAttempts = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--raw-collapse-passes") == 0 && i + 1 < argc)
+      rawCollapsePasses = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--raw-flip-passes") == 0 && i + 1 < argc)
+      rawFlipPasses = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--max-error") == 0 && i + 1 < argc)
       maxError = std::strtof(argv[++i], nullptr);
     else {
@@ -156,6 +167,8 @@ int main(int argc, char **argv) {
   if((forceLocalSizing && !useGlobal) || !std::isfinite(boundaryGradation) ||
      boundaryGradation<=0.0f || boundaryGradation>1.0f ||
      iters<1 || workers<1 || workers>32 || splitPasses<1 || collapsePasses<1 ||
+     rawSmoothPasses<1 || rawSmoothPasses>12 || rawSmoothAttempts<1 || rawSmoothAttempts>3 ||
+     rawCollapsePasses<1 || rawCollapsePasses>8 || rawFlipPasses<1 || rawFlipPasses>8 ||
      !std::isfinite(target) || target<0 || !std::isfinite(maxError) || maxError<0 ||
      !std::isfinite(cavityRatio) || cavityRatio<=4.0f/3.0f ||
      !std::isfinite(smoothLambda) || smoothLambda<0 || smoothLambda>1 ||
@@ -451,10 +464,19 @@ int main(int argc, char **argv) {
       std::cerr << "RXMesh GPU backend unavailable\n";
       return 1;
     }
-    RxMeshBackend backend;
-    ok = backend.remesh(mesh, cfg, report);
-    backendName = reference.patches.size()==1 && reference.patches[0].type==PatchType::Unknown
-        ? "gpu-raw-cuda" : "gpu-rxmesh";
+    const bool rawGpu=reference.patches.size()==1 && reference.patches[0].type==PatchType::Unknown;
+    if(rawGpu) {
+      RawCudaOptions rawOptions;
+      rawOptions.smoothPasses=rawSmoothPasses;
+      rawOptions.smoothAttempts=rawSmoothAttempts;
+      rawOptions.collapsePasses=rawCollapsePasses;
+      rawOptions.flipPasses=rawFlipPasses;
+      ok=remeshRawCuda(mesh,cfg,report,rawOptions);
+    } else {
+      RxMeshBackend backend;
+      ok=backend.remesh(mesh,cfg,report);
+    }
+    backendName=rawGpu?"gpu-raw-cuda":"gpu-rxmesh";
 #else
     std::cerr << "this binary was built without CAD_ADAPTIVE_RXMESH\n";
     return 1;
@@ -578,6 +600,9 @@ int main(int argc, char **argv) {
     return 1;
   }
   secondsSave=elapsed(saveStart);
+  if(!useGlobal) std::cout << "cli_post_timing final_validation=" << secondsFinalValidation
+                           << " final_audit=" << secondsFinalAudit
+                           << " save=" << secondsSave << '\n';
   std::string json = remeshReportJson(report);
   {
     std::ostringstream extra;

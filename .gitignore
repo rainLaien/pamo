@@ -3,6 +3,7 @@
 .venv/
 *obj
 *build*
+!experiments/rxmesh-remesh/tools/build_face_regions.py
 *egg*
 *.ply
 *.so

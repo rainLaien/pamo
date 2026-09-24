@@ -20,6 +20,33 @@ int main(){
   source=makeTwoPatchGrid(2,2,0,0,4,4);cfg.constantLength=.7f;cfg.maxIterations=2;
   CHECK(remeshRawCudaPatches(source,parallel,cfg,options,b,&error));
   CHECK(b.boundarySplits>0 && b.fallback==0 && b.boundariesHeld);
+  // Two distinct reference planes share one GPU task. Every output face must
+  // retain its CAD owner and remain on that owner's plane after all operators.
+  source=makeTwoPatchGrid(8,6,0,0,4,3);
+  source.patches[1].axis={-0.70710678f,0,0.70710678f};
+  for(int v=0;v<source.vertexCount();++v) {
+    auto p=source.position(v);
+    if(p.x>2) {p.z=p.x-2;source.setPosition(v,p);}
+  }
+  source.rebuildTopology();
+  options.patchesPerTask=2;cfg.constantLength=.55f;cfg.maxGeometryError=.05f;cfg.maxIterations=3;
+  CHECK(remeshRawCudaPatches(source,parallel,cfg,options,b,&error));
+  if(b.fallback)std::cerr<<"packed fallback: "<<b.patches[0].error
+    <<" geom="<<b.patches[0].report.geometryErrorMax
+    <<" locked="<<b.patches[0].report.movedLockedVertices<<'\n';
+  CHECK(b.patches.size()==1 && b.accepted==1 && b.fallback==0 && b.boundariesHeld);
+  int owner0=0,owner1=0;
+  for(int f=0;f<parallel.faceCount();++f) {
+    const auto patch=parallel.facePatchId[f];
+    CHECK(patch<2);
+    if(patch==0)++owner0;else ++owner1;
+    for(int k=0;k<3;++k) {
+      const auto p=parallel.facePoint(f,k);
+      CHECK_NEAR(p.z,patch==0?0.f:p.x-2.f,.051f);
+    }
+  }
+  CHECK(owner0>0 && owner1>0);
+  options.patchesPerTask=1;
   // A task exceeding its allocation cap retains valid source geometry and
   // reports fallback, rather than silently claiming it was remeshed.
   source=makeGrid(256,256,0,0,4,4,0);options.memoryBytes=16ull*1024*1024;

@@ -8,7 +8,8 @@ __global__ void compareSizing(ReferenceSurfaceGpu indexed,int *failures) {
   if(i>=4096)return;
   auto linear=indexed;linear.sizingNodeCount=0;
   const auto p=make_float3(float(i%32)*.23f-3.5f,float((i/32)%32)*.21f-3.2f,float(i/1024)*.3f);
-  if(sizingAt(indexed,p)!=sizingAt(linear,p))atomicAdd(failures,1);
+  for(int patch=0;patch<2;++patch)
+    if(sizingAt(indexed,p,patch)!=sizingAt(linear,p,patch))atomicAdd(failures,1);
 }
 
 __global__ void compareReferenceNear(ReferenceSurfaceGpu ref,int *failures) {
@@ -20,7 +21,7 @@ __global__ void compareReferenceNear(ReferenceSurfaceGpu ref,int *failures) {
   for(int patch=0;patch<3;++patch) {
     auto linear=ref;linear.nodeCount=0;
     float3 q;
-    const float tolerance=toleranceAt(ref,p);
+    const float tolerance=toleranceAt(ref,p,patch);
     const bool expected=projectReference(linear,patch,p,q) &&
                         dist2(p,q)<=tolerance*tolerance;
     if(referenceNear(ref,patch,p)!=expected)atomicAdd(failures,1);
@@ -41,7 +42,7 @@ int main() {
   Buffer<ReferenceTriangleGpu> reference(source);
   ReferenceSurfaceGpu ref{reference.p,1,2.f};ref.regularLength=1.f;
   DeviceMesh d(mesh,ref);auto m=d.view();Buffer<Vertex> proposed(3);
-  proposeProjection<<<1,128>>>(m,proposed.p,ref);sync();
+  proposeProjection<<<1,128>>>(m,proposed.p,ref,nullptr);sync();
   const auto unsafe=proposed.read();
   auto v=[](float3 p){return Vec3{p.x,p.y,p.z};};
   CHECK(triangleQuality(v(unsafe[0].p),v(unsafe[1].p),v(unsafe[2].p))==0);
@@ -77,7 +78,7 @@ int main() {
   for(int i=0;i<128;++i) {
     float3 a=make_float3(float(i%16)*.3f-2.f,float(i/16)*.4f-1.5f,0);
     float3 b=make_float3(a.x+.17f,a.y+.2f,.4f);
-    seeds.push_back({a,b,.2f+.001f*i});bounds.push_back({a,b,a,0});
+    seeds.push_back({a,b,.2f+.001f*i,i%2});bounds.push_back({a,b,a,i%2});
   }
   std::vector<ReferenceBvhNode> nodes;std::vector<int> ids;
   buildReferenceBvh(bounds,1.e-5f,nodes,ids);

@@ -64,6 +64,7 @@ void fillMeshMetrics(SemanticMesh &mesh, const RemeshConfig &config, RemeshRepor
 std::string remeshReportJson(const RemeshReport &r) {
   std::ostringstream o;
   o << "{\n"
+    << "  \"cycles_executed\": " << r.cyclesExecuted << ",\n"
     << "  \"splits\": " << r.splits << ",\n"
     << "  \"cavity_refines\": " << r.cavityRefines << ",\n"
     << "  \"collapses\": " << r.collapses << ",\n"

@@ -284,17 +284,34 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
         std::cerr << "[cad_adaptive rxmesh] CUDA sync failed at " << where << '\n';
       CUDA_ERROR(err);
     };
+    int device=0;
+    cudaDeviceProp deviceProps{};
+    CUDA_ERROR(cudaGetDevice(&device));
+    CUDA_ERROR(cudaGetDeviceProperties(&deviceProps,device));
+    auto checkLaunchResources=[&](const char *where,uint32_t dynamicBytes,const void *kernel) {
+      if(dynamicBytes+8192u<=deviceProps.sharedMemPerBlockOptin) return;
+      cudaFuncAttributes attributes{};
+      CUDA_ERROR(cudaFuncGetAttributes(&attributes,kernel));
+      if(dynamicBytes>uint32_t(attributes.maxDynamicSharedSizeBytes) ||
+         dynamicBytes+attributes.sharedSizeBytes>deviceProps.sharedMemPerBlockOptin)
+        throw std::runtime_error(std::string("RXMesh ")+where+" requires "+
+            std::to_string(dynamicBytes)+" bytes of dynamic shared memory; device/kernel limit is "+
+            std::to_string(std::min(size_t(attributes.maxDynamicSharedSizeBytes),
+                                    size_t(deviceProps.sharedMemPerBlockOptin-attributes.sharedSizeBytes))));
+    };
     auto tagPatchInterfaces = [&] {
       // for_each<Op> uses prepare_launch_box (static). After cavity/slice the
       // patches grow and that under-allocates shared memory (illegal access).
       constexpr uint32_t tagThreads = 256;
       rxmesh::LaunchBox<tagThreads> lb;
       rx.update_launch_box({rxmesh::Op::EF}, lb, (void *)tag_edge_patch_kernel<tagThreads>, false);
+      checkLaunchResources("tag_edge_patch",lb.smem_bytes_dyn,(void *)tag_edge_patch_kernel<tagThreads>);
       tag_edge_patch_kernel<tagThreads>
           <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(rx.get_context(), *edgePatch, *fp);
       syncCuda("tag_edge_patch");
       rx.update_launch_box({rxmesh::Op::EV}, lb, (void *)promote_seam_verts_kernel<tagThreads>,
-                           false);
+                            false);
+      checkLaunchResources("promote_seam_verts",lb.smem_bytes_dyn,(void *)promote_seam_verts_kernel<tagThreads>);
       promote_seam_verts_kernel<tagThreads>
           <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(rx.get_context(), *edgePatch, *cAttr);
       syncCuda("promote_seam_verts");
@@ -404,15 +421,18 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
         // separate query workspace here double-counts it and can push the
         // launch into a bad shared-memory configuration after patch growth.
         rx.update_launch_box({}, lb, (void *)edge_split_kernel<threads>, true,
-                             false, false, false, edgeMaskShmem);
+                              false, false, false, edgeMaskShmem);
+        checkLaunchResources("edge_split",lb.smem_bytes_dyn,(void *)edge_split_kernel<threads>);
+        const int acceptedBefore=*accepted;
         edge_split_kernel<threads><<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
             rx.get_context(), *coords, *sAttr, *cAttr, *vp, *fp, *edgePatch, *status, *boundary,
             *vDirty, *vTouched, splitRatio, accepted, candidates);
         syncCuda("edge_split");
+        const bool changed=*accepted>acceptedBefore;
         sliceAll<threads>(rx, coords.get(), sAttr.get(), cAttr.get(), vp.get(), fp.get(),
                           edgePatch.get(), status.get(), boundary.get(), scratch.get(),
                           valence.get(), vDirty.get(), vTouched.get());
-        projectSurfaceVerts();
+        if(changed) projectSurfaceVerts();
       }
       report.splitCandidates += *candidates;
       if (*accepted > 0) expandDirty2Ring();
@@ -432,15 +452,18 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
         }
         rxmesh::LaunchBox<threads> lb;
         rx.update_launch_box({rxmesh::Op::EVDiamond}, lb, (void *)edge_collapse_kernel<threads>,
-                             true, false, false, false, topologyMaskShmem);
+                              true, false, false, false, topologyMaskShmem);
+        checkLaunchResources("edge_collapse",lb.smem_bytes_dyn,(void *)edge_collapse_kernel<threads>);
+        const int acceptedBefore=*accepted;
         edge_collapse_kernel<threads><<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
             rx.get_context(), *coords, *sAttr, *cAttr, *vp, *fp, *edgePatch, *status, *boundary,
             *vDirty, *vTouched, collapseRatio, splitRatio, accepted, candidates);
         syncCuda("edge_collapse");
+        const bool changed=*accepted>acceptedBefore;
         sliceAll<threads>(rx, coords.get(), sAttr.get(), cAttr.get(), vp.get(), fp.get(),
                           edgePatch.get(), status.get(), boundary.get(), scratch.get(),
                           valence.get(), vDirty.get(), vTouched.get());
-        projectSurfaceVerts();
+        if(changed) projectSurfaceVerts();
       }
       report.collapseCandidates += *candidates;
       if (*accepted > 0) expandDirty2Ring();
@@ -467,7 +490,8 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
         }
         rxmesh::LaunchBox<threads> lb;
         rx.update_launch_box({rxmesh::Op::EVDiamond}, lb, (void *)edge_flip_kernel<threads>, true,
-                             false, false, false, topologyMaskShmem);
+                              false, false, false, topologyMaskShmem);
+        checkLaunchResources("edge_flip",lb.smem_bytes_dyn,(void *)edge_flip_kernel<threads>);
         edge_flip_kernel<threads><<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
             rx.get_context(), *coords, *valence, *sAttr, *cAttr, *vp, *fp, *edgePatch, *status,
             *boundary, *vDirty, *vTouched, accepted, candidates);
@@ -486,12 +510,13 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
 
     const int optimizeCycles = config.maxIterations;
     for (int it = 0; it < optimizeCycles; ++it) {
+      report.cyclesExecuted=it+1;
+      const int smoothBefore=report.smoothMoves;
       auto mark = std::chrono::steady_clock::now();
+      int splitCount=0;
       if (config.enableSplit) {
-        report.splits += runSplit();
-        rx.update_host();
-        if (!rx.validate())
-          throw std::runtime_error("RXMesh topology invalid immediately after split");
+        splitCount=runSplit();
+        report.splits += splitCount;
       }
       report.secondsSplit +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
@@ -500,9 +525,6 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       if (config.enableCollapse) {
         collapsed = runCollapse();
         report.collapses += collapsed;
-        rx.update_host();
-        if (!rx.validate())
-          throw std::runtime_error("RXMesh topology invalid immediately after collapse");
       }
       report.secondsCollapse +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
@@ -511,13 +533,10 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       if (config.enableFlip) {
         flipped = runFlip();
         report.flips += flipped;
-        rx.update_host();
-        if (!rx.validate())
-          throw std::runtime_error("RXMesh topology invalid immediately after flip");
       }
       report.secondsFlip +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
-      tagPatchInterfaces();
+      if(splitCount || collapsed || flipped) tagPatchInterfaces();
       mark = std::chrono::steady_clock::now();
       if (enableGpuSmooth) {
         const float lambda = config.smoothLambda;
@@ -539,13 +558,17 @@ bool RxMeshBackend::remesh(SemanticMesh &mesh, const RemeshConfig &config, Remes
       }
       report.secondsSmooth +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
-      rx.update_host();
-      if (!rx.validate()) throw std::runtime_error("RXMesh topology invalid after iteration");
+      if(splitCount==0 && collapsed==0 && flipped==0 && report.smoothMoves==smoothBefore)
+        break;
     }
     CUDA_ERROR(cudaFree(accepted));
     CUDA_ERROR(cudaFree(candidates));
     CUDA_ERROR(cudaFree(dPatches));
     exportMesh(rx, coords.get(), cAttr.get(), sAttr.get(), vp.get(), fp.get(), mesh, mesh);
+    // Dynamic topology edits only touch RXMesh's device representation. Keep
+    // the expensive full invariant check once at the synchronization/export
+    // boundary instead of once after every operator and again each cycle.
+    if (!rx.validate()) throw std::runtime_error("RXMesh topology invalid after remesh");
     std::string err;
     report.topologyValid = mesh.validate(&err);
     if (!report.topologyValid) std::cerr << "[cad_adaptive rxmesh] export: " << err << '\n';
