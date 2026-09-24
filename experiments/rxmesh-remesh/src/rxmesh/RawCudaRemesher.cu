@@ -400,8 +400,24 @@ __device__ bool changedFaceLengthSafe(MeshView m,Triangle t,int a,int b,float3 d
     if(edgeDist2>high*high*scale*scale)return false;
   }
   return true;
-}__global__ void splitVertices(MeshView m, Vertex *out, int *marked, float high,
-                              ReferenceSurfaceGpu ref) {
+}__device__ float splitEdgeQuality(MeshView m,Edge e,float3 splitPoint) {
+  float score=FLT_MAX;
+  for(int side=0;side<2;++side) {
+    const int f=side==0?e.f0:e.f1;
+    if(f<0)continue;
+    const auto face=m.f[f];
+    int opposite=-1;
+    for(int k=0;k<3;++k)if(face.v[k]!=e.a && face.v[k]!=e.b)
+      opposite=face.v[k];
+    if(opposite<0)continue;
+    const auto c=m.v[opposite].p;
+    score=fminf(score,qualityVcg(m.v[e.a].p,splitPoint,c));
+    score=fminf(score,qualityVcg(splitPoint,m.v[e.b].p,c));
+  }
+  return score;
+}
+__global__ void splitVertices(MeshView m, Vertex *out, int *marked, float high,
+                              ReferenceSurfaceGpu ref,bool optimizePoint) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < m.nv)
     out[i] = m.v[i];
@@ -409,13 +425,24 @@ __device__ bool changedFaceLengthSafe(MeshView m,Triangle t,int a,int b,float3 d
     return;
   auto e = m.e[i];
   const auto midpoint = mul3(add3(m.v[e.a].p, m.v[e.b].p), .5f);
-  const float target = sizingAt(ref, midpoint,m.f[e.f0].patch);
+  float target = sizingAt(ref, midpoint,m.f[e.f0].patch);
   high *= ref.sizingCount
               ? fminf(target, .5f * (m.v[e.a].target + m.v[e.b].target)) /
                     ref.regularLength
               : 1.f;
   marked[i] = !(m.freezeBoundary && (e.f1<0 || (e.feature && m.v[e.a].constraint>=4 && m.v[e.b].constraint>=4))) && dist2(m.v[e.a].p, m.v[e.b].p) > high * high;
-  out[m.nv + i] = {midpoint, e.feature ? 2 : 1, target};
+  float3 splitPoint=midpoint;
+  if(marked[i] && optimizePoint) {
+    float best=splitEdgeQuality(m,e,midpoint);
+    const float trials[4]={.35f,.425f,.575f,.65f};
+    for(float t:trials) {
+      const auto trial=add3(m.v[e.a].p,mul3(sub3(m.v[e.b].p,m.v[e.a].p),t));
+      const float score=splitEdgeQuality(m,e,trial);
+      if(score>best) {best=score;splitPoint=trial;}
+    }
+    target=sizingAt(ref,splitPoint,m.f[e.f0].patch);
+  }
+  out[m.nv + i] = {splitPoint, e.feature ? 2 : 1, target};
 }
 __global__ void splitFaces(MeshView m, const Vertex *verts, const int *marked,
                            Triangle *out) {
@@ -1355,27 +1382,35 @@ void compactRawVertices(SemanticMesh &mesh) {
   mesh = std::move(out);
 }
 __global__ void rejectSplitFaces(MeshView m,const Vertex *v,const Triangle *faces,
-                                  int *marked,ReferenceSurfaceGpu ref,int *bad) {
+                                  int *marked,ReferenceSurfaceGpu ref,int *bad,
+                                  float qualityRatio) {
   int f=blockIdx.x*blockDim.x+threadIdx.x;if(f>=m.nf)return;
   if(faces[4*f+1].v[0]<0)return;
+  const auto parent=m.f[f];
+  const float parentQuality=qualityVcg(m.v[parent.v[0]].p,m.v[parent.v[1]].p,
+                                        m.v[parent.v[2]].p);
   for(int q=0;q<4;++q) {
     auto t=faces[4*f+q];if(t.v[0]<0)continue;
     auto a=v[t.v[0]].p,b=v[t.v[1]].p,c=v[t.v[2]].p;
-    if(!(qualityVcg(a,b,c)>0) || !referenceFaceSafe(ref,t.patch,a,b,c)) {
+    const float childQuality=qualityVcg(a,b,c);
+    if(!(childQuality>0) ||
+       (qualityRatio>0 && childQuality<qualityRatio*parentQuality) ||
+       !referenceFaceSafe(ref,t.patch,a,b,c)) {
       atomicAdd(bad,1);
       for(int k=0;k<3;++k)atomicExch(marked+m.faceEdges[3*f+k],0);
       return;
     }
   }
 }
-int split(SemanticMesh &mesh, float h, float high, ReferenceSurfaceGpu ref,RemeshReport &report) {
+int split(SemanticMesh &mesh, float h, float high, ReferenceSurfaceGpu ref,
+          RemeshReport &report,bool optimizePoint,float splitQualityRatio) {
   DeviceMesh d(mesh, ref);
   auto m = d.view();
   Buffer<Vertex> v(m.nv + m.ne);
   Buffer<Triangle> f(4 * m.nf);
   Buffer<int> marked(m.ne);
-  splitVertices<<<(std::max(m.nv, m.ne) + 127) / 128, 128,0,executionStream>>>(m, v.p, marked.p,
-                                                             high, ref);
+  splitVertices<<<(std::max(m.nv, m.ne) + 127) / 128, 128,0,executionStream>>>(
+      m, v.p, marked.p,high, ref,optimizePoint);
   Buffer<int> bad(1);
   // Read/write split masks are separate: neighboring threads may cancel the
   // same edge, but never read a mask while another thread writes it.
@@ -1385,7 +1420,8 @@ int split(SemanticMesh &mesh, float h, float high, ReferenceSurfaceGpu ref,Remes
     splitFaces<<<(m.nf+127)/128,128,0,executionStream>>>(m,v.p,marked.p,f.p);
     checked(streamCopy(checkedMask.p,marked.p,m.ne*sizeof(int),cudaMemcpyDeviceToDevice));
     checked(streamZero(bad.p,0,sizeof(int)));
-    rejectSplitFaces<<<(m.nf+127)/128,128,0,executionStream>>>(m,v.p,f.p,checkedMask.p,ref,bad.p);
+    rejectSplitFaces<<<(m.nf+127)/128,128,0,executionStream>>>(
+        m,v.p,f.p,checkedMask.p,ref,bad.p,splitQualityRatio);
     sync();const int rejected=bad.read()[0];report.rejectError+=rejected;
     if(!rejected){stable=true;break;}
     checked(streamCopy(marked.p,checkedMask.p,m.ne*sizeof(int),cudaMemcpyDeviceToDevice));
@@ -1725,7 +1761,8 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
         options.smoothPasses < 1 || options.smoothPasses > 12 ||
         options.smoothAttempts < 1 || options.smoothAttempts > 3 ||
         options.collapsePasses < 1 || options.collapsePasses > 8 ||
-        options.flipPasses < 1 || options.flipPasses > 8)
+        options.flipPasses < 1 || options.flipPasses > 8 ||
+        !(options.splitQualityRatio>=0.f && options.splitQualityRatio<=1.f))
       throw std::runtime_error(
           "invalid raw CUDA sizing, error budget or iteration count");
     const auto setupFeatureStart=Clock::now();
@@ -1914,7 +1951,8 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       auto mark = Clock::now();
       stage="split";
       if (cfg.enableSplit) {
-        ns = split(mesh, h, cfg.splitRatio * h, ref,report);
+        ns = split(mesh, h, cfg.splitRatio * h, ref,report,
+                   options.optimizeSplitPoint,options.splitQualityRatio);
         report.splits += ns;
         report.splitCandidates += ns;
         validate();

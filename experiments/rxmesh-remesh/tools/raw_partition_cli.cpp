@@ -103,6 +103,7 @@ int main(int argc,char **argv) {
        <<",\n  \"accepted\": "<<report.accepted
        <<",\n  \"unchanged\": "<<report.unchanged<<",\n  \"fallback\": "<<report.fallback
        <<",\n  \"uniform_regions\": "<<report.uniformRegions
+       <<",\n  \"quality_split_regions\": "<<report.qualitySplitRegions
        <<",\n  \"retried\": "<<report.retried
        <<",\n  \"seam_repairs\": "<<report.seamRepairs
        <<",\n  \"seam_split_repairs\": "<<report.seamSplitRepairs
@@ -113,12 +114,15 @@ int main(int argc,char **argv) {
       out<<(i?",\n":"\n")<<"    {\"id\": "<<i<<", \"accepted\": "<<(p.accepted?"true":"false")
          <<", \"unchanged\": "<<(p.unchanged?"true":"false")
          <<", \"uniform_sizing\": "<<(p.uniformSizing?"true":"false")
+         <<", \"quality_split\": "<<(p.qualitySplit?"true":"false")
          <<", \"retried\": "<<(p.retried?"true":"false")
          <<", \"input_faces\": "<<p.inputFaces<<", \"output_faces\": "<<p.outputFaces
          <<", \"input_quality_mean\": "<<p.inputQualityMean
          <<", \"input_quality_p05\": "<<p.inputQualityP05
          <<", \"output_quality_mean\": "<<p.report.qualityMean
          <<", \"output_quality_p05\": "<<p.report.qualityP05
+         <<", \"sizing_error_mean\": "<<p.report.sizingErrorMean
+         <<", \"sizing_error_p95\": "<<p.report.sizingErrorP95
          <<", \"cycles_executed\": "<<p.report.cyclesExecuted
          <<", \"recovered_cycle_failures\": "<<p.report.recoveredCycleFailures
          <<", \"selected_cycle\": "<<p.report.selectedCycle
@@ -147,7 +151,7 @@ int main(int argc,char **argv) {
     if(!output.save(argv[2],&error))throw std::runtime_error(error);
     std::cout<<"raw_batch_timing load_s="<<loadSeconds<<" batch_s="<<(remeshEnd-loadSeconds)
              <<" save_and_report_s="<<(elapsed()-remeshEnd)<<'\n';
-    std::cout<<"raw_batch seconds="<<report.seconds<<" patches_per_task="<<report.patchesPerTask<<" accepted="<<report.accepted<<" unchanged="<<report.unchanged<<" uniform="<<report.uniformRegions<<" fallback="<<report.fallback<<" retried="<<report.retried
+    std::cout<<"raw_batch seconds="<<report.seconds<<" patches_per_task="<<report.patchesPerTask<<" accepted="<<report.accepted<<" unchanged="<<report.unchanged<<" uniform="<<report.uniformRegions<<" quality_split="<<report.qualitySplitRegions<<" fallback="<<report.fallback<<" retried="<<report.retried
              <<" peak_active="<<report.peakActive<<" vertices="<<output.vertexCount()<<" faces="<<output.faceCount()<<'\n';
     if(report.fallback)return 3;
     if(!qualityImproved){std::cerr<<"output mesh quality regressed\n";return 4;}

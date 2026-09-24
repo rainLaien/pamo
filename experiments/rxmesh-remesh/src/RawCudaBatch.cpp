@@ -82,7 +82,7 @@ int AutoPartitionSinglePatch(SemanticMesh &mesh,int requestedPartitions) {
 }
 struct Job {
   int id=0,firstPatch=0,patchCount=0; double cost=0; size_t bytes=0;
-  bool succeeded=false,unchanged=false,uniformSizing=false;
+  bool succeeded=false,unchanged=false,uniformSizing=false,qualitySplit=false;
   float qualityMeanFloor=0,qualityP05Floor=0;
   std::vector<int> faces;
   SemanticMesh output;
@@ -239,17 +239,19 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       RawCudaOptions uniformOptions=options;
       std::string uniformError;
       uniformOptions.error=&uniformError;
+      uniformOptions.collapsePasses=1;
+      uniformOptions.qualityMeanFloor=localQualityFloor.first*1.01f;
+      uniformOptions.qualityP05Floor=localQualityFloor.second*.99f;
       RemeshReport uniformReport;
       SemanticMesh uniformMesh=uniformSource;
       bool uniformOk=remeshRawCuda(uniformMesh,uniformConfig,uniformReport,uniformOptions);
       auto uniformQuality=uniformOk?qualitySummary(uniformMesh):std::pair<float,float>{0.f,0.f};
       if(!(uniformOk && uniformReport.selectedCycle>=0 &&
-           uniformQuality.first+1.e-6f>=localQualityFloor.first &&
-           uniformQuality.second+1.e-6f>=localQualityFloor.second)) {
+           uniformQuality.first+1.e-6f>=uniformOptions.qualityMeanFloor &&
+           uniformQuality.second+1.e-6f>=uniformOptions.qualityP05Floor)) {
         uniformMesh=std::move(uniformSource);
-        uniformOptions.collapsePasses=1;
-        uniformOptions.qualityMeanFloor=localQualityFloor.first*1.01f;
-        uniformOptions.qualityP05Floor=localQualityFloor.second*.99f;
+        uniformOptions=options;
+        uniformOptions.error=&uniformError;
         uniformOk=remeshRawCuda(uniformMesh,uniformConfig,uniformReport,uniformOptions);
         uniformQuality=uniformOk?qualitySummary(uniformMesh):std::pair<float,float>{0.f,0.f};
       }
@@ -261,6 +263,30 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
         result.uniformSizing=true;
         result.error.clear();
         improved=true;
+      }
+    }
+    if(!improved && initialOk && requireQualityImprovement) {
+      result.retried=true;
+      SemanticMesh splitMesh=local;
+      RemeshConfig splitConfig=config;
+      splitConfig.maxIterations=std::min(config.maxIterations,8);
+      RawCudaOptions splitOptions=options;
+      splitOptions.optimizeSplitPoint=true;
+      splitOptions.splitQualityRatio=.5f;
+      std::string splitError;
+      splitOptions.error=&splitError;
+      RemeshReport splitReport;
+      if(remeshRawCuda(splitMesh,splitConfig,splitReport,splitOptions)) {
+        const auto splitQuality=qualitySummary(splitMesh);
+        if(splitReport.selectedCycle>=0 &&
+           splitQuality.first+1.e-6f>=localQualityFloor.first &&
+           splitQuality.second+1.e-6f>=localQualityFloor.second) {
+          local=std::move(splitMesh);
+          result.report=splitReport;
+          result.qualitySplit=true;
+          result.error.clear();
+          improved=true;
+        }
       }
     }
     if(!improved && initialOk &&
@@ -293,6 +319,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     if(!required.empty())throw std::runtime_error("missing patch boundary edge");
     result.outputFaces=local.faceCount();result.accepted=true;job.succeeded=true;
     job.unchanged=result.unchanged;job.uniformSizing=result.uniformSizing;
+    job.qualitySplit=result.qualitySplit;
     job.output=std::move(local);
   } catch(const std::exception &e) {result.error=e.what();result.outputFaces=result.inputFaces;}
   if(!result.accepted && job.patchCount>1) {
@@ -435,6 +462,7 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
       ++report.accepted;
       report.unchanged+=int(job.unchanged);
       report.uniformRegions+=int(job.uniformSizing);
+      report.qualitySplitRegions+=int(job.qualitySplit);
       for(int &alias:job.aliases)if(alias>=source.vertexCount())alias=-1;
       for(int v=0;v<job.output.vertexCount();++v)if(job.aliases[v]<0)
         job.aliases[v]=merged.addVertex(job.output.position(v),job.firstPatch+job.output.vertexPatchId[v],VertexConstraint(job.output.vertexConstraint[v]));
@@ -450,7 +478,8 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
       for(int v=0;v<source.vertexCount();++v)
         merged.addVertex(source.position(v),source.vertexPatchId[v],VertexConstraint(source.vertexConstraint[v]));
       for(auto &h:merged.targetLength)h=cfg.constantLength;
-      faceOwner.clear();report.accepted=report.unchanged=report.uniformRegions=report.fallback=0;
+      faceOwner.clear();report.accepted=report.unchanged=report.uniformRegions=
+          report.qualitySplitRegions=report.fallback=0;
       for(auto &job:jobs)appendJob(job);
       merged.rebuildTopology();
       std::set<uint64_t> outputSeams;

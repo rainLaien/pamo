@@ -13,6 +13,8 @@ struct RawCudaOptions {
   int smoothAttempts=3;
   int collapsePasses=8, flipPasses=8;
   bool strictFlipQuality=true;
+  bool optimizeSplitPoint=false;
+  float splitQualityRatio=0.f;
   float qualityMeanFloor=0,qualityP05Floor=0;
   size_t workspaceBytes=0; // 0: unlimited; includes cached device buffers
 };
