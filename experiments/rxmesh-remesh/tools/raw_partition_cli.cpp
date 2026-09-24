@@ -115,6 +115,7 @@ int main(int argc,char **argv) {
          <<", \"unchanged\": "<<(p.unchanged?"true":"false")
          <<", \"uniform_sizing\": "<<(p.uniformSizing?"true":"false")
          <<", \"quality_split\": "<<(p.qualitySplit?"true":"false")
+         <<", \"quality_split_ratio\": "<<p.qualitySplitRatio
          <<", \"retried\": "<<(p.retried?"true":"false")
          <<", \"input_faces\": "<<p.inputFaces<<", \"output_faces\": "<<p.outputFaces
          <<", \"input_quality_mean\": "<<p.inputQualityMean
@@ -127,6 +128,11 @@ int main(int argc,char **argv) {
          <<", \"recovered_cycle_failures\": "<<p.report.recoveredCycleFailures
          <<", \"selected_cycle\": "<<p.report.selectedCycle
          <<", \"seconds\": "<<p.seconds<<", \"workspace_bytes\": "<<p.workspaceBytes
+         <<", \"seconds_initial\": "<<p.secondsInitial
+         <<", \"seconds_gentle\": "<<p.secondsGentle
+         <<", \"seconds_uniform_gentle\": "<<p.secondsUniformGentle
+         <<", \"seconds_uniform_strict\": "<<p.secondsUniformStrict
+         <<", \"seconds_quality_split\": "<<p.secondsQualitySplit
          <<", \"seconds_setup\": "<<p.report.secondsSetup
          <<", \"seconds_split\": "<<p.report.secondsSplit
          <<", \"seconds_collapse\": "<<p.report.secondsCollapse

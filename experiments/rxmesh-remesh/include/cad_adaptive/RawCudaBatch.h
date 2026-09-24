@@ -18,11 +18,14 @@ struct RawPatchResult {
   bool unchanged=false; // Valid source geometry retained after quality-gated attempts.
   bool uniformSizing=false; // Curvature sizing failed; uniform interior sizing succeeded.
   bool qualitySplit=false; // Alternate interior edge point and split quality gate succeeded.
+  float qualitySplitRatio=0;
   bool retried=false;
   size_t workspaceBytes=0;
   int inputFaces=0,outputFaces=0;
   float inputQualityMean=0,inputQualityP05=0;
   double seconds=0;
+  double secondsInitial=0,secondsGentle=0;
+  double secondsUniformGentle=0,secondsUniformStrict=0,secondsQualitySplit=0;
   std::string error;
   std::string retryReason;
   RemeshReport report;

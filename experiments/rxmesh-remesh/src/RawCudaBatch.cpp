@@ -192,7 +192,10 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     RawCudaOptions options;options.independentStream=true;options.quiet=true;options.error=&result.error;options.freezeBoundary=hasSharedOrOpenBoundary;options.stopWhenIdle=stopWhenIdle;options.smoothPasses=smoothPasses;options.collapsePasses=collapsePasses;options.flipPasses=flipPasses;options.strictFlipQuality=strictFlipQuality;options.workspaceBytes=job.bytes;options.qualityMeanFloor=localQualityFloor.first;options.qualityP05Floor=localQualityFloor.second;
     SemanticMesh initialLocal;
     if(requireQualityImprovement && collapsePasses>1)initialLocal=local;
+    auto phaseStart=Clock::now();
     const bool initialOk=remeshRawCuda(local,config,result.report,options);
+    result.secondsInitial=std::chrono::duration<double>(Clock::now()-phaseStart).count();
+    const float initialSizingP95=result.report.sizingErrorP95;
     const auto initialQuality=initialOk?qualitySummary(local):std::pair<float,float>{0.f,0.f};
     bool improved=initialOk && (!requireQualityImprovement ||
         (result.report.selectedCycle>=0 &&
@@ -212,6 +215,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       RemeshConfig retryConfig=config;
       retryConfig.maxIterations=std::min(config.maxIterations,8);
       RemeshReport retryReport;
+      phaseStart=Clock::now();
       if(remeshRawCuda(initialLocal,retryConfig,retryReport,retryOptions)) {
         const auto retryQuality=qualitySummary(initialLocal);
         if(retryReport.selectedCycle>=0 &&
@@ -223,6 +227,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
           improved=true;
         }
       }
+      result.secondsGentle=std::chrono::duration<double>(Clock::now()-phaseStart).count();
       if(!improved && !retryError.empty())result.error=retryError;
     }
     if(!improved && initialOk && requireQualityImprovement &&
@@ -244,7 +249,9 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       uniformOptions.qualityP05Floor=localQualityFloor.second*.99f;
       RemeshReport uniformReport;
       SemanticMesh uniformMesh=uniformSource;
+      phaseStart=Clock::now();
       bool uniformOk=remeshRawCuda(uniformMesh,uniformConfig,uniformReport,uniformOptions);
+      result.secondsUniformGentle=std::chrono::duration<double>(Clock::now()-phaseStart).count();
       auto uniformQuality=uniformOk?qualitySummary(uniformMesh):std::pair<float,float>{0.f,0.f};
       if(!(uniformOk && uniformReport.selectedCycle>=0 &&
            uniformQuality.first+1.e-6f>=uniformOptions.qualityMeanFloor &&
@@ -252,7 +259,9 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
         uniformMesh=std::move(uniformSource);
         uniformOptions=options;
         uniformOptions.error=&uniformError;
+        phaseStart=Clock::now();
         uniformOk=remeshRawCuda(uniformMesh,uniformConfig,uniformReport,uniformOptions);
+        result.secondsUniformStrict=std::chrono::duration<double>(Clock::now()-phaseStart).count();
         uniformQuality=uniformOk?qualitySummary(uniformMesh):std::pair<float,float>{0.f,0.f};
       }
       if(uniformOk && uniformReport.selectedCycle>=0 &&
@@ -267,23 +276,31 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     }
     if(!improved && initialOk && requireQualityImprovement) {
       result.retried=true;
-      SemanticMesh splitMesh=local;
       RemeshConfig splitConfig=config;
       splitConfig.maxIterations=std::min(config.maxIterations,8);
+      SemanticMesh splitMesh=local;
       RawCudaOptions splitOptions=options;
       splitOptions.optimizeSplitPoint=true;
-      splitOptions.splitQualityRatio=.5f;
+      // A region with a stronger input lower tail can tolerate a more
+      // permissive intermediate split; the final region and sizing gates
+      // still require non-regression before accepting the result.
+      splitOptions.splitQualityRatio=localQualityFloor.second>.04f?.6f:.65f;
       std::string splitError;
       splitOptions.error=&splitError;
       RemeshReport splitReport;
-      if(remeshRawCuda(splitMesh,splitConfig,splitReport,splitOptions)) {
+      phaseStart=Clock::now();
+      const bool splitOk=remeshRawCuda(splitMesh,splitConfig,splitReport,splitOptions);
+      result.secondsQualitySplit+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
+      if(splitOk) {
         const auto splitQuality=qualitySummary(splitMesh);
         if(splitReport.selectedCycle>=0 &&
            splitQuality.first+1.e-6f>=localQualityFloor.first &&
-           splitQuality.second+1.e-6f>=localQualityFloor.second) {
+           splitQuality.second+1.e-6f>=localQualityFloor.second &&
+           splitReport.sizingErrorP95<=initialSizingP95+1.e-5f) {
           local=std::move(splitMesh);
           result.report=splitReport;
           result.qualitySplit=true;
+          result.qualitySplitRatio=splitOptions.splitQualityRatio;
           result.error.clear();
           improved=true;
         }
