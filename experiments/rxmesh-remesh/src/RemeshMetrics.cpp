@@ -47,9 +47,9 @@ void fillMeshMetrics(SemanticMesh &mesh, const RemeshConfig &config, RemeshRepor
   std::sort(sizing.begin(), sizing.end());
   if (!qualities.empty()) {
     report.qualityMin = qmin;
-    float s = 0;
+    double s = 0;
     for (float q : qualities) s += q;
-    report.qualityMean = s / float(qualities.size());
+    report.qualityMean = float(s / double(qualities.size()));
     report.qualityP05 = qualities[std::min(qualities.size() - 1, qualities.size() / 20)];
   }
   if (!sizing.empty()) {

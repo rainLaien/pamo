@@ -81,7 +81,8 @@ int AutoPartitionSinglePatch(SemanticMesh &mesh,int requestedPartitions) {
   return partitions;
 }
 struct Job {
-  int id=0,firstPatch=0,patchCount=0; double cost=0; size_t bytes=0; bool succeeded=false;
+  int id=0,firstPatch=0,patchCount=0; double cost=0; size_t bytes=0;
+  bool succeeded=false,unchanged=false,uniformSizing=false;
   float qualityMeanFloor=0,qualityP05Floor=0;
   std::vector<int> faces;
   SemanticMesh output;
@@ -179,6 +180,8 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     local.rebuildTopology();
     const auto localQualityFloor=requireQualityImprovement?qualitySummary(local):
         std::pair<float,float>{0.f,0.f};
+    result.inputQualityMean=localQualityFloor.first;
+    result.inputQualityP05=localQualityFloor.second;
     job.qualityMeanFloor=localQualityFloor.first;
     job.qualityP05Floor=localQualityFloor.second;
     std::set<uint64_t> required;
@@ -187,10 +190,90 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     const bool hasSharedOrOpenBoundary=source.patches.size()>1 ||
         std::any_of(source.edges.begin(),source.edges.end(),[](const EdgeRec &e){return (e.flags&EdgeMeshBoundary)!=0;});
     RawCudaOptions options;options.independentStream=true;options.quiet=true;options.error=&result.error;options.freezeBoundary=hasSharedOrOpenBoundary;options.stopWhenIdle=stopWhenIdle;options.smoothPasses=smoothPasses;options.collapsePasses=collapsePasses;options.flipPasses=flipPasses;options.strictFlipQuality=strictFlipQuality;options.workspaceBytes=job.bytes;options.qualityMeanFloor=localQualityFloor.first;options.qualityP05Floor=localQualityFloor.second;
-    if(!remeshRawCuda(local,config,result.report,options))throw std::runtime_error(result.error.empty()?"raw CUDA task failed":result.error);
-    if(result.report.qualityMean+1.e-6f<localQualityFloor.first ||
-       result.report.qualityP05+1.e-6f<localQualityFloor.second)
-      throw std::runtime_error("local quality below its input floor");
+    SemanticMesh initialLocal;
+    if(requireQualityImprovement && collapsePasses>1)initialLocal=local;
+    const bool initialOk=remeshRawCuda(local,config,result.report,options);
+    const auto initialQuality=initialOk?qualitySummary(local):std::pair<float,float>{0.f,0.f};
+    bool improved=initialOk && (!requireQualityImprovement ||
+        (result.report.selectedCycle>=0 &&
+         initialQuality.first+1.e-6f>=localQualityFloor.first &&
+         initialQuality.second+1.e-6f>=localQualityFloor.second));
+    if(!improved && requireQualityImprovement && collapsePasses>1) {
+      result.retried=true;
+      result.retryReason=initialOk?"no cycle improved both local quality metrics":result.error;
+      std::string retryError;
+      RawCudaOptions retryOptions=options;
+      retryOptions.error=&retryError;
+      retryOptions.collapsePasses=1;
+      // A small lower-tail tradeoff is allowed only with a substantial mean
+      // gain. The full output still has to pass its global quality gate.
+      retryOptions.qualityMeanFloor=localQualityFloor.first*1.01f;
+      retryOptions.qualityP05Floor=localQualityFloor.second*.99f;
+      RemeshConfig retryConfig=config;
+      retryConfig.maxIterations=std::min(config.maxIterations,8);
+      RemeshReport retryReport;
+      if(remeshRawCuda(initialLocal,retryConfig,retryReport,retryOptions)) {
+        const auto retryQuality=qualitySummary(initialLocal);
+        if(retryReport.selectedCycle>=0 &&
+           retryQuality.first+1.e-6f>=retryOptions.qualityMeanFloor &&
+           retryQuality.second+1.e-6f>=retryOptions.qualityP05Floor) {
+          local=std::move(initialLocal);
+          result.report=retryReport;
+          result.error.clear();
+          improved=true;
+        }
+      }
+      if(!improved && !retryError.empty())result.error=retryError;
+    }
+    if(!improved && initialOk && requireQualityImprovement &&
+       config.featureEdgeLength>0.f) {
+      // Crease-rich regions can accumulate slivers under curvature sizing.
+      // The source's hard feature edges and frozen seam stay unchanged while
+      // only the interior sizing field is switched to uniform.
+      result.retried=true;
+      RemeshConfig uniformConfig=config;
+      uniformConfig.featureEdgeLength=0.f;
+      uniformConfig.featureBand=0.f;
+      uniformConfig.maxIterations=std::min(config.maxIterations,8);
+      SemanticMesh uniformSource=local;
+      RawCudaOptions uniformOptions=options;
+      std::string uniformError;
+      uniformOptions.error=&uniformError;
+      RemeshReport uniformReport;
+      SemanticMesh uniformMesh=uniformSource;
+      bool uniformOk=remeshRawCuda(uniformMesh,uniformConfig,uniformReport,uniformOptions);
+      auto uniformQuality=uniformOk?qualitySummary(uniformMesh):std::pair<float,float>{0.f,0.f};
+      if(!(uniformOk && uniformReport.selectedCycle>=0 &&
+           uniformQuality.first+1.e-6f>=localQualityFloor.first &&
+           uniformQuality.second+1.e-6f>=localQualityFloor.second)) {
+        uniformMesh=std::move(uniformSource);
+        uniformOptions.collapsePasses=1;
+        uniformOptions.qualityMeanFloor=localQualityFloor.first*1.01f;
+        uniformOptions.qualityP05Floor=localQualityFloor.second*.99f;
+        uniformOk=remeshRawCuda(uniformMesh,uniformConfig,uniformReport,uniformOptions);
+        uniformQuality=uniformOk?qualitySummary(uniformMesh):std::pair<float,float>{0.f,0.f};
+      }
+      if(uniformOk && uniformReport.selectedCycle>=0 &&
+         uniformQuality.first+1.e-6f>=uniformOptions.qualityMeanFloor &&
+         uniformQuality.second+1.e-6f>=uniformOptions.qualityP05Floor) {
+        local=std::move(uniformMesh);
+        result.report=uniformReport;
+        result.uniformSizing=true;
+        result.error.clear();
+        improved=true;
+      }
+    }
+    if(!improved && initialOk &&
+       initialQuality.first+1.e-6f>=localQualityFloor.first &&
+       initialQuality.second+1.e-6f>=localQualityFloor.second) {
+      // The input itself passed the quality and geometry gates. Keep this
+      // outcome visible as unchanged rather than calling it an improvement.
+      result.unchanged=true;
+      result.error.clear();
+      improved=true;
+    }
+    if(!improved)throw std::runtime_error(result.error.empty()?
+        "no GPU cycle met the local quality gate":result.error);
     std::string topologyError;
     if(!local.validate(&topologyError))throw std::runtime_error("task topology: "+topologyError);
     job.aliases.assign(local.vertexCount(),-1);
@@ -208,7 +291,9 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       if(a<0 || b<0 || !required.erase(edgeKey(a,b)))throw std::runtime_error("unexpected patch boundary");
     }
     if(!required.empty())throw std::runtime_error("missing patch boundary edge");
-    result.outputFaces=local.faceCount();result.accepted=true;job.succeeded=true;job.output=std::move(local);
+    result.outputFaces=local.faceCount();result.accepted=true;job.succeeded=true;
+    job.unchanged=result.unchanged;job.uniformSizing=result.uniformSizing;
+    job.output=std::move(local);
   } catch(const std::exception &e) {result.error=e.what();result.outputFaces=result.inputFaces;}
   if(!result.accepted && job.patchCount>1) {
     result.retried=true;
@@ -348,6 +433,8 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
         return;
       }
       ++report.accepted;
+      report.unchanged+=int(job.unchanged);
+      report.uniformRegions+=int(job.uniformSizing);
       for(int &alias:job.aliases)if(alias>=source.vertexCount())alias=-1;
       for(int v=0;v<job.output.vertexCount();++v)if(job.aliases[v]<0)
         job.aliases[v]=merged.addVertex(job.output.position(v),job.firstPatch+job.output.vertexPatchId[v],VertexConstraint(job.output.vertexConstraint[v]));
@@ -363,7 +450,7 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
       for(int v=0;v<source.vertexCount();++v)
         merged.addVertex(source.position(v),source.vertexPatchId[v],VertexConstraint(source.vertexConstraint[v]));
       for(auto &h:merged.targetLength)h=cfg.constantLength;
-      faceOwner.clear();report.accepted=report.fallback=0;
+      faceOwner.clear();report.accepted=report.unchanged=report.uniformRegions=report.fallback=0;
       for(auto &job:jobs)appendJob(job);
       merged.rebuildTopology();
       std::set<uint64_t> outputSeams;
