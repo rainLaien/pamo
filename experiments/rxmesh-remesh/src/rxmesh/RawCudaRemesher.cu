@@ -1929,14 +1929,18 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
     float bestMean=-1,bestP05=-1;
     auto considerBest=[&](int selected) {
       const auto [mean,p05]=qualitySummary(mesh);
-      if(mean+1.e-6f<options.qualityMeanFloor || p05+1.e-6f<options.qualityP05Floor)return;
+      if(mean+1.e-6f<options.qualityMeanFloor || p05+1.e-6f<options.qualityP05Floor)
+        return std::pair<float,float>{mean,p05};
       if(bestP05>=0 && (p05<bestP05-1.e-6f ||
-                         (std::abs(p05-bestP05)<=1.e-6f && mean<=bestMean)))return;
+                         (std::abs(p05-bestP05)<=1.e-6f && mean<=bestMean)))
+        return std::pair<float,float>{mean,p05};
       bestMesh=mesh;bestMean=mean;bestP05=p05;report.selectedCycle=selected;
+      return std::pair<float,float>{mean,p05};
     };
     const bool trackQuality=options.freezeBoundary &&
         (options.qualityMeanFloor>0.f || options.qualityP05Floor>0.f);
     if(trackQuality)considerBest(-1);
+    int severeQualityStallCycles=0;
     for (int cycle = 0; cycle < cfg.maxIterations; ++cycle) {
       // A late topology failure must not discard all earlier valid cycles of
       // a frozen-boundary region. The source boundary identity is unchanged.
@@ -2032,7 +2036,22 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       validate();
       report.secondsSmooth +=
           std::chrono::duration<double>(Clock::now() - mark).count();
-      if(trackQuality)considerBest(cycle);
+      if(trackQuality) {
+        const auto [cycleMean,cycleP05]=considerBest(cycle);
+        if(cycleMean<.75f*options.qualityMeanFloor &&
+           cycleP05<.01f*options.qualityP05Floor)
+          ++severeQualityStallCycles;
+        else
+          severeQualityStallCycles=0;
+        // A region with both metrics far below its input for several full
+        // cycles is not recovering. Preserve the best accepted mesh and let
+        // the batch controller try its next sizing/split strategy.
+        if(severeQualityStallCycles>=3) {
+          if(!options.quiet)std::cout<<"raw_quality_stall_stop cycle="<<cycle
+                                     <<" mean="<<cycleMean<<" p05="<<cycleP05<<std::endl;
+          break;
+        }
+      }
       if(!options.quiet) std::cout << "raw_gpu_cycle=" << cycle << " faces=" << mesh.faceCount()
                  << " split=" << ns << " collapse=" << nc << " flip=" << nf
                  << " smooth=" << nm << std::endl;
