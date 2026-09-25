@@ -12,9 +12,36 @@ import numpy as np
 
 def build(source: Path, destination: Path, regions: int) -> dict:
     from_stl = source.suffix.lower() == ".stl"
+    removed_degenerate_faces = 0
     if from_stl:
         import trimesh
         mesh = trimesh.load(source, force="mesh", process=True)
+        # STL exporters occasionally emit zero-area triangles (often with two
+        # identical vertex indices). They are not surface geometry and can
+        # make an otherwise manifold shell look non-manifold after welding.
+        valid_area = np.isfinite(mesh.area_faces) & (mesh.area_faces > 0.0)
+        removed_degenerate_faces = int(len(mesh.faces) - np.count_nonzero(valid_area))
+        if removed_degenerate_faces:
+            mesh.update_faces(valid_area)
+            mesh.remove_unreferenced_vertices()
+        # A few STL exports contain tiny detached triangles that touch the
+        # main shell along an edge with four incident faces. Keep the sheets
+        # topologically separate (duplicated vertices) and pack those tiny
+        # faces into a nearby main region instead of sending them through the
+        # expensive CAD recognizer or making a one-face compute region.
+        components = sorted(mesh.split(only_watertight=False),
+                            key=lambda component: len(component.faces), reverse=True)
+        if len(components) > 1:
+            main_components = [component for component in components
+                               if len(component.faces) >= 1024]
+            small_components = [component for component in components
+                                if len(component.faces) < 1024]
+            if len(main_components) != 1:
+                raise ValueError("STL has multiple large disconnected components; use CAD partitioning")
+            main_faces = len(main_components[0].faces)
+            mesh = trimesh.util.concatenate(main_components + small_components)
+        else:
+            main_faces = len(mesh.faces)
         nv, nf = len(mesh.vertices), len(mesh.faces)
         source_patches, ne = 1, 0
         vertex_bytes = np.asarray(mesh.vertices, dtype="<f8").tobytes()
@@ -51,7 +78,8 @@ def build(source: Path, destination: Path, regions: int) -> dict:
         if stream.read(1):
             raise ValueError("trailing snapshot data")
 
-    if not 1 <= regions <= nf // 1024:
+    partition_faces = main_faces if from_stl else nf
+    if not 1 <= regions <= partition_faces // 1024:
         raise ValueError("each requested region must have at least 1024 faces")
 
     vertices = np.frombuffer(vertex_bytes, dtype="<f8").reshape(nv, 3)
@@ -86,14 +114,14 @@ def build(source: Path, destination: Path, regions: int) -> dict:
 
     centers = (vertices[triangle[:, 0]] + vertices[triangle[:, 1]] +
                vertices[triangle[:, 2]]) / 3.0
-    mid = (centers.min(axis=0) + centers.max(axis=0)) * 0.5
-    seeds = [int(np.argmax(np.sum((centers - mid) ** 2, axis=1)))]
-    nearest = np.full(nf, np.inf)
+    mid = (centers[:partition_faces].min(axis=0) + centers[:partition_faces].max(axis=0)) * 0.5
+    seeds = [int(np.argmax(np.sum((centers[:partition_faces] - mid) ** 2, axis=1)))]
+    nearest = np.full(partition_faces, np.inf)
     for _ in range(regions - 1):
-        delta = centers - centers[seeds[-1]]
+        delta = centers[:partition_faces] - centers[seeds[-1]]
         nearest = np.minimum(nearest, np.einsum("ij,ij->i", delta, delta))
         seeds.append(int(np.argmax(nearest)))
-    del centers, nearest
+    del nearest
 
     labels = np.full(nf, -1, dtype=np.int16)
     counts = [0] * regions
@@ -108,7 +136,7 @@ def build(source: Path, destination: Path, regions: int) -> dict:
                 frontiers[region].append(neighbor[slot])
         heapq.heappush(heap, (1, region))
     assigned = regions
-    while assigned < nf:
+    while assigned < partition_faces:
         if not heap:
             raise ValueError("input has disconnected face components")
         count, region = heapq.heappop(heap)
@@ -128,6 +156,35 @@ def build(source: Path, destination: Path, regions: int) -> dict:
             if next_face >= 0 and labels[next_face] < 0:
                 frontier.append(next_face)
         heapq.heappush(heap, (counts[region], region))
+    # A seed enclosed by other growing regions can lose its frontier early.
+    # Merge such undersized connected cells across their shared boundary
+    # instead of emitting a tiny compute region.
+    counts = np.bincount(labels[:partition_faces], minlength=regions).tolist()
+    while len(counts) > 1 and min(counts) < 1024:
+        small_region = int(np.argmin(counts))
+        boundary_labels = []
+        for face in np.flatnonzero(labels[:partition_faces] == small_region):
+            for slot in range(3 * int(face), 3 * int(face) + 3):
+                other = int(adjacency[slot])
+                if other >= 0 and labels[other] != small_region:
+                    boundary_labels.append(int(labels[other]))
+        if not boundary_labels:
+            raise ValueError("undersized region has no adjacent region to merge into")
+        target = min(set(boundary_labels), key=lambda label: (-boundary_labels.count(label), label))
+        labels[labels == small_region] = target
+        active_labels = np.unique(labels[:partition_faces])
+        remap = np.full(regions, -1, dtype=np.int16)
+        remap[active_labels] = np.arange(len(active_labels), dtype=np.int16)
+        labels[:partition_faces] = remap[labels[:partition_faces]]
+        regions = len(active_labels)
+        counts = np.bincount(labels[:partition_faces], minlength=regions).tolist()
+
+    if partition_faces < nf:
+        region_centers = np.stack([centers[:partition_faces][labels[:partition_faces] == r].mean(axis=0)
+                                   for r in range(regions)])
+        extra_delta = centers[partition_faces:, None, :] - region_centers[None, :, :]
+        labels[partition_faces:] = np.argmin(np.einsum("ijk,ijk->ij", extra_delta, extra_delta), axis=1)
+        counts = np.bincount(labels, minlength=regions).tolist()
     if min(counts) < 1024:
         raise ValueError(f"a connected region is too small: {min(counts)} faces")
     faces[:, 3] = labels.astype(np.uint32)
@@ -148,13 +205,16 @@ def build(source: Path, destination: Path, regions: int) -> dict:
         "input_faces": nf,
         "source_patches": source_patches,
         "source_kind": "stl" if from_stl else "cadpart",
+        "removed_degenerate_faces": removed_degenerate_faces,
+        "attached_small_components": int(nf - partition_faces) if from_stl else 0,
         "compute_regions": regions,
         "region_faces": counts,
         "minimum_region_faces": min(counts),
         "maximum_region_faces": max(counts),
         "hard_feature_edges": len(hard_edges),
         "discarded_soft_label_edges": 0 if from_stl else ne - len(hard_edges),
-        "connected_regions": True,
+        "connected_regions": nf == partition_faces,
+        "main_regions_connected": True,
     }
     destination.with_suffix(destination.suffix + ".json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"

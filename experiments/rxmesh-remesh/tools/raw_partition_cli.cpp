@@ -66,7 +66,11 @@ int main(int argc,char **argv) {
     const double loadSeconds=elapsed();
     if(!(cfg.constantLength>0))cfg.constantLength=source.bboxDiagonal()*.01f;
     cfg.maxGeometryError=errorBudget>0?errorBudget:.2f*cfg.constantLength;
-    if(refine){cfg.featureEdgeLength=.25f*cfg.constantLength;cfg.featureBand=.75f*cfg.constantLength;}
+    // Feature vertices/edges remain constrained by the partition. Use a
+    // moderate near-feature target so narrow STL tessellation creases do not
+    // trigger a disproportionate split cascade.
+    constexpr float featureEdgeRatio=.5f;
+    if(refine){cfg.featureEdgeLength=featureEdgeRatio*cfg.constantLength;cfg.featureBand=.75f*cfg.constantLength;}
     RawBatchReport report;
     const bool valid=remeshRawCudaPatches(source,output,cfg,options,report,&error);
     const double remeshEnd=elapsed();
@@ -87,6 +91,8 @@ int main(int argc,char **argv) {
        <<",\n  \"collapse_passes\": "<<options.collapsePasses
        <<",\n  \"flip_passes\": "<<options.flipPasses
        <<",\n  \"strict_flip_quality\": "<<(options.strictFlipQuality?"true":"false")
+       <<",\n  \"feature_refine\": "<<(refine?"true":"false")
+       <<",\n  \"feature_edge_ratio\": "<<(refine?featureEdgeRatio:0.f)
        <<",\n  \"auto_partition_single_patch\": "<<(options.autoPartitionSinglePatch?"true":"false")
        <<",\n  \"stop_when_idle\": "<<(options.stopWhenIdle?"true":"false")
        <<",\n  \"seconds\": "<<report.seconds<<",\n  \"memory_budget\": "<<report.memoryBudget
