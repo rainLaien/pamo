@@ -104,6 +104,7 @@ int main(int argc,char **argv) {
        <<",\n  \"unchanged\": "<<report.unchanged<<",\n  \"fallback\": "<<report.fallback
        <<",\n  \"uniform_regions\": "<<report.uniformRegions
        <<",\n  \"quality_split_regions\": "<<report.qualitySplitRegions
+       <<",\n  \"mean_recovery_regions\": "<<report.meanRecoveryRegions
        <<",\n  \"retried\": "<<report.retried
        <<",\n  \"seam_repairs\": "<<report.seamRepairs
        <<",\n  \"seam_split_repairs\": "<<report.seamSplitRepairs
@@ -115,6 +116,7 @@ int main(int argc,char **argv) {
          <<", \"unchanged\": "<<(p.unchanged?"true":"false")
          <<", \"uniform_sizing\": "<<(p.uniformSizing?"true":"false")
          <<", \"quality_split\": "<<(p.qualitySplit?"true":"false")
+         <<", \"mean_recovery\": "<<(p.meanRecovery?"true":"false")
          <<", \"quality_split_ratio\": "<<p.qualitySplitRatio
          <<", \"retried\": "<<(p.retried?"true":"false")
          <<", \"input_faces\": "<<p.inputFaces<<", \"output_faces\": "<<p.outputFaces
@@ -133,6 +135,7 @@ int main(int argc,char **argv) {
          <<", \"seconds_uniform_gentle\": "<<p.secondsUniformGentle
          <<", \"seconds_uniform_strict\": "<<p.secondsUniformStrict
          <<", \"seconds_quality_split\": "<<p.secondsQualitySplit
+         <<", \"seconds_mean_recovery\": "<<p.secondsMeanRecovery
          <<", \"seconds_setup\": "<<p.report.secondsSetup
          <<", \"seconds_split\": "<<p.report.secondsSplit
          <<", \"seconds_collapse\": "<<p.report.secondsCollapse
