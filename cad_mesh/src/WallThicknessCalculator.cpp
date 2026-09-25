@@ -27,8 +27,6 @@ using ThicknessGeometry::Face;
 using ThicknessGeometry::Bvh;
 using ThicknessGeometry::Node;
 using std::vector;
-constexpr float kThicknessSampleConeAngleRad=0.1308996939f;
-constexpr int kThicknessDirectionCount=9;
 // C++17 view for Apollo's span parameters; preserves const element access.
 template<class T> class ArrayView {
   T* pointer; std::size_t count;
@@ -153,28 +151,6 @@ struct InSphere {
 using FacePredicate = std::function<bool(Face*)>;
 
 void BuildThicknessAabbTree(Mesh& mesh,Bvh& tree){tree.initialize(mesh);}
-
-auto BuildThicknessSampleDirections(const Vector& inwardDirection)
-    -> std::array<Vector, kThicknessDirectionCount> {
-  std::array<Vector, kThicknessDirectionCount> directions;
-  const auto inward = inwardDirection.normalized();
-  const Vector helperAxis = std::abs(inward.X()) < 0.8f ? Vector{1.0f, 0.0f, 0.0f}
-                                                              : Vector{0.0f, 1.0f, 0.0f};
-  const auto firstTangent  = (inward ^ helperAxis).normalized();
-  const auto secondTangent = (inward ^ firstTangent).normalized();
-  directions[0]            = inward;
-
-  constexpr float fullTurn = 6.2831853072f;
-  const float axialWeight  = std::cos(kThicknessSampleConeAngleRad);
-  const float radialWeight = std::sin(kThicknessSampleConeAngleRad);
-  for (int index = 1; index < kThicknessDirectionCount; ++index) {
-    const float azimuth = fullTurn * static_cast<float>(index - 1) /
-                          static_cast<float>(kThicknessDirectionCount - 1);
-    const auto radialDirection = firstTangent * std::cos(azimuth) + secondTangent * std::sin(azimuth);
-    directions[index]          = (inward * axialWeight + radialDirection * radialWeight).normalized();
-  }
-  return directions;
-}
 
 struct MeshPoint {
   Face* sourceFace = nullptr;

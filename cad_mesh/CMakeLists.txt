@@ -48,6 +48,8 @@ endif()
 
 add_executable(cad_mesh_segment app/cad_mesh_segment.cpp)
 target_link_libraries(cad_mesh_segment PRIVATE CadMesh)
+add_executable(cad_mesh_thickness app/cad_mesh_thickness.cpp)
+target_link_libraries(cad_mesh_thickness PRIVATE CadMesh)
 add_executable(cad_mesh_generic app/cad_mesh_generic.cpp)
 target_link_libraries(cad_mesh_generic PRIVATE CadMesh)
 add_executable(cad_mesh_quality app/cad_mesh_quality.cpp)

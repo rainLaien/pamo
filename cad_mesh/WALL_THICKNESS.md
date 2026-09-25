@@ -28,6 +28,17 @@ smallest bounding-box dimension) and `--thickness-contact-angle-deg` (0..180,
 default 0). The minimum is an acceptance floor, not convergence accuracy.
 The flag requires remesh and cannot be combined with stop-after-partition.
 
+For an already remeshed ASCII PLY, use the read-only measurement executable:
+
+```powershell
+cmake --build .\cad_mesh\build --target cad_mesh_thickness
+.\cad_mesh\build\cad_mesh_thickness.exe input_remeshed.ply output_with_thickness.ply --workers 20
+```
+
+This path reads the existing vertices and triangular faces, computes face
+properties, then copies the original vertex rows and face data unchanged while
+appending `wall_thickness`, `thickness_valid`, and `thickness_status`.
+
 ## Measurement and output
 
 Measurements run after final mesh compaction, across the whole final mesh,
@@ -70,4 +81,8 @@ ordering may differ from Apollo. Identical numerical results are not claimed.
 The unused Apollo vertex-only source relocation/adjacency branches were removed;
 face representative refinement and full-mesh containment remain enabled.
 
-No compilation, tests or mesh runs were performed for this change.
+The native executable builds with this source. A smoke run on
+`examples/generic_fixture.stl` completed with 2,953 valid measurements out of
+3,226 final faces (96.76% valid area); the output PLY contained all three face
+properties. These figures are an integration check, not a general accuracy
+benchmark.
