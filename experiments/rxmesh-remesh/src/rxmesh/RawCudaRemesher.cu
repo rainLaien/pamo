@@ -10,9 +10,11 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <functional>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -356,7 +358,8 @@ __device__ bool changedFaceSafe(MeshView m, Triangle t, int a, int b,
   if(!refSafe) { if(stats) atomicAdd(&stats->referenceReject,1ull); return false; }
   if(stats) atomicAdd(&stats->safe,1ull);
   return true;
-}__device__ bool changedFaceShapeSafe(MeshView m,Triangle t,int a,int b,float3 dest) {
+}__device__ bool changedFaceShapeSafe(MeshView m,Triangle t,int a,int b,float3 dest,
+                                     bool allowQualityTradeoff) {
   float3 before[3],after[3];
   bool hasA=false,hasB=false;
   for(int k=0;k<3;++k) {
@@ -368,9 +371,11 @@ __device__ bool changedFaceSafe(MeshView m, Triangle t, int a, int b,
   if(a!=b && hasA && hasB)return true;
   const auto n0=normal3(before[0],before[1],before[2]);
   const auto n1=normal3(after[0],after[1],after[2]);
+  const float qualityFraction=allowQualityTradeoff?.02f:.5f;
   if(qualityVcgKnownNormal(after[0],after[1],after[2],n1)<=
-     fmaxf(1.e-8f,.5f*qualityVcgKnownNormal(before[0],before[1],before[2],n0)))return false;
-  return dot3(n0,n1)>=.7f*sqrtf(dot3(n0,n0)*dot3(n1,n1));
+     fmaxf(1.e-8f,qualityFraction*qualityVcgKnownNormal(before[0],before[1],before[2],n0)))return false;
+  const float normalCos=allowQualityTradeoff?.2f:.7f;
+  return dot3(n0,n1)>=normalCos*sqrtf(dot3(n0,n0)*dot3(n1,n1));
 }
 __device__ int findEdgeId(MeshView m,int a,int b) {
   for(int i=m.offsets[a];i<m.offsets[a+1];++i) {
@@ -487,7 +492,8 @@ __global__ void splitFaces(MeshView m, const Vertex *verts, const int *marked,
 }
 __global__ void collapsePrefilter(MeshView m, Candidate *out, int *flags,
                                   float *localLow, float low,
-                                  ReferenceSurfaceGpu ref, bool relaxed) {
+                                  ReferenceSurfaceGpu ref, bool relaxed,
+                                  bool allowQualityTradeoff) {
   int id=blockIdx.x*blockDim.x+threadIdx.x;
   if(id>=m.ne)return;
   out[id].keep=-1; flags[id]=0;
@@ -501,7 +507,7 @@ __global__ void collapsePrefilter(MeshView m, Candidate *out, int *flags,
   }
   localLow[id]=edgeLow;
   const float edgeDist2=dist2(m.v[a].p,m.v[b].p);
-  if(!relaxed && edgeDist2>=edgeLow*edgeLow) {
+  if(!relaxed && !allowQualityTradeoff && edgeDist2>=edgeLow*edgeLow) {
     auto t0=m.f[e.f0];
     auto n0=normal3(m.v[t0.v[0]].p,m.v[t0.v[1]].p,m.v[t0.v[2]].p);
     float minArea=.5f*sqrtf(dot3(n0,n0));
@@ -513,7 +519,7 @@ __global__ void collapsePrefilter(MeshView m, Candidate *out, int *flags,
     if(minArea>=edgeLow*edgeLow/100.f)return;
   }
   int da=m.offsets[a+1]-m.offsets[a],db=m.offsets[b+1]-m.offsets[b];
-  if(relaxed && !((da==3||da==4)&&m.v[a].constraint<2) &&
+  if(relaxed && !allowQualityTradeoff && !((da==3||da==4)&&m.v[a].constraint<2) &&
       !((db==3||db==4)&&m.v[b].constraint<2))return;
   flags[id]=1;
 }
@@ -529,7 +535,8 @@ __global__ void countRawCollapseStages(const Candidate *c,const int *flags,int n
   unsigned long long changedFaceReject=0;
   unsigned long long accepted=0;
 };__global__ void collapseCandidatesShape(MeshView m, Candidate *out,
-                                         const int *flags,bool relaxed) {
+                                         const int *flags,bool relaxed,
+                                         bool allowQualityTradeoff) {
   int id=blockIdx.x*blockDim.x+threadIdx.x;
   if(id>=m.ne || !flags[id])return;
   auto e=m.e[id]; int a=e.a,b=e.b;
@@ -546,8 +553,8 @@ __global__ void countRawCollapseStages(const Candidate *c,const int *flags,int n
     int v=side?a:b;
     for(int i=m.offsets[v];i<m.offsets[v+1];++i) {
       auto x=m.e[m.ids[i]];
-      if(x.f0>=0 && ownsFace(m.f[x.f0],x,v) && !changedFaceShapeSafe(m,m.f[x.f0],a,b,dest))return;
-      if(x.f1>=0 && ownsFace(m.f[x.f1],x,v) && !changedFaceShapeSafe(m,m.f[x.f1],a,b,dest))return;
+      if(x.f0>=0 && ownsFace(m.f[x.f0],x,v) && !changedFaceShapeSafe(m,m.f[x.f0],a,b,dest,allowQualityTradeoff))return;
+      if(x.f1>=0 && ownsFace(m.f[x.f1],x,v) && !changedFaceShapeSafe(m,m.f[x.f1],a,b,dest,allowQualityTradeoff))return;
     }
   }
   out[id]={keep,remove,-1,-1,dest,(ma&&mb)?0.f:m.v[keep].target};
@@ -1463,7 +1470,8 @@ thread_local TopologyTiming flipTiming;
 
 int topology(SemanticMesh &mesh, float h, float low, float high,
              ReferenceSurfaceGpu ref, bool flip, bool relaxed, unsigned seed,
-             RemeshReport &report,bool strictFlipQuality) {
+             RemeshReport &report,bool strictFlipQuality,
+             bool allowQualityTradeoff) {
   using TopologyClock = std::chrono::steady_clock;
   auto &timing = flip ? flipTiming : collapseTiming;
   ++timing.calls;
@@ -1483,7 +1491,7 @@ int topology(SemanticMesh &mesh, float h, float low, float high,
     const bool profileCandidateParts=(timing.calls==1 && !freezeBoundary);
     const auto prefilterMark=TopologyClock::now();
     collapsePrefilter<<<(m.ne + 127) / 128, 128,0,executionStream>>>(
-        m,candidates.p,flags.p,localLow.p,low,ref,relaxed);
+        m,candidates.p,flags.p,localLow.p,low,ref,relaxed,allowQualityTradeoff);
     double prefilterSeconds=0.0;
     if(profileCandidateParts) {
       sync();
@@ -1491,7 +1499,7 @@ int topology(SemanticMesh &mesh, float h, float low, float high,
     }
     const auto shapeMark=TopologyClock::now();
     collapseCandidatesShape<<<(m.ne + 127) / 128, 128,0,executionStream>>>(
-        m,candidates.p,flags.p,relaxed);
+        m,candidates.p,flags.p,relaxed,allowQualityTradeoff);
     double shapeSeconds=0.0;
     if(profileCandidateParts) {
       sync();
@@ -1925,16 +1933,47 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       std::nth_element(values.begin(),values.begin()+p05,values.end());
       return std::pair<float,float>{float(sum/double(values.size())),values[p05]};
     };
+    auto sizeSummary=[&](const SemanticMesh &candidate) {
+      int overlong=0;float maxRatio=0.f;std::vector<float> errors;
+      errors.reserve(candidate.edges.size());
+      for(const auto &edge:candidate.edges) {
+        const float h=.5f*(candidate.targetLength[edge.v0]+candidate.targetLength[edge.v1]);
+        if(!(h>0.f))continue;
+        const float ratio=distance(candidate.position(int(edge.v0)),candidate.position(int(edge.v1)))/h;
+        maxRatio=fmaxf(maxRatio,ratio);
+        if(ratio>cfg.splitRatio*(1.f+1.e-5f))++overlong;
+        errors.push_back(fabsf(ratio-1.f));
+      }
+      float p95=0.f;
+      if(!errors.empty()) {
+        const size_t index=errors.size()*95/100;
+        std::nth_element(errors.begin(),errors.begin()+index,errors.end());
+        p95=errors[index];
+      }
+      return std::tuple<int,float,float>{overlong,maxRatio,p95};
+    };
     SemanticMesh bestMesh;
     float bestMean=-1,bestP05=-1;
+    int bestOverlong=std::numeric_limits<int>::max();
+    float bestMaxRatio=std::numeric_limits<float>::max(),bestSizingP95=std::numeric_limits<float>::max();
     auto considerBest=[&](int selected) {
       const auto [mean,p05]=qualitySummary(mesh);
       if(mean+1.e-6f<options.qualityMeanFloor || p05+1.e-6f<options.qualityP05Floor)
         return std::pair<float,float>{mean,p05};
-      if(bestP05>=0 && (p05<bestP05-1.e-6f ||
-                         (std::abs(p05-bestP05)<=1.e-6f && mean<=bestMean)))
+      const auto [overlong,maxRatio,sizingP95]=sizeSummary(mesh);
+      const bool sizeBetter=overlong<bestOverlong ||
+          (overlong==bestOverlong && (maxRatio<bestMaxRatio-1.e-5f ||
+           (std::abs(maxRatio-bestMaxRatio)<=1.e-5f && sizingP95<bestSizingP95-1.e-5f)));
+      const bool sizeEqual=overlong==bestOverlong &&
+          std::abs(maxRatio-bestMaxRatio)<=1.e-5f &&
+          std::abs(sizingP95-bestSizingP95)<=1.e-5f;
+      if(bestP05>=0 && !sizeBetter && !(sizeEqual &&
+          (p05>bestP05+1.e-6f ||
+           (std::abs(p05-bestP05)<=1.e-6f && mean>bestMean+1.e-6f))))
         return std::pair<float,float>{mean,p05};
-      bestMesh=mesh;bestMean=mean;bestP05=p05;report.selectedCycle=selected;
+      bestMesh=mesh;bestMean=mean;bestP05=p05;
+      bestOverlong=overlong;bestMaxRatio=maxRatio;bestSizingP95=sizingP95;
+      report.selectedCycle=selected;
       return std::pair<float,float>{mean,p05};
     };
     const bool trackQuality=options.freezeBoundary &&
@@ -1971,7 +2010,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
           const auto passStart=Clock::now();
           int n =
               topology(mesh, h, cfg.collapseRatio * h, cfg.splitRatio * h, ref,
-                       false, false, unsigned(cycle * 31 + pass + 1), report,options.strictFlipQuality);
+                       false, false, unsigned(cycle * 31 + pass + 1), report,options.strictFlipQuality,options.allowQualityTradeoff);
           ++report.collapsePassCalls[pass];
           report.collapsePassAccepted[pass]+=n;
           report.collapsePassSeconds[pass]+=std::chrono::duration<double>(Clock::now()-passStart).count();
@@ -1981,7 +2020,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
             break;
         }
         int n = topology(mesh, h, cfg.collapseRatio * h, cfg.splitRatio * h,
-                         ref, false, true, unsigned(cycle + 717), report,options.strictFlipQuality);
+                         ref, false, true, unsigned(cycle + 717), report,options.strictFlipQuality,options.allowQualityTradeoff);
         nc += n;
         report.collapses += nc;
         const auto compactStart=Clock::now();
@@ -1998,7 +2037,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
           const auto passStart=Clock::now();
           int n =
               topology(mesh, h, cfg.collapseRatio * h, cfg.splitRatio * h, ref,
-                       true, false, unsigned(cycle * 37 + pass + 1), report,options.strictFlipQuality);
+                       true, false, unsigned(cycle * 37 + pass + 1), report,options.strictFlipQuality,options.allowQualityTradeoff);
           ++report.flipPassCalls[pass];
           report.flipPassAccepted[pass]+=n;
           report.flipPassSeconds[pass]+=std::chrono::duration<double>(Clock::now()-passStart).count();

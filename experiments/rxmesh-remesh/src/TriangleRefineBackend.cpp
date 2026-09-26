@@ -1,6 +1,7 @@
 #include "cad_adaptive/TriangleRefineBackend.h"
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -11,13 +12,121 @@ uint64_t EdgeKey(uint32_t a,uint32_t b){if(a>b)std::swap(a,b);return(uint64_t(a)
 
 bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
                               const GeometryProjector& referenceProjector,
-                              SemanticMesh& out,TriangleRefineStats& st,std::string* error){
+                              SemanticMesh& out,TriangleRefineStats& st,std::string* error,
+                              const std::unordered_set<uint32_t>* onlyPatches,
+                              bool projectNewVertices,
+                              const std::unordered_set<uint32_t>* forcePatches){
   st={}; st.InputFaces=in.faceCount();
   std::unordered_set<uint64_t> marked;
   for(const auto&e:in.edges){
+    const bool selected=!onlyPatches ||
+        (e.face0>=0 && onlyPatches->count(in.facePatchId[e.face0])) ||
+        (e.face1>=0 && onlyPatches->count(in.facePatchId[e.face1]));
+    if(!selected)continue;
     const float h=0.5f*(in.targetLength[e.v0]+in.targetLength[e.v1]);
-    if(h>0&&distance(in.position(int(e.v0)),in.position(int(e.v1)))>cfg.splitRatio*h)
-      marked.insert(EdgeKey(e.v0,e.v1));
+    if(h>0&&distance(in.position(int(e.v0)),in.position(int(e.v1)))>cfg.splitRatio*h) {
+      const Vec3 a=in.position(int(e.v0)),b=in.position(int(e.v1));
+      const Vec3 midpoint=(a+b)*.5f;
+      // At large coordinate magnitudes a representable edge can still be
+      // shorter than one float ULP at its midpoint. Splitting it would create
+      // duplicate vertices and zero-area children, so leave that edge intact.
+      if((midpoint.x!=a.x || midpoint.y!=a.y || midpoint.z!=a.z) &&
+         (midpoint.x!=b.x || midpoint.y!=b.y || midpoint.z!=b.z))
+        marked.insert(EdgeKey(e.v0,e.v1));
+    }
+  }
+  std::unordered_map<uint64_t,Vec3> splitPoints;
+  splitPoints.reserve(marked.size()*2);
+  // Choose a split point on each long edge by maximizing the worst child-face
+  // quality across both incident triangles. Include off-center candidates so
+  // sliver faces are not forced to use a midpoint that collapses numerically.
+  static constexpr float splitFractions[]={.1f,.2f,.3f,.4f,.5f,.6f,.7f,.8f,.9f};
+  for(const auto &edge:in.edges) {
+    const uint64_t key=EdgeKey(edge.v0,edge.v1);
+    if(!marked.count(key))continue;
+    const Vec3 a=in.position(int(edge.v0)),b=in.position(int(edge.v1));
+    float bestScore=-1.f;
+    Vec3 bestPoint{};
+    for(float t:splitFractions) {
+      const Vec3 point=a+(b-a)*t;
+      if((point.x==a.x&&point.y==a.y&&point.z==a.z) ||
+         (point.x==b.x&&point.y==b.y&&point.z==b.z))continue;
+      float score=std::numeric_limits<float>::max();
+      for(int f:{edge.face0,edge.face1}) {
+        if(f<0)continue;
+        const auto tri=in.face(f);
+        int opposite=-1;
+        for(int v:tri)if(v!=int(edge.v0)&&v!=int(edge.v1)){opposite=v;break;}
+        if(opposite<0)continue;
+        const Vec3 c=in.position(opposite);
+        score=std::min(score,triangleQuality(a,point,c));
+        score=std::min(score,triangleQuality(point,b,c));
+      }
+      // Slightly prefer a balanced split when child quality is comparable.
+      score*=1.f-.05f*std::abs(t-.5f);
+      if(score>bestScore){bestScore=score;bestPoint=point;}
+    }
+    if(!(bestScore>0.f))marked.erase(key);
+    else splitPoints.emplace(key,bestPoint);
+  }
+  static constexpr int refineTriNum[8]={1,2,2,3,2,3,3,4};
+  static constexpr int refineTv[8][4][3]={
+    {{0,1,2},{0,0,0},{0,0,0},{0,0,0}},
+    {{0,3,2},{3,1,2},{0,0,0},{0,0,0}},
+    {{0,1,4},{0,4,2},{0,0,0},{0,0,0}},
+    {{3,1,4},{0,3,2},{4,2,3},{0,0,0}},
+    {{0,1,5},{5,1,2},{0,0,0},{0,0,0}},
+    {{0,3,5},{3,1,5},{2,5,1},{0,0,0}},
+    {{2,5,4},{0,1,5},{4,5,1},{0,0,0}},
+    {{3,4,5},{0,3,5},{3,1,4},{5,4,2}}
+  };
+  auto maskIsSafe=[&](int mask,const Vec3 *p) {
+    if(mask==0)return true;
+    const int vv[6]={0,1,2,3,4,5};
+    int local[4][3]{};
+    for(int q=0;q<refineTriNum[mask];++q)
+      for(int j=0;j<3;++j)local[q][j]=vv[refineTv[mask][q][j]];
+    if(mask==3||mask==5||mask==6) {
+      int a0,a1,b0,b1;
+      if(mask==3){a0=0;a1=4;b0=3;b1=2;}
+      else if(mask==5){a0=3;a1=2;b0=5;b1=1;}
+      else {a0=0;a1=4;b0=5;b1=1;}
+      const auto d2=[&](int x,int y){const Vec3 d=p[x]-p[y];return length2(d);};
+      if(d2(a0,a1)<d2(b0,b1)) {
+        local[2][1]=local[1][0];
+        local[1][1]=local[2][0];
+      }
+    }
+    for(int q=0;q<refineTriNum[mask];++q)
+      if(!(triangleQuality(p[local[q][0]],p[local[q][1]],p[local[q][2]])>0.f))return false;
+    return true;
+  };
+  bool removedUnsafe=true;
+  while(removedUnsafe) {
+    removedUnsafe=false;
+    for(int f=0;f<in.faceCount();++f) {
+      const int v[3]={int(in.i0[f]),int(in.i1[f]),int(in.i2[f])};
+      const uint64_t k[3]={EdgeKey(v[0],v[1]),EdgeKey(v[1],v[2]),EdgeKey(v[2],v[0])};
+      const bool s[3]={marked.count(k[0])!=0,marked.count(k[1])!=0,marked.count(k[2])!=0};
+      const int mask=(s[0]?1:0)|(s[1]?2:0)|(s[2]?4:0);
+      if(mask==0)continue;
+      const Vec3 p[6]={in.position(v[0]),in.position(v[1]),in.position(v[2]),
+          s[0]?splitPoints[k[0]]:Vec3{},
+          s[1]?splitPoints[k[1]]:Vec3{},
+          s[2]?splitPoints[k[2]]:Vec3{}};
+      if(maskIsSafe(mask,p))continue;
+      bool reduced=false;
+      for(int e=0;e<3;++e)if(s[e] && maskIsSafe(mask&~(1<<e),p)) {
+        removedUnsafe|=marked.erase(k[e])!=0;
+        splitPoints.erase(k[e]);
+        reduced=true;
+        break;
+      }
+      if(!reduced)for(int e=0;e<3;++e)if(s[e]) {
+        removedUnsafe|=marked.erase(k[e])!=0;
+        splitPoints.erase(k[e]);
+      }
+    }
   }
   st.SplitEdges=int(marked.size());
   if(marked.empty()){out=in;st.OutputFaces=in.faceCount();return true;}
@@ -27,15 +136,19 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
   out.edges.clear();out.incidentFaces.assign(out.vertexCount(),{});
   std::unordered_map<uint64_t,int> mids;
   mids.reserve(marked.size()*2);
+  std::unordered_map<uint64_t,const EdgeRec*> edgeByKey;
+  edgeByKey.reserve(in.edges.size()*2);
+  for(const auto &e:in.edges)edgeByKey.emplace(EdgeKey(e.v0,e.v1),&e);
   auto mid=[&](int a,int b,uint32_t patch){
     const uint64_t k=EdgeKey(uint32_t(a),uint32_t(b));
     auto it=mids.find(k);if(it!=mids.end())return it->second;
-    Vec3 p=(in.position(a)+in.position(b))*0.5f;
+    Vec3 p=splitPoints.at(k);
     const auto ca=VertexConstraint(in.vertexConstraint[a]),cb=VertexConstraint(in.vertexConstraint[b]);
     VertexConstraint cc=VertexConstraint::Surface;
     uint8_t parentFlags=0;
     uint32_t feature=0;
-    for(const auto&e:in.edges)if(EdgeKey(e.v0,e.v1)==k){
+    if(auto edge=edgeByKey.find(k);edge!=edgeByKey.end()){
+      const auto &e=*edge->second;
       parentFlags=e.flags;
       feature=e.featureCurveId;
       // EdgeProtected is a generic topology guard, not a geometric feature.
@@ -43,14 +156,15 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
       // 1-D constraint.
       if(e.flags&(EdgeSharp|EdgePatchBoundary|EdgeMeshBoundary))
         cc=(e.flags&EdgeSharp)?VertexConstraint::FeatureEdge:VertexConstraint::PatchBoundary;
-      break;
     }
-    ProjectionResult hit;
-    if(parentFlags&(EdgeSharp|EdgePatchBoundary|EdgeMeshBoundary))
-      hit=referenceProjector.projectFeature(feature,p);
-    else
-      hit=referenceProjector.projectSurface(patch,p);
-    if(hit.ok)p=hit.position;
+    if(projectNewVertices) {
+      ProjectionResult hit;
+      if(parentFlags&(EdgeSharp|EdgePatchBoundary|EdgeMeshBoundary))
+        hit=referenceProjector.projectFeature(feature,p);
+      else
+        hit=referenceProjector.projectSurface(patch,p);
+      if(hit.ok)p=hit.position;
+    }
     const int v=out.addVertex(p,patch,cc);
     out.targetLength[v]=0.5f*(in.targetLength[a]+in.targetLength[b]);
     if(parentFlags&EdgeSharp) {
@@ -70,6 +184,23 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
     const int mask=(s[0]?1:0)|(s[1]?2:0)|(s[2]?4:0);
     ++st.MaskCounts[mask];
     const uint32_t p=in.facePatchId[f];const PatchType t=PatchType(in.facePatchType[f]);
+    if(mask==0 && forcePatches && forcePatches->count(p)) {
+      // Coverage-only pass: split the face around an interior centroid. This
+      // changes every still-untouched patch without inserting seam vertices,
+      // so neighboring patches remain conforming and boundary identities stay
+      // intact. Skip a centroid that collapses under float precision.
+      const Vec3 center=(in.position(v[0])+in.position(v[1])+in.position(v[2]))*(1.f/3.f);
+      if(triangleQuality(in.position(v[0]),in.position(v[1]),center)>0.f &&
+         triangleQuality(in.position(v[1]),in.position(v[2]),center)>0.f &&
+         triangleQuality(in.position(v[2]),in.position(v[0]),center)>0.f) {
+        const int c=out.addVertex(center,p,VertexConstraint::Surface);
+        out.targetLength[c]=(in.targetLength[v[0]]+in.targetLength[v[1]]+in.targetLength[v[2]])/3.f;
+        add(v[0],v[1],c,p,t);add(v[1],v[2],c,p,t);add(v[2],v[0],c,p,t);
+        ++st.InsertedVertices;++st.RefinedFaces;
+        st.touchedPatches.insert(p);
+        continue;
+      }
+    }
     int m[3]={-1,-1,-1};for(int e=0;e<3;++e)if(s[e])m[e]=mid(v[e],v[(e+1)%3],p);
     // Exact VCGLib SplitTab convention:
     // vv 0..2 = original vertices, 3=m01, 4=m12, 5=m20.
@@ -99,7 +230,7 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
         local[1][1]=local[2][0];
       }
     }
-    if(mask!=0)++st.RefinedFaces;
+    if(mask!=0){++st.RefinedFaces;st.touchedPatches.insert(p);}
     for(int q=0;q<triNum[mask];++q)add(local[q][0],local[q][1],local[q][2],p,t);
   }
   out.rebuildTopology();out.computeVertexNormals();st.OutputFaces=out.faceCount();
@@ -109,7 +240,9 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
 bool refineCoarseConforming(const SemanticMesh& input,const RemeshConfig& cfg,
                             const GeometryProjector& referenceProjector,
                             SemanticMesh& output,TriangleRefineStats& total,
-                            int maxLevels,std::string* error){
+                            int maxLevels,std::string* error,
+                            const std::unordered_set<uint32_t>* onlyPatches,
+                            bool projectNewVertices){
   total={};
   total.InputFaces=input.faceCount();
   SemanticMesh current=input;
@@ -117,11 +250,13 @@ bool refineCoarseConforming(const SemanticMesh& input,const RemeshConfig& cfg,
   for(int level=0;level<maxLevels;++level){
     TriangleRefineStats step;
     SemanticMesh next;
-    if(!refineMidpointConforming(current,cfg,referenceProjector,next,step,error))
+    if(!refineMidpointConforming(current,cfg,referenceProjector,next,step,error,
+                                 onlyPatches,projectNewVertices))
       return false;
     total.RefinedFaces+=step.RefinedFaces;
     total.InsertedVertices+=step.InsertedVertices;
     total.SplitEdges+=step.SplitEdges;
+    ++total.Levels;
     for(int i=0;i<8;++i) total.MaskCounts[i]+=step.MaskCounts[i];
     current=std::move(next);
     std::cout<<"coarse_refine_level="<<level

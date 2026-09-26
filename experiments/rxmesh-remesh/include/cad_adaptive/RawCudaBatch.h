@@ -1,5 +1,7 @@
 #pragma once
 #include "cad_adaptive/RawCudaRemesher.h"
+#include <cstdint>
+#include <vector>
 namespace cad_adaptive {
 struct RawBatchOptions {
   int workers=2;
@@ -20,7 +22,11 @@ struct RawPatchResult {
   bool qualitySplit=false; // Alternate interior edge point and split quality gate succeeded.
   float qualitySplitRatio=0;
   bool meanRecovery=false; // Flip/smooth-only retry improved mean quality with a lower-tail guard.
+  bool sizeRecovery=false; // Size-targeted retry reduced overlong edges under bounded quality guards.
   bool retried=false;
+  // Source patch IDs whose accepted output is exactly the retained input.
+  // A task may contain several patches and only some may be unchanged.
+  std::vector<uint32_t> unchangedPatchIds;
   size_t workspaceBytes=0;
   int inputFaces=0,outputFaces=0;
   float inputQualityMean=0,inputQualityP05=0;
@@ -36,6 +42,8 @@ struct RawBatchReport {
   int patchesPerTask=1;
   int accepted=0,unchanged=0,uniformRegions=0,qualitySplitRegions=0,meanRecoveryRegions=0;
   int fallback=0,retried=0,peakActive=0,boundarySplits=0;
+  int finalSizeRefineSplits=0,finalSizeRefineLevels=0,sizeRecoveryRegions=0,longEdgesAfterRefine=0;
+  float maxOutputEdgeRatio=0;
   size_t memoryBudget=0,peakReserved=0;
   double seconds=0;
   double secondsBoundary=0,secondsTasks=0,secondsAssembly=0;

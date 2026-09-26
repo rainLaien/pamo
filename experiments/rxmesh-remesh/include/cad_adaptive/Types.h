@@ -134,6 +134,8 @@ struct RemeshReport {
   int rejectNormal = 0, rejectQuality = 0, rejectError = 0;
   float qualityMean = 0, qualityP05 = 0, qualityMin = 0;
   float sizingErrorMean = 0, sizingErrorP95 = 0;
+  float maxEdgeLengthRatio = 0;
+  int overlongEdges = 0;
   float geometryErrorMax = 0;
   int movedLockedVertices = 0, missingBoundaryEdges = 0;
   double seconds = 0;

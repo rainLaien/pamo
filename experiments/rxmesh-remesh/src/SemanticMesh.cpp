@@ -286,7 +286,7 @@ bool SemanticMesh::validate(std::string *error) const {
       return fail("face index out of range");
     if (a == b || b == c || a == c) return fail("degenerate face");
     if (!(triangleQuality(position(a), position(b), position(c)) > 0))
-      return fail("zero-area face");
+      return fail("zero-area face "+std::to_string(f));
   }
   if (live == 0) return fail("no live faces");
   std::unordered_map<uint64_t, int> count;

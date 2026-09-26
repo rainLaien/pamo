@@ -13,6 +13,9 @@ struct RawCudaOptions {
   int smoothAttempts=3;
   int collapsePasses=8, flipPasses=8;
   bool strictFlipQuality=true;
+  // Permit a stronger quality tradeoff during edge collapse while still
+  // rejecting inverted/zero-area faces and invalid topology.
+  bool allowQualityTradeoff=false;
   bool optimizeSplitPoint=false;
   float splitQualityRatio=0.f;
   float qualityMeanFloor=0,qualityP05Floor=0;

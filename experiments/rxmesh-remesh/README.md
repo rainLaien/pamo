@@ -193,7 +193,60 @@ with the raw CUDA operators (including reference-only/nonanalytic patches):
   -Workers 4 -Iterations 20 -FeatureRefine
 ```
 
-For repeatable debugging, reuse `input.cadpart` with `-SavedPartition`, or call:
+The same runner now includes narrow-strip repair by default (Python, NumPy and
+SciPy are required). Start from the original STL; no manually repaired snapshot
+or model-specific patch list is needed:
+
+```powershell
+.\experiments\rxmesh-remesh\run_raw_partition.ps1 `
+  -InputMesh .\examples\2.stl `
+  -OutputDirectory .\experiments\rxmesh-remesh\results\2stl-remesh
+```
+
+Before GPU task dispatch, `tools/repair_narrow_strips.py` identifies small,
+extremely elongated Freeform regions, groups their convex planar components,
+rebuilds their interior connectivity and synchronizes new boundary samples with
+neighboring triangles. Source vertices, fold edges and feature chains are
+preserved. If a neighboring thin planar region cannot be safely subdivided,
+the repair expands to that region, with at most eight expansions. Truly curved,
+nonconvex, multi-loop or internally protected regions are retained with explicit
+rejection reasons. The original partition snapshot remains immutable; GPU
+reference queries use the repaired snapshot after its source-geometry checks.
+
+After each GPU run, residual oversized edges can admit additional narrow planar
+regions. `-StripRepairPasses` bounds GPU attempts (default 3, maximum 5); an
+unchanged candidate set ends retries. The runner selects a complete result
+before a partial result, then minimizes oversized-edge count and worst edge
+ratio. Remaining oversized edges are reported as a partial result (exit 3).
+Use `-SkipStripRepair` for an explicit raw-operator comparison, and `-Python`
+to select the Python interpreter.
+
+Each `strip_repair/pass_XX/` directory contains its input snapshot, repair
+report, GPU mesh and GPU report. `pipeline.json` records the immutable source,
+selected snapshot, attempted rounds, stop reason, remaining oversized edges,
+and total elapsed time including preprocessing. The selected mesh is copied to
+the usual `remeshed.ply`, so the third workflow retains one user-facing entry.
+The current repair eligibility is conservative: at most 64 source faces and a
+bounding-box aspect ratio above 100. The validated case uses uniform sizing;
+unsupported geometries remain visible in the reports.
+
+End-to-end check on `examples/2.stl`: automatic segmentation, one neighboring
+strip expansion, 231 repaired regions and one GPU pass completed in 142.8 seconds
+(including partitioning and preprocessing). The exported mesh has 268,103 faces,
+zero oversized edges, worst edge/target ratio 1.33331 and quality P05 0.0231345.
+An independent PLY audit found no zero-area or duplicate faces, nonmanifold
+edges, or inconsistent interior-edge orientation; the original 81 open edges,
+one connected component and Euler characteristic -1 were retained. This is one
+validated model/run, not a guarantee for all CAD inputs.
+
+The independent shared-boundary and input-preservation regression checks run as:
+
+```powershell
+python .\experiments\rxmesh-remesh\tests\test_repair_narrow_strips.py
+```
+
+For repeatable debugging, reuse the original `input.cadpart` with
+`-SavedPartition`. Calling the executable directly bypasses the runner's repair:
 
 ```powershell
 .\experiments\rxmesh-remesh\build_rx\Release\cad_raw_partition_cli.exe input.cadpart out.ply --workers 4 --iters 20 --feature-refine

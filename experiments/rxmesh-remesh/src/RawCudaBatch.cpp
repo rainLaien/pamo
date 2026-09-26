@@ -1,9 +1,11 @@
 #include "cad_adaptive/RawCudaBatch.h"
 #include "cad_adaptive/PartitionInput.h"
+#include "cad_adaptive/TriangleRefineBackend.h"
 #include "RemeshWorkerPool.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <functional>
@@ -20,6 +22,35 @@ using Clock=std::chrono::steady_clock;
 using Position=std::tuple<float,float,float>;
 Position positionKey(Vec3 p){return {p.x,p.y,p.z};}
 uint64_t edgeKey(int a,int b){return (uint64_t(std::min(a,b))<<32)|uint32_t(std::max(a,b));}
+bool featureSegmentCovered(const SemanticMesh &source,const SemanticMesh &output,
+                           uint64_t sourceEdge,uint32_t featureId) {
+  const uint32_t a=uint32_t(sourceEdge>>32),b=uint32_t(sourceEdge);
+  if(a>=uint32_t(source.vertexCount())||b>=uint32_t(source.vertexCount()))return false;
+  const Vec3 p0=source.position(int(a)),p1=source.position(int(b)),d=p1-p0;
+  const float len2=length2(d),len=std::sqrt(len2);
+  if(!(len2>0.f))return false;
+  const float tolerance=std::max(1.e-6f,source.bboxDiagonal()*1.e-6f);
+  std::vector<std::pair<float,float>> intervals;
+  for(const auto &feature:output.featureEdges) {
+    if(feature.second!=featureId)continue;
+    const uint32_t u=uint32_t(feature.first>>32),v=uint32_t(feature.first);
+    if(u>=uint32_t(output.vertexCount())||v>=uint32_t(output.vertexCount()))continue;
+    const Vec3 x=output.position(int(u)),y=output.position(int(v));
+    const float tx=dot(x-p0,d)/len2,ty=dot(y-p0,d)/len2;
+    if(tx < -tolerance/len || tx > 1.f+tolerance/len ||
+       ty < -tolerance/len || ty > 1.f+tolerance/len)continue;
+    if(distance(x,p0+d*tx)>tolerance||distance(y,p0+d*ty)>tolerance)continue;
+    intervals.emplace_back(std::min(tx,ty),std::max(tx,ty));
+  }
+  std::sort(intervals.begin(),intervals.end());
+  float covered=0.f;
+  for(const auto &interval:intervals) {
+    if(interval.first>covered+tolerance/len)continue;
+    covered=std::max(covered,interval.second);
+    if(covered>=1.f-tolerance/len)return true;
+  }
+  return false;
+}
 std::pair<float,float> qualitySummary(const SemanticMesh &mesh) {
   std::vector<float> values;values.reserve(mesh.faceCount());
   double sum=0;
@@ -32,6 +63,15 @@ std::pair<float,float> qualitySummary(const SemanticMesh &mesh) {
   const size_t p05=values.size()/20;
   std::nth_element(values.begin(),values.begin()+p05,values.end());
   return {float(sum/double(values.size())),values[p05]};
+}
+bool meshChanged(const SemanticMesh &a,const SemanticMesh &b) {
+  if(a.vertexCount()!=b.vertexCount() || a.faceCount()!=b.faceCount() ||
+     a.i0!=b.i0 || a.i1!=b.i1 || a.i2!=b.i2)return true;
+  for(int v=0;v<a.vertexCount();++v) {
+    const Vec3 p=a.position(v),q=b.position(v);
+    if(p.x!=q.x || p.y!=q.y || p.z!=q.z)return true;
+  }
+  return false;
 }
 void cudaCheck(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
 struct FacePartitionItem {
@@ -82,7 +122,7 @@ int AutoPartitionSinglePatch(SemanticMesh &mesh,int requestedPartitions) {
 }
 struct Job {
   int id=0,firstPatch=0,patchCount=0; double cost=0; size_t bytes=0;
-  bool succeeded=false,unchanged=false,uniformSizing=false,qualitySplit=false,meanRecovery=false;
+  bool succeeded=false,unchanged=false,uniformSizing=false,qualitySplit=false,meanRecovery=false,sizeRecovery=false;
   float qualityMeanFloor=0,qualityP05Floor=0;
   std::vector<int> faces;
   SemanticMesh output;
@@ -134,9 +174,9 @@ bool splitConflictingChord(Job &job,int sourceA,int sourceB,std::string &reason)
     candidate.rebuildTopology();
     std::string problem;
     if(!candidate.validate(&problem)){reason="split topology: "+problem;return false;}
-    const auto newQuality=qualitySummary(candidate);
-    if(newQuality.first+1.e-6f<job.qualityMeanFloor ||
-       newQuality.second+1.e-6f<job.qualityP05Floor){reason="split quality below local input";return false;}
+    // Seam repair is required to make the assembled topology conforming.
+    // A quality-only rejection here used to discard the entire remeshed job
+    // and restore its source faces, creating large untouched regions.
     job.aliases.resize(candidate.vertexCount(),-1);
     job.output=std::move(candidate);
     return true;
@@ -189,9 +229,19 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       required.insert(edgeKey(originals[e.v0],originals[e.v1]));
     const bool hasSharedOrOpenBoundary=source.patches.size()>1 ||
         std::any_of(source.edges.begin(),source.edges.end(),[](const EdgeRec &e){return (e.flags&EdgeMeshBoundary)!=0;});
-    RawCudaOptions options;options.independentStream=true;options.quiet=true;options.error=&result.error;options.freezeBoundary=hasSharedOrOpenBoundary;options.stopWhenIdle=stopWhenIdle;options.smoothPasses=smoothPasses;options.collapsePasses=collapsePasses;options.flipPasses=flipPasses;options.strictFlipQuality=strictFlipQuality;options.workspaceBytes=job.bytes;options.qualityMeanFloor=localQualityFloor.first;options.qualityP05Floor=localQualityFloor.second;
+    float sourceMaxRatio=0.f;
+    for(const auto &edge:local.edges) {
+      const float h=.5f*(local.targetLength[edge.v0]+local.targetLength[edge.v1]);
+      if(h>0.f)sourceMaxRatio=std::max(sourceMaxRatio,
+          distance(local.position(int(edge.v0)),local.position(int(edge.v1)))/h);
+    }
+    RawCudaOptions options;options.independentStream=true;options.quiet=true;options.error=&result.error;options.freezeBoundary=hasSharedOrOpenBoundary;options.stopWhenIdle=stopWhenIdle;options.smoothPasses=smoothPasses;options.collapsePasses=collapsePasses;options.flipPasses=flipPasses;options.strictFlipQuality=strictFlipQuality;options.allowQualityTradeoff=sourceMaxRatio>16.f;options.workspaceBytes=job.bytes;
+    // Let the GPU finish its best valid cycle even when its quality metrics
+    // trade off against the source. Quality floors here previously caused
+    // remeshRawCuda to restore the input mesh wholesale for difficult patches.
+    options.qualityMeanFloor=0.f;options.qualityP05Floor=0.f;
     SemanticMesh initialLocal;
-    if(requireQualityImprovement && collapsePasses>1)initialLocal=local;
+    if(requireQualityImprovement)initialLocal=local;
     auto phaseStart=Clock::now();
     const bool initialOk=remeshRawCuda(local,config,result.report,options);
     result.secondsInitial=std::chrono::duration<double>(Clock::now()-phaseStart).count();
@@ -201,6 +251,14 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
         (result.report.selectedCycle>=0 &&
          initialQuality.first+1.e-6f>=localQualityFloor.first &&
          initialQuality.second+1.e-6f>=localQualityFloor.second));
+    if(!improved && initialOk && requireQualityImprovement && meshChanged(initialLocal,local)) {
+      // A changed, valid local result is useful coverage even when no cycle
+      // satisfies the old shape gate. Keep it and report the quality tradeoff
+      // at the assembled-mesh level instead of silently restoring this patch.
+      improved=true;
+      result.qualitySplit=true;
+      result.error.clear();
+    }
     if(!improved && requireQualityImprovement && collapsePasses>1) {
       result.retried=true;
       result.retryReason=initialOk?"no cycle improved both local quality metrics":result.error;
@@ -342,6 +400,144 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
         }
       }
     }
+    const bool geometryRetry=!initialOk && result.report.overlongEdges>0 &&
+        result.error.find("final raw CUDA geometry or locked-vertex constraints failed")!=std::string::npos;
+    if(!improved && requireQualityImprovement &&
+       ((initialOk && result.report.maxEdgeLengthRatio>config.splitRatio*(1.f+1.e-4f)) || geometryRetry)) {
+      // A shape-only gate can reject every useful cycle even when a region
+      // still contains extreme long edges. Retry from the untouched source,
+      // prioritize edge sizing, and allow only a bounded local quality tradeoff.
+      result.retried=true;
+      RemeshConfig sizeConfig=config;
+      if(geometryRetry) {
+        sizeConfig.constantLength=config.constantLength*.9f;
+        if(sizeConfig.featureEdgeLength>0.f)sizeConfig.featureEdgeLength*=.9f;
+      }
+      SemanticMesh sizeMesh=initialLocal;
+      RawCudaOptions sizeOptions=options;
+      sizeOptions.optimizeSplitPoint=true;
+      sizeOptions.collapsePasses=2;
+      sizeOptions.splitQualityRatio=.20f;
+      sizeOptions.qualityMeanFloor=localQualityFloor.first*.90f;
+      sizeOptions.qualityP05Floor=localQualityFloor.second*.20f;
+      std::string sizeError;
+      sizeOptions.error=&sizeError;
+      RemeshReport sizeReport;
+      phaseStart=Clock::now();
+      const bool sizeOk=remeshRawCuda(sizeMesh,sizeConfig,sizeReport,sizeOptions);
+      result.secondsQualitySplit+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
+      const auto sizeQuality=sizeOk?qualitySummary(sizeMesh):std::pair<float,float>{0.f,0.f};
+      const bool reducedLongEdges=geometryRetry ? sizeReport.splits>0 :
+          (sizeReport.overlongEdges<int(result.report.overlongEdges*.8f) ||
+           sizeReport.maxEdgeLengthRatio<result.report.maxEdgeLengthRatio*.8f);
+      if(sizeOk && sizeReport.selectedCycle>=0 && reducedLongEdges &&
+         sizeQuality.first+1.e-6f>=sizeOptions.qualityMeanFloor &&
+         sizeQuality.second+1.e-6f>=sizeOptions.qualityP05Floor) {
+        local=std::move(sizeMesh);
+        result.report=sizeReport;
+        result.sizeRecovery=true;
+        result.error.clear();
+        improved=true;
+      } else if(!sizeError.empty()) {
+        result.retryReason=sizeError;
+      } else {
+        result.retryReason="size-only retry rejected: selected="+std::to_string(sizeReport.selectedCycle)+
+            " overlong="+std::to_string(sizeReport.overlongEdges)+"/"+
+            std::to_string(result.report.overlongEdges)+" max_ratio="+
+            std::to_string(sizeReport.maxEdgeLengthRatio)+"/"+
+            std::to_string(result.report.maxEdgeLengthRatio)+" quality="+
+            std::to_string(sizeQuality.first)+","+std::to_string(sizeQuality.second);
+      }
+    }
+    if(!improved && initialOk && requireQualityImprovement &&
+       result.report.maxEdgeLengthRatio>config.splitRatio*(1.f+1.e-4f)) {
+      // If the permissive size retry would make a severe lower-tail sliver,
+      // try again with stronger per-child quality protection. This often
+      // handles a few isolated giant edges without changing the rest of a patch.
+      RemeshConfig strictSizeConfig=config;
+      SemanticMesh strictSizeMesh=initialLocal;
+      RawCudaOptions strictSizeOptions=options;
+      strictSizeOptions.optimizeSplitPoint=true;
+      strictSizeOptions.splitQualityRatio=.60f;
+      strictSizeOptions.collapsePasses=2;
+      strictSizeOptions.qualityMeanFloor=localQualityFloor.first*.75f;
+      strictSizeOptions.qualityP05Floor=localQualityFloor.second*.10f;
+      std::string strictSizeError;
+      strictSizeOptions.error=&strictSizeError;
+      RemeshReport strictSizeReport;
+      phaseStart=Clock::now();
+      const bool strictSizeOk=remeshRawCuda(strictSizeMesh,strictSizeConfig,strictSizeReport,strictSizeOptions);
+      result.secondsQualitySplit+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
+      const auto strictQuality=strictSizeOk?qualitySummary(strictSizeMesh):std::pair<float,float>{0.f,0.f};
+      const bool strictSizeReduced=strictSizeReport.overlongEdges<int(result.report.overlongEdges*.8f) ||
+          strictSizeReport.maxEdgeLengthRatio<result.report.maxEdgeLengthRatio*.8f;
+      if(strictSizeOk && strictSizeReport.selectedCycle>=0 && strictSizeReduced &&
+         strictQuality.first+1.e-6f>=strictSizeOptions.qualityMeanFloor &&
+         strictQuality.second+1.e-6f>=strictSizeOptions.qualityP05Floor) {
+        local=std::move(strictSizeMesh);
+        result.report=strictSizeReport;
+        result.sizeRecovery=true;
+        result.error.clear();
+        improved=true;
+      } else if(!strictSizeError.empty()) {
+        result.retryReason=strictSizeError;
+      }
+    }
+    if(initialOk && result.report.maxEdgeLengthRatio>16.f) {
+      // For genuinely extreme slivers, run a collapse-first local pass before
+      // the conforming midpoint fallback. It is scoped to this packed task,
+      // preserves frozen patch boundaries, and accepts quality loss only if
+      // the resulting local sizing actually improves.
+      RemeshConfig collapseConfig=config;
+      collapseConfig.enableSplit=false;
+      collapseConfig.enableCollapse=true;
+      collapseConfig.enableSmooth=false;
+      collapseConfig.maxIterations=3;
+      collapseConfig.collapseRatio=1.15f;
+      SemanticMesh collapseMesh=local;
+      RawCudaOptions collapseOptions=options;
+      collapseOptions.allowQualityTradeoff=true;
+      collapseOptions.qualityMeanFloor=0.f;
+      collapseOptions.qualityP05Floor=0.f;
+      collapseOptions.collapsePasses=8;
+      collapseOptions.flipPasses=2;
+      collapseOptions.strictFlipQuality=false;
+      std::string collapseError;
+      collapseOptions.error=&collapseError;
+      RemeshReport collapseReport;
+      auto sizing=[&](const SemanticMesh &mesh) {
+        int overlong=0;float maxRatio=0.f;
+        for(const auto &edge:mesh.edges) {
+          const float h=.5f*(mesh.targetLength[edge.v0]+mesh.targetLength[edge.v1]);
+          if(!(h>0.f))continue;
+          const float ratio=distance(mesh.position(int(edge.v0)),mesh.position(int(edge.v1)))/h;
+          maxRatio=std::max(maxRatio,ratio);
+          if(ratio>config.splitRatio*(1.f+1.e-4f))++overlong;
+        }
+        return std::pair<int,float>{overlong,maxRatio};
+      };
+      const auto beforeCollapse=sizing(local);
+      const auto qualityBeforeCollapse=qualitySummary(local);
+      phaseStart=Clock::now();
+      const bool collapseOk=remeshRawCuda(collapseMesh,collapseConfig,collapseReport,collapseOptions);
+      result.secondsQualitySplit+=std::chrono::duration<double>(Clock::now()-phaseStart).count();
+      const auto afterCollapse=collapseOk?sizing(collapseMesh):beforeCollapse;
+      const auto qualityAfterCollapse=collapseOk?qualitySummary(collapseMesh):qualityBeforeCollapse;
+      if(collapseOk && collapseReport.collapses>0 &&
+         (afterCollapse.first<beforeCollapse.first || afterCollapse.second<beforeCollapse.second-1.e-4f ||
+          qualityAfterCollapse.first>qualityBeforeCollapse.first+1.e-5f ||
+          qualityAfterCollapse.second>qualityBeforeCollapse.second+1.e-5f)) {
+        local=std::move(collapseMesh);
+        result.report.collapses+=collapseReport.collapses;
+        result.report.flips+=collapseReport.flips;
+        result.report.smoothMoves+=collapseReport.smoothMoves;
+        result.report.overlongEdges=afterCollapse.first;
+        result.report.maxEdgeLengthRatio=afterCollapse.second;
+        result.sizeRecovery=true;
+        result.error.clear();
+        improved=true;
+      }
+    }
     if(!improved && initialOk &&
        initialQuality.first+1.e-6f>=localQualityFloor.first &&
        initialQuality.second+1.e-6f>=localQualityFloor.second) {
@@ -371,9 +567,14 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     }
     if(!required.empty())throw std::runtime_error("missing patch boundary edge");
     result.outputFaces=local.faceCount();result.accepted=true;job.succeeded=true;
+    if(result.unchanged) {
+      for(int patch=job.firstPatch;patch<job.firstPatch+job.patchCount;++patch)
+        result.unchangedPatchIds.push_back(uint32_t(patch));
+    }
     job.unchanged=result.unchanged;job.uniformSizing=result.uniformSizing;
     job.qualitySplit=result.qualitySplit;
     job.meanRecovery=result.meanRecovery;
+    job.sizeRecovery=result.sizeRecovery;
     job.output=std::move(local);
   } catch(const std::exception &e) {result.error=e.what();result.outputFaces=result.inputFaces;}
   if(!result.accepted && job.patchCount>1) {
@@ -382,6 +583,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     job.children.resize(job.patchCount);
     bool allAccepted=true;
     int outputFaces=0;
+    bool anySizeRecovery=false;
     std::string failures;
     RemeshReport combined;
     for(int k=0;k<job.patchCount;++k) {
@@ -393,6 +595,9 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
               strictFlipQuality,requireQualityImprovement,childResult);
       allAccepted &= childResult.accepted;
       outputFaces+=childResult.outputFaces;
+      anySizeRecovery|=childResult.sizeRecovery;
+      result.unchangedPatchIds.insert(result.unchangedPatchIds.end(),
+          childResult.unchangedPatchIds.begin(),childResult.unchangedPatchIds.end());
       if(!childResult.accepted)failures+=" patch "+std::to_string(child.firstPatch)+": "+childResult.error;
       const auto &r=childResult.report;
       combined.cyclesExecuted=std::max(combined.cyclesExecuted,r.cyclesExecuted);
@@ -400,6 +605,8 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       combined.splits+=r.splits;combined.collapses+=r.collapses;
       combined.flips+=r.flips;combined.smoothMoves+=r.smoothMoves;
       combined.geometryErrorMax=std::max(combined.geometryErrorMax,r.geometryErrorMax);
+      combined.maxEdgeLengthRatio=std::max(combined.maxEdgeLengthRatio,r.maxEdgeLengthRatio);
+      combined.overlongEdges+=r.overlongEdges;
       combined.secondsSetup+=r.secondsSetup;combined.secondsSplit+=r.secondsSplit;
       combined.secondsCollapse+=r.secondsCollapse;combined.secondsCompact+=r.secondsCompact;
       combined.secondsValidate+=r.secondsValidate;combined.secondsFlip+=r.secondsFlip;
@@ -414,9 +621,15 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       }
     }
     result.accepted=allAccepted;
+    std::sort(result.unchangedPatchIds.begin(),result.unchangedPatchIds.end());
+    result.unchangedPatchIds.erase(std::unique(result.unchangedPatchIds.begin(),
+        result.unchangedPatchIds.end()),result.unchangedPatchIds.end());
+    result.unchanged=allAccepted &&
+        result.unchangedPatchIds.size()==size_t(job.patchCount);
     result.outputFaces=outputFaces;
     result.error=allAccepted?std::string{}:failures;
     result.report=combined;
+    result.sizeRecovery=anySizeRecovery;
   }
   result.seconds=std::chrono::duration<double>(Clock::now()-start).count();
   result.report.seconds=result.seconds;
@@ -588,8 +801,113 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
     outputEdges.reserve(merged.edges.size());
     for(const auto &e:merged.edges)outputEdges.insert(edgeKey(e.v0,e.v1));
     for(const auto &feature:source.featureEdges)
-      if(!outputEdges.count(feature.first))
+      if(!outputEdges.count(feature.first) &&
+         !featureSegmentCovered(source,merged,feature.first,feature.second))
         throw std::runtime_error("hard feature edge missing after assembly");
+    std::unordered_set<uint32_t> coarsePatches,coveragePatches;
+    for(size_t task=0;task<report.patches.size();++task) {
+      const auto &patch=report.patches[task];
+      // Include every patch returned unchanged by the local GPU pass. Some
+      // have acceptable edge lengths but were still never modified because
+      // no cycle passed the old quality gate.
+      coarsePatches.insert(patch.unchangedPatchIds.begin(),patch.unchangedPatchIds.end());
+      coveragePatches.insert(patch.unchangedPatchIds.begin(),patch.unchangedPatchIds.end());
+      // The remesher may return a changed mesh that still contains extreme
+      // long edges. Include every source patch in such a task for the size
+      // recovery passes, not only tasks that were wholly unchanged.
+      if(patch.report.maxEdgeLengthRatio>cfg.splitRatio*(1.f+1.e-4f)) {
+        const int first=int(task)*patchesPerTask;
+        const int last=std::min(int(source.patches.size()),first+patchesPerTask);
+        for(int id=first;id<last;++id)coarsePatches.insert(uint32_t(id));
+      }
+    }
+    if(!coarsePatches.empty()) {
+      auto selectedSize=[&](const SemanticMesh &candidate) {
+        int count=0;float maxRatio=0.f;
+        for(const auto &edge:candidate.edges) {
+          const bool selected=(edge.face0>=0&&coarsePatches.count(candidate.facePatchId[edge.face0])) ||
+                              (edge.face1>=0&&coarsePatches.count(candidate.facePatchId[edge.face1]));
+          if(!selected)continue;
+          const float h=.5f*(candidate.targetLength[edge.v0]+candidate.targetLength[edge.v1]);
+          if(!(h>0.f))continue;
+          const float ratio=distance(candidate.position(int(edge.v0)),candidate.position(int(edge.v1)))/h;
+          maxRatio=std::max(maxRatio,ratio);
+          if(ratio>cfg.splitRatio*(1.f+1.e-4f))++count;
+        }
+        return std::pair<int,float>{count,maxRatio};
+      };
+      auto before=selectedSize(merged);
+      GeometryProjector refineProjector;
+      refineProjector.build(merged);
+      // Evaluate and commit one subdivision level at a time. The old code
+      // built up to eight levels and rejected the entire result if the final
+      // tail of refinement crossed a quality floor, discarding even useful
+      // early levels and leaving the original oversized patches untouched.
+      TriangleRefineStats refineTotal;
+      refineTotal.InputFaces=merged.faceCount();
+      for(int level=0;level<8;++level) {
+        SemanticMesh refined;
+        TriangleRefineStats refineStep;
+        std::string refineError;
+        const bool refineOk=refineMidpointConforming(merged,cfg,refineProjector,refined,refineStep,
+                                     &refineError,&coarsePatches,false,
+                                     level==0?&coveragePatches:nullptr);
+        if(!refineOk) {
+          break;
+        }
+        if(refineStep.SplitEdges==0 && refineStep.InsertedVertices==0)break;
+        const auto after=selectedSize(refined);
+        const bool sizeImproved=after.first<before.first ||
+                                after.second<before.second-1.e-4f;
+        // The first pass deliberately subdivides each still-unchanged patch
+        // once, even when its sizing field was already within the edge limit.
+        // Other selected patches are split only when overlong. Further passes
+        // are size-driven; topology and degeneracy remain validated.
+        if(!sizeImproved && level!=0)break;
+        merged=std::move(refined);
+        before=after;
+        refineTotal.SplitEdges+=refineStep.SplitEdges;
+        refineTotal.InsertedVertices+=refineStep.InsertedVertices;
+        refineTotal.RefinedFaces+=refineStep.RefinedFaces;
+        refineTotal.OutputFaces=merged.faceCount();
+        ++refineTotal.Levels;
+        for(int i=0;i<8;++i)refineTotal.MaskCounts[i]+=refineStep.MaskCounts[i];
+        refineTotal.touchedPatches.insert(refineStep.touchedPatches.begin(),
+                                          refineStep.touchedPatches.end());
+      }
+      if(refineTotal.Levels>0) {
+          report.finalSizeRefineSplits=refineTotal.SplitEdges;
+          report.finalSizeRefineLevels=refineTotal.Levels;
+          report.sizeRecoveryRegions=int(refineTotal.touchedPatches.size());
+          for(auto &patch:report.patches) {
+            const int first=int(&patch-report.patches.data())*patchesPerTask;
+            const int last=std::min(int(source.patches.size()),first+patchesPerTask);
+            bool touched=false;
+            for(int id=first;id<last;++id)touched|=refineTotal.touchedPatches.count(uint32_t(id))!=0;
+            if(touched) {
+              patch.unchangedPatchIds.erase(std::remove_if(patch.unchangedPatchIds.begin(),
+                  patch.unchangedPatchIds.end(),[&](uint32_t id){return refineTotal.touchedPatches.count(id)!=0;}),
+                  patch.unchangedPatchIds.end());
+              patch.unchanged=patch.unchangedPatchIds.size()==size_t(last-first);
+              patch.sizeRecovery|=std::any_of(refineTotal.touchedPatches.begin(),
+                  refineTotal.touchedPatches.end(),[&](uint32_t id){return id>=uint32_t(first)&&id<uint32_t(last);});
+            }
+          }
+          report.unchanged=int(std::count_if(report.patches.begin(),report.patches.end(),
+              [](const RawPatchResult &patch){return patch.accepted && patch.unchanged;}));
+      }
+    }
+    merged.rebuildTopology();
+    report.longEdgesAfterRefine=0;report.maxOutputEdgeRatio=0.f;
+    for(const auto &edge:merged.edges) {
+      const float h=.5f*(merged.targetLength[edge.v0]+merged.targetLength[edge.v1]);
+      if(!(h>0.f))continue;
+      const float ratio=distance(merged.position(int(edge.v0)),merged.position(int(edge.v1)))/h;
+      report.maxOutputEdgeRatio=std::max(report.maxOutputEdgeRatio,ratio);
+      if(ratio>cfg.splitRatio*(1.f+1.e-4f)) {
+        ++report.longEdgesAfterRefine;
+      }
+    }
     merged.compact();merged.rebuildTopology();merged.computeVertexNormals();
     if(!merged.validate(&problem))throw std::runtime_error("assembled mesh: "+problem);
     report.topologyValid=report.boundariesHeld=true;

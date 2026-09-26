@@ -58,9 +58,12 @@ int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
     std::vector<uint8_t> claimed(mesh.faceCount(),0);
     std::vector<EdgeRec> selected;
     for(const auto &e:mesh.edges) {
-      if(!(e.flags & (EdgePatchBoundary|EdgeMeshBoundary))) continue;
+      const bool sharp=(e.flags&EdgeSharp)!=0;
+      if(!(e.flags & (EdgePatchBoundary|EdgeMeshBoundary|EdgeSharp))) continue;
       const Vec3 a=mesh.position(e.v0),b=mesh.position(e.v1),mid=(a+b)*0.5f;
       float target=config.constantLength;
+      if(sharp && config.featureEdgeLength>0.f)
+        target=std::min(target,config.featureEdgeLength);
       for(uint32_t p:{e.patchLeft,e.patchRight}) if(mesh.LocalSizing && p<mesh.patches.size()) {
         target=std::min(target,mesh.LocalSizing->evaluate(p,a));
         target=std::min(target,mesh.LocalSizing->evaluate(p,b));
@@ -78,8 +81,11 @@ int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
     }
     if(size_t(total)+selected.size()>100000u) throw std::runtime_error("local boundary subdivision budget exceeded");
     for(const auto &e:selected) {
+      const bool sharp=(e.flags&EdgeSharp)!=0;
+      const bool boundary=(e.flags&(EdgePatchBoundary|EdgeMeshBoundary))!=0;
       const int middle=mesh.addVertex((mesh.position(e.v0)+mesh.position(e.v1))*0.5f,
-                                     e.patchLeft,VertexConstraint::Locked);
+                                     e.patchLeft,boundary?VertexConstraint::Locked:
+                                         (sharp?VertexConstraint::FeatureEdge:VertexConstraint::Locked));
       const uint64_t originalKey=(uint64_t(e.v0)<<32)|e.v1;
       if(auto feature=mesh.featureEdges.find(originalKey);feature!=mesh.featureEdges.end()) {
         const uint32_t id=feature->second;

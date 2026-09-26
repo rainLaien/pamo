@@ -38,10 +38,17 @@ void fillMeshMetrics(SemanticMesh &mesh, const RemeshConfig &config, RemeshRepor
       if (hit.ok) geom = std::max(geom, distance(mid, hit.position));
     }
   }
+  report.maxEdgeLengthRatio=0.f;
+  report.overlongEdges=0;
   for (const auto &e : mesh.edges) {
     const float h = RemeshPolicy::edgeTarget(mesh.targetLength[e.v0], mesh.targetLength[e.v1]);
     const float len = distance(mesh.position(int(e.v0)), mesh.position(int(e.v1)));
-    if (h > 0) sizing.push_back(std::abs(len / h - 1));
+    if (h > 0) {
+      const float ratio=len/h;
+      report.maxEdgeLengthRatio=std::max(report.maxEdgeLengthRatio,ratio);
+      if(ratio>config.splitRatio*(1.f+1.e-5f))++report.overlongEdges;
+      sizing.push_back(std::abs(ratio-1.f));
+    }
   }
   std::sort(qualities.begin(), qualities.end());
   std::sort(sizing.begin(), sizing.end());
@@ -85,6 +92,8 @@ std::string remeshReportJson(const RemeshReport &r) {
     << "  \"quality_min\": " << r.qualityMin << ",\n"
     << "  \"sizing_error_mean\": " << r.sizingErrorMean << ",\n"
     << "  \"sizing_error_p95\": " << r.sizingErrorP95 << ",\n"
+    << "  \"max_edge_length_ratio\": " << r.maxEdgeLengthRatio << ",\n"
+    << "  \"overlong_edges\": " << r.overlongEdges << ",\n"
     << "  \"geometry_error_max\": " << r.geometryErrorMax << ",\n"
     << "  \"moved_locked_vertices\": " << r.movedLockedVertices << ",\n"
     << "  \"missing_boundary_edges\": " << r.missingBoundaryEdges << ",\n"
