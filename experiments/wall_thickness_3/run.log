@@ -1,0 +1,53 @@
+[CadMesh] CPU mode: CUDA disabled for fitting, boundaries and charts
+[CadMesh] STL import: 0.013134 s
+[CadMesh] topology: 0.301502 s
+[CadMesh] model neighbors: 0.0061968 s
+[CadMesh] smooth components=332, certified=291
+[CadMesh] whole component fits: 40.2376 s
+[CadMesh] provisional planar cells=6303
+[CadMesh] planar cells: 0.0165025 s
+[CadMesh] narrow sampling links=820 (soft partition barriers; mesh edges unchanged)
+[CadMesh] narrow sampling links: 0.0175656 s
+[CadMesh] ruled strip candidates: attempts=34, support_faces=1356, accepted=33
+[CadMesh] ruled strip candidates: 21.3125 s
+[CadMesh] cylinder/cone ring absorption: rounds=12, absolute_distance_limit=0.02, accepted_faces=102, evaluations=225, ambiguous=0, normal_limit_deg=10, relaxed_faces=0, normal_rejections=3, distance_rejections=118, unreliable_rejections=0, stop=round_limit, budget_reached=yes
+[CadMesh] early cylinder/cone absorption: 0.0093648 s
+[CadMesh] after mother planes=396
+[CadMesh] strict planar cores: 0.0118445 s
+[CadMesh] analytic seeds=82, after analytic growth=475
+[CadMesh] analytic seed search: 15.4536 s
+[CadMesh] exposed component probes cumulative after analytic seed search: probes=124, over_budget=0, over_budget_reuses=0, traversed_faces=7706, traversal_seconds=0.0029656, repeated_face_sets=18, different_order=18, exact_failure_reuses=0, selector_calls=124, selector_seconds=25.6689, cached_components=38
+[CadMesh] after mother planes=475
+[CadMesh] mother planes: 0.0030777 s
+[CadMesh] residual reserve seeds=15/1250, spatial components=2, committed=1
+[CadMesh] residual seed search: 1.17008 s
+[CadMesh] exposed component probes cumulative after residual seed search: probes=125, over_budget=0, over_budget_reuses=0, traversed_faces=7708, traversal_seconds=0.0029677, repeated_face_sets=18, different_order=18, exact_failure_reuses=0, selector_calls=125, selector_seconds=25.669, cached_components=38
+[CadMesh] cylinder/cone ring absorption: rounds=8, absolute_distance_limit=0.02, accepted_faces=19, evaluations=37, ambiguous=0, normal_limit_deg=10, relaxed_faces=0, normal_rejections=0, distance_rejections=18, unreliable_rejections=0, stop=frontier_empty, budget_reached=no
+[CadMesh] residual cylinder/cone absorption: 0.0011636 s
+[CadMesh] long-side sliver assignments=0
+[CadMesh] long-side sliver assignment: 0.0002111 s
+[CadMesh] residual local recovery: attempts=3, recovered_cores=0, remaining_budget=253
+[CadMesh] residual classification: 0.0659979 s
+[CadMesh] ruled strip reassignment: patches=0, faces=0, evaluations=10, ambiguous=0, budget_reached=no
+[CadMesh] small ruled strip reassignment: 0.0001342 s
+[CadMesh] final adjacency merge=32/32 certified unions (residual absorptions=10), patches=457
+[CadMesh] analytic adjacency merge: 1.04721 s
+[CadMesh] residual seam bridges=0, transferred_faces=0, components=11, evaluated=128, common_models=0, common_model_faces=0, rejected(bound=0, support=11, opposition=0, width=0, hard=0, fit=0), patches=457
+[CadMesh] residual seam bridging: 0.0022275 s
+[CadMesh] model-first partition: 79.3568 s, patches=457
+[CadMesh] patch graph: 0.0969058 s, patches=457
+[CadMesh] small patches (<=2 input triangles): 95/457, planar=95, triangles=183, surface_area_percent=7.93868
+[CadMesh] native remesh: CPU thread pools
+[CadMesh] boundary split complete: 0.638566 s; starting analytic rebuild
+[CadMesh] ruled-first boundary handoff: proposals=33298; shared vertex sequences reconciled before adjacent charts
+[CadMesh] remesh failed: patch_id=94, source_patch_id=94, type=Plane, source_faces=3813, reason=parameterization_or_construction, boundary_loops=2; failure=chart_construction
+[CadMesh] remesh failed: patch_id=149, source_patch_id=149, type=Plane, source_faces=7929, reason=parameterization_or_construction, boundary_loops=2; failure=chart_construction
+[CadMesh] remesh shape rejected: patch_id=447, source_patch_id=441, failure=reference_normal, measured=11.4958; retained_original_child
+[CadMesh] reference shape guard: rejected_children=1, distance_limit=0.1, normal_limit_deg=10
+[CadMesh] remesh reason area: reason=deviation, code=4, patches=1, input_area_percent=0.000144108
+[CadMesh] remesh reason area: reason=parameterization_or_construction, code=5, patches=2, input_area_percent=11.8007
+[CadMesh] remesh face status: unselected=0, failed=11784, rebuilt=4171601, preserved_good=3
+[CadMesh] global patch remesh: partition_s=4.46788, analytic_s=36.1902, freeform_and_assembly_s=259.418, accepted=458/461, fallback=3
+[CadMesh] deferred ruled seams: shared_splits=0, seconds=9.33239; both incident sides updated
+[CadMesh] global patch remesh complete: boundary_sampling_s=0.638566, repartition_and_remesh_s=310.411, compact_s=0.315948, output_patches=464, accepted=458/461; global postprocessing and rollback skipped
+[CadMesh] wall thickness: sampling final mesh, workers=4

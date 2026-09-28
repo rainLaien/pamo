@@ -26,7 +26,8 @@ bool refineMidpointConforming(const SemanticMesh& input, const RemeshConfig& con
                               std::string* error = nullptr,
                               const std::unordered_set<uint32_t>* onlyPatches = nullptr,
                               bool projectNewVertices = true,
-                              const std::unordered_set<uint32_t>* forcePatches = nullptr);
+                              const std::unordered_set<uint32_t>* forcePatches = nullptr,
+                              bool sizeFeasibleSplits = false);
 
 // Multi-level conforming coarse refinement. Each level globally marks long
 // shared edges before retriangulation, so adjacent faces always reuse the same

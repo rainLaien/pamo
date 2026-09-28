@@ -2,7 +2,9 @@
 #include "cad_adaptive/SemanticMesh.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace cad_adaptive {
 uint32_t BoundarySizingField::BuildTree(std::vector<uint32_t> &ids, size_t begin, size_t end) {
@@ -40,7 +42,7 @@ uint32_t BoundarySizingField::BuildTree(std::vector<uint32_t> &ids, size_t begin
 
 std::shared_ptr<const BoundarySizingField> BoundarySizingField::create(
     const SemanticMesh &reference,const RemeshConfig &config,float gradation,bool curvatureSizing,
-    const std::vector<float> &patchTargetLengths) {
+    const std::vector<float> &patchTargetLengths,bool respectBoundarySampling) {
   if(!(gradation>0.0f) || !std::isfinite(gradation) ||
      !(config.constantLength>0.0f) || !std::isfinite(config.constantLength) ||
      !(config.maxGeometryError>0.0f) || !std::isfinite(config.maxGeometryError) ||
@@ -51,15 +53,38 @@ std::shared_ptr<const BoundarySizingField> BoundarySizingField::create(
   auto field=std::make_shared<BoundarySizingField>();
   field->mGradation=gradation; field->mFallbackLength=config.constantLength;
   field->mPatches.resize(reference.patches.size());
+  // A cone has one zero-curvature direction and one varying circumferential
+  // curvature. Use its smallest sampled radius for a safe patch-wide target;
+  // the cone is still projected against the immutable reference triangles.
+  std::vector<double> coneMinimumRadius(reference.patches.size(),std::numeric_limits<double>::infinity());
+  if(curvatureSizing) for(int f=0;f<reference.faceCount();++f) if(reference.faceAlive[f]) {
+    const uint32_t id=reference.facePatchId[f];
+    if(id>=reference.patches.size() || reference.patches[id].type!=PatchType::Cone)continue;
+    const auto &cone=reference.patches[id];
+    const Vec3 axis=normalize(cone.axis);
+    for(int v:reference.face(f)) {
+      const Vec3 delta=reference.position(v)-cone.origin;
+      coneMinimumRadius[id]=std::min(coneMinimumRadius[id],double(length(delta-axis*dot(delta,axis))));
+    }
+  }
   for(size_t i=0;i<reference.patches.size();++i) {
     const auto &p=reference.patches[i];
     float base=config.constantLength;
-    if(curvatureSizing && p.type==PatchType::Cylinder) {
+    if(curvatureSizing && (p.type==PatchType::Cylinder || p.type==PatchType::Cone)) {
       if(!(p.radius>0.0f) || !std::isfinite(p.radius) ||
          !(config.normalDegrees>0.0f) || !(config.normalDegrees<90.0f))
-        throw std::runtime_error("invalid cylinder sizing geometry");
+        throw std::runtime_error("invalid curved patch sizing geometry");
       // Target length is below the permissible chord, allowing for splitRatio.
-      const double radius=p.radius, epsilon=std::min(double(config.maxGeometryError),radius);
+      double radius=p.radius;
+      if(p.type==PatchType::Cone) {
+        if(!(p.radius<1.5707963267948966) || !(length2(p.axis)>1e-12f) ||
+           !(coneMinimumRadius[i]>0.0) || !std::isfinite(coneMinimumRadius[i]))
+          throw std::runtime_error("invalid cone sizing geometry");
+        // For a cone of semi-angle alpha, the circumferential principal
+        // curvature is cos(alpha)/radial_distance.
+        radius=coneMinimumRadius[i]/std::cos(double(p.radius));
+      }
+      const double epsilon=std::min(double(config.maxGeometryError),radius);
       const double chord=2.0*std::sqrt(std::max(0.0,2.0*radius*epsilon-epsilon*epsilon));
       const double normalChord=2.0*radius*std::sin(double(config.normalDegrees)*0.017453292519943295);
       base=std::min(base,float(0.95*std::min(chord,normalChord)/config.splitRatio));
@@ -78,9 +103,12 @@ std::shared_ptr<const BoundarySizingField> BoundarySizingField::create(
     const Vec3 a=reference.position(int(e.v0)),b=reference.position(int(e.v1));
     const float edgeLength=distance(a,b);
     if(!(edgeLength>0.0f) || !std::isfinite(edgeLength)) throw std::runtime_error("invalid sizing seed edge");
-    float target=std::min(config.constantLength,edgeLength);
+    float target=respectBoundarySampling?std::min(config.constantLength,edgeLength):config.constantLength;
     const uint32_t supports[2]={e.patchLeft,e.patchRight};
     for(uint32_t p:supports) if(p<field->mPatches.size()) target=std::min(target,field->mPatches[p].BaseLength);
+    if(!respectBoundarySampling &&
+       std::none_of(std::begin(supports),std::end(supports),[&](uint32_t p){
+         return p<field->mPatches.size() && target<field->mPatches[p].BaseLength;}))continue;
     const uint32_t seedId=uint32_t(field->mSeeds.size());
     field->mSeeds.push_back({a.x,a.y,a.z,b.x,b.y,b.z,target});
     for(int k=0;k<2;++k) {
@@ -97,15 +125,46 @@ std::shared_ptr<const BoundarySizingField> BoundarySizingField::create(
   return field;
 }
 
+std::shared_ptr<const BoundarySizingField> BoundarySizingField::subset(uint32_t first,uint32_t count) const {
+  if(first>mPatches.size() || count>mPatches.size()-first)
+    throw std::runtime_error("sizing subset patch range invalid");
+  auto out=std::make_shared<BoundarySizingField>();
+  out->mGradation=mGradation;out->mFallbackLength=mFallbackLength;
+  std::unordered_map<uint32_t,uint32_t> seedMap;
+  for(uint32_t p=first;p<first+count;++p) {
+    const auto &src=mPatches[p];
+    const uint32_t begin=uint32_t(out->mNodes.size());
+    for(uint32_t i=src.Begin;i<src.End;++i) {
+      auto node=mNodes[i];node.Skip=begin+(node.Skip-src.Begin);
+      if(node.Seed!=kInvalidId) {
+        auto found=seedMap.find(node.Seed);
+        if(found==seedMap.end()) {
+          const uint32_t mapped=uint32_t(out->mSeeds.size());
+          out->mSeeds.push_back(mSeeds[node.Seed]);
+          found=seedMap.emplace(node.Seed,mapped).first;
+        }
+        node.Seed=found->second;
+      }
+      out->mNodes.push_back(node);
+    }
+    out->mPatches.push_back({src.BaseLength,begin,uint32_t(out->mNodes.size())});
+  }
+  return out;
+}
+
 float BoundarySizingField::evaluate(uint32_t patchId,Vec3 point) const {
   if(patchId>=mPatches.size()) return mFallbackLength;
   return evaluateBoundarySizing(point.x,point.y,point.z,mPatches[patchId],
                                 mNodes.data(),mSeeds.data(),mGradation);
 }
-void BoundarySizingField::apply(SemanticMesh &mesh) const {
+void BoundarySizingField::apply(SemanticMesh &mesh,bool preserveFinerTargets) const {
   mesh.targetLength.resize(mesh.vertexCount());
   for(int v=0;v<mesh.vertexCount();++v)
-    mesh.targetLength[v]=evaluate(mesh.vertexPatchId[v],mesh.position(v));
+    {
+      const float h=evaluate(mesh.vertexPatchId[v],mesh.position(v));
+      mesh.targetLength[v]=preserveFinerTargets && mesh.targetLength[v]>0?
+          std::min(mesh.targetLength[v],h):h;
+    }
   // Boundary vertices have multiple supports; take the most restrictive one.
   for(int f=0;f<mesh.faceCount();++f) if(mesh.faceAlive[f])
     for(int v:mesh.face(f)) mesh.targetLength[v]=std::min(mesh.targetLength[v],evaluate(mesh.facePatchId[f],mesh.position(v)));

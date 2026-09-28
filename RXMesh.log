@@ -1,16 +1,16 @@
-[12:31:27] [info] RXMesh: Total number of device: 1
-[12:31:27] [info] RXMesh: Using device Number: 0
-[12:31:27] [info] RXMesh: Device name: NVIDIA GeForce RTX 3060
-[12:31:27] [info] RXMesh: Compute Capability: 8.6
-[12:31:27] [info] RXMesh: Total amount of global memory (MB): 12287.4
-[12:31:27] [info] RXMesh: 28 Multiprocessors, 128 CUDA Cores/MP: 3584 CUDA Cores
-[12:31:27] [info] RXMesh: Maximum # blocks per SM: 16
-[12:31:27] [info] RXMesh: ECC support: Disabled
-[12:31:27] [info] RXMesh: GPU Max Clock rate: 1777.0 MHz (1.78 GHz)
-[12:31:27] [info] RXMesh: Memory Clock rate: 7501.0 Mhz
-[12:31:27] [info] RXMesh: Memory Bus Width:  192-bit
-[12:31:27] [info] RXMesh: Peak Memory Bandwidth: 360.048000(GB/s)
-[12:31:27] [info] RXMesh: Kernels compiled for compute capability: 860
-[12:31:27] [info] RXMesh: Using cuSolver Version 11.7.1
-[12:31:27] [info] RXMesh: Using cuSparse Version 12.5.4
-[12:31:27] [info] RXMesh: Using cuBlas Version 12.6.3
+[12:43:20] [info] RXMesh: Total number of device: 1
+[12:43:20] [info] RXMesh: Using device Number: 0
+[12:43:20] [info] RXMesh: Device name: NVIDIA GeForce RTX 3060
+[12:43:20] [info] RXMesh: Compute Capability: 8.6
+[12:43:20] [info] RXMesh: Total amount of global memory (MB): 12287.4
+[12:43:20] [info] RXMesh: 28 Multiprocessors, 128 CUDA Cores/MP: 3584 CUDA Cores
+[12:43:20] [info] RXMesh: Maximum # blocks per SM: 16
+[12:43:20] [info] RXMesh: ECC support: Disabled
+[12:43:20] [info] RXMesh: GPU Max Clock rate: 1777.0 MHz (1.78 GHz)
+[12:43:20] [info] RXMesh: Memory Clock rate: 7501.0 Mhz
+[12:43:20] [info] RXMesh: Memory Bus Width:  192-bit
+[12:43:20] [info] RXMesh: Peak Memory Bandwidth: 360.048000(GB/s)
+[12:43:20] [info] RXMesh: Kernels compiled for compute capability: 860
+[12:43:20] [info] RXMesh: Using cuSolver Version 11.7.1
+[12:43:20] [info] RXMesh: Using cuSparse Version 12.5.4
+[12:43:20] [info] RXMesh: Using cuBlas Version 12.6.3

@@ -98,31 +98,33 @@ bool writePly(const std::string& path,const Ply& ply,const CadMesh::WallThicknes
               std::string& error){
   std::ofstream out(path);if(!out){error="cannot open output PLY";return false;}
   for(const auto& line:ply.header){
-    if(line=="end_header"){
-      out<<"comment wall_thickness is rolling_ball_diameter_in_model_units; invalid=nan\n"
-            "comment thickness_status valid=0_measured_or_9_feature_sample; see WALL_THICKNESS.md\n"
+    if(line.rfind("element face ",0)==0){
+      out<<"comment wall_thickness is vertex rolling_ball_diameter_in_model_units; invalid=nan\n"
+            "comment thickness_status valid=0_measured; see WALL_THICKNESS.md\n"
             "property float wall_thickness\nproperty uchar thickness_valid\nproperty uchar thickness_status\n";
     }
     out<<line<<'\n';
   }
-  for(const auto& line:ply.vertices)out<<line<<'\n';
   out<<std::setprecision(9);
-  for(std::size_t i=0;i<ply.faces.size();++i){
-    const auto status=thickness.Status[i];
-    const bool valid=status==CadMesh::ThicknessStatus::Measured||status==CadMesh::ThicknessStatus::FeatureSample;
-    out<<ply.faces[i]<<' ';
-    if(valid)out<<thickness.Values[i];else out<<"nan";
+  for(std::size_t i=0;i<ply.vertices.size();++i){
+    out<<ply.vertices[i];const auto status=thickness.Status[i];
+    const bool valid=status==CadMesh::ThicknessStatus::Measured;
+    out<<' ';if(valid)out<<thickness.Values[i];else out<<"nan";
     out<<' '<<int(valid)<<' '<<int(status)<<'\n';
+  }
+  for(std::size_t i=0;i<ply.faces.size();++i){
+    out<<ply.faces[i]<<'\n';
   }
   out.flush();if(!out){error="writing output PLY failed";return false;}return true;
 }
 }
 
 int main(int argc,char** argv){
-  if(argc<3){std::cerr<<"Usage: cad_mesh_thickness input.ply output.ply [--workers count] [--minimum value] [--contact-angle-deg value]\n";return 2;}
+  if(argc<3){std::cerr<<"Usage: cad_mesh_thickness input.ply output.ply [--workers count] [--minimum value] [--contact-angle-deg value] [--cuda-ray-seeds]\n";return 2;}
   try{
     CadMesh::WallThicknessOptions options;
     for(int i=3;i<argc;++i){
+      if(std::string(argv[i])=="--cuda-ray-seeds"){options.UseCudaRaySeeds=true;continue;}
       if(i+1>=argc)throw std::invalid_argument("missing value for "+std::string(argv[i]));
       const std::string key=argv[i++];const double value=std::stod(argv[i]);
       if(!std::isfinite(value))throw std::invalid_argument("nonfinite option value");
@@ -137,10 +139,11 @@ int main(int argc,char** argv){
     if(!CadMesh::WallThicknessCalculator::compute(ply.positions,ply.triangles,options,result,error))throw std::runtime_error(error);
     if(!writePly(argv[2],ply,result,error))throw std::runtime_error(error);
     const double elapsed=std::chrono::duration<double>(Clock::now()-start).count();
-    std::cout<<std::setprecision(9)<<"[CadMesh] wall thickness only: faces="<<ply.triangles.size()
-      <<", valid="<<result.ValidFaces<<", valid_area_fraction="<<result.ValidAreaFraction
+    std::cout<<std::setprecision(9)<<"[CadMesh] wall thickness only: vertices="<<ply.vertexCount
+      <<", valid="<<result.ValidVertices<<", valid_vertex_fraction="<<result.ValidVertexFraction
       <<", min="<<result.Minimum<<", max="<<result.Maximum
-      <<", area_weighted_mean="<<result.AreaWeightedAverage
+      <<", mean="<<result.Average
+      <<", cuda_ray_seeds="<<(result.CudaRaySeedsUsed?"yes":"no")
       <<", preparation_s="<<result.PreparationSeconds<<", sampling_s="<<result.SamplingSeconds
       <<", read_compute_write_s="<<elapsed<<"\nOutput: "<<argv[2]<<'\n';
     return 0;

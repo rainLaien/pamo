@@ -1,9 +1,13 @@
 # Optional wall thickness
 
-`WallThicknessCalculator` adapts the face-sampling rolling-ball algorithm from
+`WallThicknessCalculator` adapts the rolling-ball search from
 `F:/work/sunjie/Apollo/Apollo/src/algorithm/thickness/wall_thickness_calculator.cpp`.
-It retains AABB traversal, inscribed-ball shrinking, containment/contact checks
-and `refineFaceRepresentative`. It does not replace these with normal-ray length.
+It retains AABB traversal, inscribed-ball shrinking, and containment/contact
+checks. Each query starts at an existing remesh vertex;
+there is no subdivision, resampling, representative relocation, or mesh edit.
+The sphere center is constrained to the inward vertex-normal line. The solver
+shrinks the radius against nearby triangles, then checks containment and wall
+contact; it does not search every possible sphere center in the mesh.
 Its private `WallThicknessGeometry.h` implements vector operations, triangles,
 slab ray/box tests and a median-split BVH in standard C++17. The public input
 is double coordinate arrays and triangle indices. Neither the public header
@@ -36,8 +40,8 @@ cmake --build .\cad_mesh\build --target cad_mesh_thickness
 ```
 
 This path reads the existing vertices and triangular faces, computes face
-properties, then copies the original vertex rows and face data unchanged while
-appending `wall_thickness`, `thickness_valid`, and `thickness_status`.
+properties, then copies the original coordinates and face data while appending
+`wall_thickness`, `thickness_valid`, and `thickness_status` to each vertex row.
 
 ## Measurement and output
 
@@ -46,10 +50,11 @@ including preserved faces. Patch IDs do not limit opposite contacts.
 The private measurement mesh copies face coordinates without changing geometry
 or face order. Face-mode queries do not require adjacency or vertex welding;
 shared-edge ray hits retain Apollo's distance-based deduplication. A read-only AABB tree is built
-once, then workers claim batches of 32 faces. Thickness is CPU-only even in a
+once, then workers claim batches of 32 vertices. The vertex direction is the
+angle-weighted sum of incident unit face normals. Thickness is CPU-only even in a
 CUDA remesh run, and its pool runs after remesh pools have completed.
 
-The existing remesh_result.ply gains these **face** properties:
+The existing remesh_result.ply gains these **vertex** properties:
 
 | Property | Meaning |
 | --- | --- |
@@ -57,32 +62,35 @@ The existing remesh_result.ply gains these **face** properties:
 | thickness_valid | 1 for accepted measurements, 0 otherwise |
 | thickness_status | Diagnostic status independent of the numeric value |
 
-Status values used by face sampling: 0 measured, 2 invalid normal,
+Status values used by vertex sampling: 0 measured, 2 invalid normal,
 5 invalid sphere, 6 nonfinite, 7 below minimum, 8 above maximum,
-9 accepted relocated representative sample, 11 penetrating sphere,
+11 penetrating sphere,
 12 local-surface contact rather than accepted wall contact.
 The other Apollo status IDs are reserved in the public enum.
 `remeshed` and `remesh_reason` retain their existing meanings.
 
-The log reports valid face count, valid area fraction, minimum, maximum,
-area-weighted mean over valid faces, preparation time and sampling time.
-Zero valid faces is exported with all values invalid; zero-valued summary
+The log reports valid vertex count/fraction, minimum, maximum, arithmetic mean,
+preparation time and sampling time. Zero valid vertices is exported with all values invalid; zero-valued summary
 statistics in that case are placeholders, not measured zero thickness.
 
-This is the Apollo **face** mode. Vertex display interpolation, reconstruction
-of failed values and extra sampling subdivision are not enabled. It relies on
+This is a vertex-query adaptation of Apollo's rolling-ball search. It relies on
 the input's face orientation to define inward directions and retains Apollo's
 maximum radius of half the smallest bounding-box dimension. It does not repair
 open/self-intersecting meshes. Structural input errors return an error; failed
-individual sphere queries remain visible as invalid face measurements.
+individual sphere queries remain visible as invalid vertex measurements.
 
 The BVH construction and traversal backend have changed, so floating-point tie
 ordering may differ from Apollo. Identical numerical results are not claimed.
-The unused Apollo vertex-only source relocation/adjacency branches were removed;
-face representative refinement and full-mesh containment remain enabled.
+The optional CUDA path currently runs one thread per vertex to find the first
+nonincident face along the inward normal, using the pointer-free BVH. The
+rolling-ball shrink, containment, contact and inside/outside certification
+still run on the CPU, using the GPU hit as their initial radius bound. Thus the
+measurement definition is retained, while only ray initialization is offloaded.
+Native CUDA remesh runs enable this stage; CPU runs do not. The standalone
+measurement executable accepts `--cuda-ray-seeds` to request it and falls back
+to CPU ray queries if CUDA initialization or execution fails.
+Iteration counts need not match across vertices: CUDA threads can run their own
+bounded loops, with warp divergence affecting speed rather than correctness.
 
-The native executable builds with this source. A smoke run on
-`examples/generic_fixture.stl` completed with 2,953 valid measurements out of
-3,226 final faces (96.76% valid area); the output PLY contained all three face
-properties. These figures are an integration check, not a general accuracy
-benchmark.
+The native executables build with this source. The earlier face-mode smoke
+statistics do not describe this vertex-mode implementation.

@@ -1,6 +1,7 @@
 #pragma once
 #include <cfloat>
 #include <cuda_runtime.h>
+#include "cad_adaptive/BoundarySizingField.h"
 namespace cad_adaptive::gpu {
 __device__ inline float3 sub3(float3 a, float3 b) {
   return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -42,7 +43,15 @@ struct ReferenceSurfaceGpu {
   const ReferenceBvhNode *sizingNodes=nullptr;
   const int *sizingIds=nullptr;
   int sizingNodeCount=0;
+  const BoundarySizingPatch *boundaryPatches=nullptr;
+  const BoundarySizingNode *boundaryNodes=nullptr;
+  const BoundarySizingSeed *boundarySeeds=nullptr;
+  int boundaryPatchCount=0;
+  float boundaryGradation=0;
 };
+__device__ inline bool hasSizing(ReferenceSurfaceGpu ref) {
+  return ref.sizingCount>0 || ref.boundaryPatches!=nullptr;
+}
 __device__ inline float3 add3(float3 a, float3 b) {
   return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
@@ -58,6 +67,9 @@ __device__ inline float boxDistance2(float3 p,const ReferenceBvhNode &t) {
 // Immutable source features define a continuous spatial field. Re-evaluating it
 // after every edit prevents collapse/smoothing from erasing the refinement.
 __device__ inline float sizingAt(ReferenceSurfaceGpu ref, float3 p, int patch=0) {
+  if(ref.boundaryPatches && patch>=0 && patch<ref.boundaryPatchCount)
+    return evaluateBoundarySizing(p.x,p.y,p.z,ref.boundaryPatches[patch],
+                                  ref.boundaryNodes,ref.boundarySeeds,ref.boundaryGradation);
   float h = ref.regularLength;
   int node=0;
   while(node<(ref.sizingNodeCount ? ref.sizingNodeCount : 1)) {

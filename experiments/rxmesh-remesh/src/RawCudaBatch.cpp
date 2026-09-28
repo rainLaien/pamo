@@ -1,6 +1,7 @@
 #include "cad_adaptive/RawCudaBatch.h"
 #include "cad_adaptive/PartitionInput.h"
 #include "cad_adaptive/TriangleRefineBackend.h"
+#include "cad_adaptive/BoundarySizingField.h"
 #include "RemeshWorkerPool.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -17,11 +18,185 @@
 #include <unordered_set>
 
 namespace cad_adaptive {
+int boundaryTargetMismatchCount(const SemanticMesh& before,const std::vector<int>& beforeAnchors,
+                                const SemanticMesh& after,const std::vector<int>& afterAnchors) {
+  if(beforeAnchors.size()!=size_t(before.vertexCount()) || afterAnchors.size()!=size_t(after.vertexCount()))
+    throw std::runtime_error("invalid boundary sizing anchor map");
+  std::map<int,float> targets;
+  for(int v=0;v<before.vertexCount();++v)if(beforeAnchors[v]>=0)targets.emplace(beforeAnchors[v],before.targetLength[v]);
+  std::set<int> boundary;
+  for(const auto &edge:after.edges)if(edge.flags&EdgeMeshBoundary) {boundary.insert(int(edge.v0));boundary.insert(int(edge.v1));}
+  int mismatch=0;
+  for(int v:boundary) {
+    const auto found=targets.find(afterAnchors[v]);
+    const float h=after.targetLength[v];
+    if(afterAnchors[v]<0 || found==targets.end() || !(h>0) || !(found->second>0) ||
+       std::abs(h-found->second)>std::max(1.e-6f,std::abs(found->second)*1.e-6f))++mismatch;
+  }
+  return mismatch;
+}
 namespace {
 using Clock=std::chrono::steady_clock;
 using Position=std::tuple<float,float,float>;
 Position positionKey(Vec3 p){return {p.x,p.y,p.z};}
 uint64_t edgeKey(int a,int b){return (uint64_t(std::min(a,b))<<32)|uint32_t(std::max(a,b));}
+void remeshCircularPlaneInteriors(SemanticMesh &mesh,const RemeshConfig &cfg,RawBatchReport &report) {
+  if(!(cfg.featureEdgeLength>0.f))return;
+  const int originalFaces=mesh.faceCount();
+  bool insertedVertices=false;
+  std::set<uint32_t> remeshedPatches;
+  std::vector<std::vector<int>> patchFaces(mesh.patches.size());
+  std::vector<std::vector<std::pair<int,int>>> patchBoundary(mesh.patches.size());
+  for(int f=0;f<originalFaces;++f)if(mesh.faceAlive[f] && mesh.facePatchId[f]<patchFaces.size())
+    patchFaces[mesh.facePatchId[f]].push_back(f);
+  for(const auto &edge:mesh.edges) {
+    const int a=edge.face0>=0?int(mesh.facePatchId[edge.face0]):-1;
+    const int b=edge.face1>=0?int(mesh.facePatchId[edge.face1]):-1;
+    if(a==b)continue;
+    if(a>=0 && a<int(patchBoundary.size()))patchBoundary[a].push_back({int(edge.v0),int(edge.v1)});
+    if(b>=0 && b<int(patchBoundary.size()))patchBoundary[b].push_back({int(edge.v0),int(edge.v1)});
+  }
+  constexpr double pi=3.14159265358979323846;
+  for(size_t patch=0;patch<mesh.patches.size();++patch) {
+    const auto &faces=patchFaces[patch];
+    const auto &edges=patchBoundary[patch];
+    if(mesh.patches[patch].type!=PatchType::Plane || faces.size()<12 ||
+       edges.size()<10 || edges.size()>128)continue;
+    std::map<int,std::vector<int>> neighbors;
+    for(auto [a,b]:edges) {neighbors[a].push_back(b);neighbors[b].push_back(a);}
+    if(neighbors.size()!=edges.size() ||
+       std::any_of(neighbors.begin(),neighbors.end(),[](const auto &item){return item.second.size()!=2;}))continue;
+    std::vector<int> outer;outer.reserve(edges.size());
+    int current=edges.front().first,previous=-1;
+    for(size_t k=0;k<edges.size();++k) {
+      outer.push_back(current);
+      const auto &adjacent=neighbors[current];
+      const int next=adjacent[0]==previous?adjacent[1]:adjacent[0];
+      previous=current;current=next;
+      if(current==outer.front() && k+1<edges.size())break;
+    }
+    if(outer.size()!=edges.size() || current!=outer.front())continue;
+    const auto first=mesh.face(faces.front());
+    const Vec3 normal=triangleNormal(mesh.position(first[0]),mesh.position(first[1]),mesh.position(first[2]));
+    if(length2(normal)<.5f)continue;
+    Vec3 center{};
+    for(int v:outer)center=center+mesh.position(v);
+    center=center*(1.f/float(outer.size()));
+    double area=0,perimeter=0,signedArea=0;
+    for(int f:faces) {
+      auto t=mesh.face(f);
+      area+=.5*length(cross(mesh.position(t[1])-mesh.position(t[0]),
+                              mesh.position(t[2])-mesh.position(t[0])));
+    }
+    for(size_t i=0;i<outer.size();++i) {
+      const Vec3 a=mesh.position(outer[i]),b=mesh.position(outer[(i+1)%outer.size()]);
+      perimeter+=distance(a,b);
+      signedArea+=dot(cross(a-center,b-center),normal);
+    }
+    if(!(perimeter>0) || signedArea==0)continue;
+    if(signedArea<0)std::reverse(outer.begin(),outer.end());
+    const double circularity=4*pi*area/(perimeter*perimeter);
+    if(circularity<.9 || circularity>1.02)continue;
+    ++report.circularPlaneSkipped;
+    float inradius=std::numeric_limits<float>::max();
+    bool convex=true;
+    for(size_t i=0;i<outer.size();++i) {
+      const Vec3 a=mesh.position(outer[i]),b=mesh.position(outer[(i+1)%outer.size()]);
+      const Vec3 c=mesh.position(outer[(i+2)%outer.size()]);
+      const Vec3 ab=b-a;
+      if(dot(cross(ab,c-b),normal)<-1.e-5f*length2(ab)){convex=false;break;}
+      inradius=std::min(inradius,length(cross(ab,center-a))/std::max(length(ab),1.e-12f));
+    }
+    if(!convex || !(inradius>0))continue;
+    const Vec3 u=normalize(mesh.position(outer.front())-center),v=normalize(cross(normal,u));
+    if(length2(u)<.5f || length2(v)<.5f)continue;
+    std::vector<double> outerPhase;outerPhase.reserve(outer.size()+1);
+    for(int id:outer) {
+      const Vec3 d=mesh.position(id)-center;
+      double angle=std::atan2(double(dot(d,v)),double(dot(d,u)));
+      if(angle<0)angle+=2*pi;
+      outerPhase.push_back(angle/(2*pi));
+    }
+    outerPhase.front()=0;
+    bool monotone=true;
+    for(size_t i=1;i<outerPhase.size();++i)
+      if(outerPhase[i]<=outerPhase[i-1]+1.e-7){monotone=false;break;}
+    if(!monotone)continue;
+    outerPhase.push_back(1.);
+    const int n0=std::min(int(outer.size())-1,std::max(8,int(std::lround(outer.size()*.72))));
+    const int n1=std::min(n0-1,std::max(6,int(std::lround(outer.size()*.36))));
+    std::vector<int> ring0,ring1;
+    auto makeRing=[&](int count,float radius,std::vector<int> &ids) {
+      ids.reserve(count);
+      for(int j=0;j<count;++j) {
+        const float angle=float(2*pi*j/count);
+        const Vec3 p=center+(u*std::cos(angle)+v*std::sin(angle))*radius;
+        const int id=mesh.addVertex(p,uint32_t(patch),VertexConstraint::Surface);
+        const float distanceFromBoundary=std::max(0.f,inradius-radius);
+        mesh.targetLength[id]=std::min(cfg.constantLength,cfg.featureEdgeLength+
+            (cfg.constantLength-cfg.featureEdgeLength)*distanceFromBoundary/cfg.featureBand);
+        ids.push_back(id);
+      }
+    };
+    makeRing(n0,.7f*inradius,ring0);
+    makeRing(n1,.35f*inradius,ring1);
+    const int middle=mesh.addVertex(center,uint32_t(patch),VertexConstraint::Surface);
+    insertedVertices=true;
+    mesh.targetLength[middle]=std::min(cfg.constantLength,cfg.featureEdgeLength+
+        (cfg.constantLength-cfg.featureEdgeLength)*inradius/cfg.featureBand);
+    std::vector<std::array<int,3>> triangles;
+    auto bridge=[&](const std::vector<int> &outside,const std::vector<double> &phase,
+                    const std::vector<int> &inside) {
+      const int no=int(outside.size()),ni=int(inside.size());
+      int i=0,j=0;
+      while(i<no || j<ni) {
+        const double nextO=i<no?phase[i+1]:2.;
+        const double nextI=j<ni?double(j+1)/ni:2.;
+        if(nextO<=nextI) {
+          triangles.push_back({outside[i%no],outside[(i+1)%no],inside[j%ni]});++i;
+        } else {
+          triangles.push_back({outside[i%no],inside[(j+1)%ni],inside[j%ni]});++j;
+        }
+      }
+    };
+    bridge(outer,outerPhase,ring0);
+    std::vector<double> ringPhase(n0+1);
+    for(int j=0;j<=n0;++j)ringPhase[j]=double(j)/n0;
+    bridge(ring0,ringPhase,ring1);
+    for(int j=0;j<n1;++j)triangles.push_back({ring1[j],ring1[(j+1)%n1],middle});
+    std::vector<float> oldQuality,newQuality;oldQuality.reserve(faces.size());newQuality.reserve(triangles.size());
+    for(int f:faces) {
+      auto t=mesh.face(f);
+      oldQuality.push_back(triangleQuality(mesh.position(t[0]),mesh.position(t[1]),mesh.position(t[2])));
+    }
+    bool valid=true;
+    for(const auto &t:triangles) {
+      const Vec3 a=mesh.position(t[0]),b=mesh.position(t[1]),c=mesh.position(t[2]);
+      if(dot(cross(b-a,c-a),normal)<=1.e-8f || !std::isfinite(a.x+b.x+c.x)){valid=false;break;}
+      newQuality.push_back(triangleQuality(a,b,c));
+    }
+    if(!valid)continue;
+    const float oldMean=std::accumulate(oldQuality.begin(),oldQuality.end(),0.f)/oldQuality.size();
+    const float newMean=std::accumulate(newQuality.begin(),newQuality.end(),0.f)/newQuality.size();
+    std::sort(oldQuality.begin(),oldQuality.end());std::sort(newQuality.begin(),newQuality.end());
+    if(newMean+1.e-5f<oldMean || newQuality[newQuality.size()/20]+1.e-5f<oldQuality[oldQuality.size()/20])continue;
+    for(int f:faces)mesh.killFace(f);
+    for(const auto &t:triangles)mesh.addFace(t[0],t[1],t[2],uint32_t(patch),PatchType::Plane);
+    ++report.circularPlaneRemeshed;--report.circularPlaneSkipped;
+    remeshedPatches.insert(uint32_t(patch));
+    report.circularPlaneAddedFaces+=int(triangles.size())-int(faces.size());
+  }
+  if(insertedVertices) {
+    mesh.compact();mesh.rebuildTopology();mesh.computeVertexNormals();
+  }
+  for(auto &task:report.patches) {
+    auto &ids=task.unchangedPatchIds;
+    ids.erase(std::remove_if(ids.begin(),ids.end(),[&](uint32_t id){return remeshedPatches.count(id)!=0;}),ids.end());
+    if(!remeshedPatches.empty() && task.unchanged && ids.empty())task.unchanged=false;
+  }
+  report.unchanged=int(std::count_if(report.patches.begin(),report.patches.end(),
+      [](const RawPatchResult &task){return task.accepted && task.unchanged;}));
+}
 bool featureSegmentCovered(const SemanticMesh &source,const SemanticMesh &output,
                            uint64_t sourceEdge,uint32_t featureId) {
   const uint32_t a=uint32_t(sourceEdge>>32),b=uint32_t(sourceEdge);
@@ -129,6 +304,32 @@ struct Job {
   std::vector<int> aliases;
   std::vector<Job> children;
 };
+Job extractIncumbentPatch(const Job &parent,int patch) {
+  Job part;part.firstPatch=parent.firstPatch+patch;part.patchCount=1;
+  part.bytes=parent.bytes;part.succeeded=true;part.unchanged=parent.unchanged;
+  part.output.patches.push_back(parent.output.patches[patch]);
+  if(parent.output.LocalSizing)part.output.LocalSizing=parent.output.LocalSizing->subset(patch,1);
+  std::map<int,int> vertices;
+  for(int f=0;f<parent.output.faceCount();++f)if(parent.output.faceAlive[f] &&
+       parent.output.facePatchId[f]==uint32_t(patch)) {
+    auto t=parent.output.face(f);
+    for(int &v:t) {
+      const int old=v;auto found=vertices.find(old);
+      if(found==vertices.end()) {
+        v=part.output.addVertex(parent.output.position(old),0,VertexConstraint(parent.output.vertexConstraint[old]));
+        part.output.targetLength[v]=parent.output.targetLength[old];
+        part.aliases.push_back(parent.aliases[old]);vertices.emplace(old,v);
+      } else v=found->second;
+    }
+    part.output.addFace(t[0],t[1],t[2],0,part.output.patches[0].type);
+  }
+  for(auto feature:parent.output.featureEdges) {
+    auto a=vertices.find(int(feature.first>>32)),b=vertices.find(int(uint32_t(feature.first)));
+    if(a!=vertices.end() && b!=vertices.end())part.output.featureEdges[edgeKey(a->second,b->second)]=feature.second;
+  }
+  part.output.rebuildTopology();
+  return part;
+}
 bool splitConflictingChord(Job &job,int sourceA,int sourceB,std::string &reason) {
   if(!job.succeeded){reason="job not accepted";return false;}
   int a=-1,b=-1;
@@ -186,13 +387,21 @@ bool splitConflictingChord(Job &job,int sourceA,int sourceB,std::string &reason)
 }
 void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
              bool stopWhenIdle,int smoothPasses,int collapsePasses,int flipPasses,bool strictFlipQuality,
-             bool requireQualityImprovement,RawPatchResult &result) {
+             bool requireQualityImprovement,bool legacyCoverageAcceptance,bool exploreProvisionalChildren,bool trackRegionCandidates,
+             float lowQualityThreshold,RawPatchResult &result) {
   const auto start=Clock::now();
   result.inputFaces=int(job.faces.size());result.workspaceBytes=job.bytes;
+  std::vector<RegionQuality> originalPatchQuality;
   try {
     SemanticMesh local;
     local.patches.assign(source.patches.begin()+job.firstPatch,
                          source.patches.begin()+job.firstPatch+job.patchCount);
+    if(source.LocalSizing) {
+      const auto field=source.LocalSizing->subset(job.firstPatch,job.patchCount);
+      if(!field->nodes().empty() || std::any_of(field->patches().begin(),field->patches().end(),
+           [&](const BoundarySizingPatch &p){return p.BaseLength!=config.constantLength;}))
+        local.LocalSizing=field;
+    }
     std::map<int,int> indices;
     std::map<Position,int> anchors;
     std::vector<int> originals;
@@ -218,6 +427,12 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       if(a!=indices.end() && b!=indices.end())local.featureEdges[edgeKey(a->second,b->second)]=feature.second;
     }
     local.rebuildTopology();
+    if(local.LocalSizing)local.LocalSizing->apply(local);
+    const auto sourceRegionQuality=evaluateRegionQuality(local,config,lowQualityThreshold);
+    const auto endpointQualitySafe=[&](const SemanticMesh& candidate) {
+      return legacyCoverageAcceptance || !requireQualityImprovement ||
+        qualityEndpointMask(sourceRegionQuality,evaluateRegionQuality(candidate,config,lowQualityThreshold))==0;
+    };
     const auto localQualityFloor=requireQualityImprovement?qualitySummary(local):
         std::pair<float,float>{0.f,0.f};
     result.inputQualityMean=localQualityFloor.first;
@@ -229,18 +444,21 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       required.insert(edgeKey(originals[e.v0],originals[e.v1]));
     const bool hasSharedOrOpenBoundary=source.patches.size()>1 ||
         std::any_of(source.edges.begin(),source.edges.end(),[](const EdgeRec &e){return (e.flags&EdgeMeshBoundary)!=0;});
-    float sourceMaxRatio=0.f;
-    for(const auto &edge:local.edges) {
-      const float h=.5f*(local.targetLength[edge.v0]+local.targetLength[edge.v1]);
-      if(h>0.f)sourceMaxRatio=std::max(sourceMaxRatio,
-          distance(local.position(int(edge.v0)),local.position(int(edge.v1)))/h);
-    }
-    RawCudaOptions options;options.independentStream=true;options.quiet=true;options.error=&result.error;options.freezeBoundary=hasSharedOrOpenBoundary;options.stopWhenIdle=stopWhenIdle;options.smoothPasses=smoothPasses;options.collapsePasses=collapsePasses;options.flipPasses=flipPasses;options.strictFlipQuality=strictFlipQuality;options.allowQualityTradeoff=sourceMaxRatio>16.f;options.workspaceBytes=job.bytes;
+    // The initial pass uses the same shape guards with or without a spatial
+    // sizing field. Previously zero-initialized uniform targets disabled this
+    // relaxation accidentally; filling valid local targets must not enable
+    // aggressive collapse across every unrelated patch in the packed task.
+    RawCudaOptions options;options.independentStream=true;options.quiet=true;options.error=&result.error;options.freezeBoundary=hasSharedOrOpenBoundary;options.stopWhenIdle=stopWhenIdle;options.smoothPasses=smoothPasses;options.collapsePasses=collapsePasses;options.flipPasses=flipPasses;options.strictFlipQuality=strictFlipQuality;options.allowQualityTradeoff=false;options.workspaceBytes=job.bytes;
     // Let the GPU finish its best valid cycle even when its quality metrics
     // trade off against the source. Quality floors here previously caused
     // remeshRawCuda to restore the input mesh wholesale for difficult patches.
     options.qualityMeanFloor=0.f;options.qualityP05Floor=0.f;
+    options.trackRegionCandidates=trackRegionCandidates;options.lowQualityThreshold=lowQualityThreshold;
     SemanticMesh initialLocal;
+    const SemanticMesh originalLocal=local;
+    if(exploreProvisionalChildren && job.patchCount>1)
+      originalPatchQuality=evaluatePatchQuality(originalLocal,config,lowQualityThreshold);
+    options.referenceMesh=&originalLocal;
     if(requireQualityImprovement)initialLocal=local;
     auto phaseStart=Clock::now();
     const bool initialOk=remeshRawCuda(local,config,result.report,options);
@@ -248,10 +466,17 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     const float initialSizingP95=result.report.sizingErrorP95;
     const auto initialQuality=initialOk?qualitySummary(local):std::pair<float,float>{0.f,0.f};
     bool improved=initialOk && (!requireQualityImprovement ||
-        (result.report.selectedCycle>=0 &&
+        (legacyCoverageAcceptance ? (result.report.selectedCycle>=0 &&
          initialQuality.first+1.e-6f>=localQualityFloor.first &&
-         initialQuality.second+1.e-6f>=localQualityFloor.second));
-    if(!improved && initialOk && requireQualityImprovement && meshChanged(initialLocal,local)) {
+         initialQuality.second+1.e-6f>=localQualityFloor.second) :
+         endpointQualitySafe(local)));
+    // Preserve a geometrically valid incumbent while trying recovery. A quality
+    // failure is not an exception and must not restore the whole source region.
+    SemanticMesh provisionalMesh;
+    RemeshReport provisionalReport=result.report;
+    bool provisionalValid=initialOk;
+    if(!legacyCoverageAcceptance && initialOk && !improved)provisionalMesh=local;
+    if(legacyCoverageAcceptance && !improved && initialOk && requireQualityImprovement && meshChanged(initialLocal,local)) {
       // A changed, valid local result is useful coverage even when no cycle
       // satisfies the old shape gate. Keep it and report the quality tradeoff
       // at the assembled-mesh level instead of silently restoring this patch.
@@ -270,15 +495,24 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       // gain. The full output still has to pass its global quality gate.
       retryOptions.qualityMeanFloor=localQualityFloor.first*1.01f;
       retryOptions.qualityP05Floor=localQualityFloor.second*.99f;
+      if(!initialOk) {
+        // Recover legal geometry first without selecting the unchanged source
+        // solely because no intermediate cycle reaches a quality floor.
+        retryOptions.qualityMeanFloor=retryOptions.qualityP05Floor=0.f;
+      }
       RemeshConfig retryConfig=config;
       retryConfig.maxIterations=std::min(config.maxIterations,8);
       RemeshReport retryReport;
       phaseStart=Clock::now();
       if(remeshRawCuda(initialLocal,retryConfig,retryReport,retryOptions)) {
+        if(!provisionalValid && !legacyCoverageAcceptance) {
+          provisionalMesh=initialLocal;provisionalReport=retryReport;
+          provisionalValid=true;
+        }
         const auto retryQuality=qualitySummary(initialLocal);
         if(retryReport.selectedCycle>=0 &&
            retryQuality.first+1.e-6f>=retryOptions.qualityMeanFloor &&
-           retryQuality.second+1.e-6f>=retryOptions.qualityP05Floor) {
+           retryQuality.second+1.e-6f>=retryOptions.qualityP05Floor && endpointQualitySafe(initialLocal)) {
           local=std::move(initialLocal);
           result.report=retryReport;
           result.error.clear();
@@ -315,7 +549,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       auto uniformQuality=uniformOk?qualitySummary(uniformMesh):std::pair<float,float>{0.f,0.f};
       if(!(uniformOk && uniformReport.selectedCycle>=0 &&
            uniformQuality.first+1.e-6f>=uniformOptions.qualityMeanFloor &&
-           uniformQuality.second+1.e-6f>=uniformOptions.qualityP05Floor)) {
+           uniformQuality.second+1.e-6f>=uniformOptions.qualityP05Floor && endpointQualitySafe(uniformMesh))) {
         uniformMesh=std::move(uniformSource);
         uniformOptions=options;
         uniformOptions.error=&uniformError;
@@ -326,7 +560,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       }
       if(uniformOk && uniformReport.selectedCycle>=0 &&
          uniformQuality.first+1.e-6f>=uniformOptions.qualityMeanFloor &&
-         uniformQuality.second+1.e-6f>=uniformOptions.qualityP05Floor) {
+         uniformQuality.second+1.e-6f>=uniformOptions.qualityP05Floor && endpointQualitySafe(uniformMesh)) {
         local=std::move(uniformMesh);
         result.report=uniformReport;
         result.uniformSizing=true;
@@ -356,7 +590,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
         if(splitReport.selectedCycle>=0 &&
            splitQuality.first+1.e-6f>=localQualityFloor.first &&
            splitQuality.second+1.e-6f>=localQualityFloor.second &&
-           splitReport.sizingErrorP95<=initialSizingP95+1.e-5f) {
+           splitReport.sizingErrorP95<=initialSizingP95+1.e-5f && endpointQualitySafe(splitMesh)) {
           local=std::move(splitMesh);
           result.report=splitReport;
           result.qualitySplit=true;
@@ -391,7 +625,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
         if(recoveryReport.selectedCycle>=0 &&
            recoveryQuality.first+1.e-6f>=recoveryOptions.qualityMeanFloor &&
            recoveryQuality.second+1.e-6f>=recoveryOptions.qualityP05Floor &&
-           recoveryReport.sizingErrorP95<=initialSizingP95+1.e-5f) {
+           recoveryReport.sizingErrorP95<=initialSizingP95+1.e-5f && endpointQualitySafe(recoveryMesh)) {
           local=std::move(recoveryMesh);
           result.report=recoveryReport;
           result.meanRecovery=true;
@@ -432,7 +666,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
            sizeReport.maxEdgeLengthRatio<result.report.maxEdgeLengthRatio*.8f);
       if(sizeOk && sizeReport.selectedCycle>=0 && reducedLongEdges &&
          sizeQuality.first+1.e-6f>=sizeOptions.qualityMeanFloor &&
-         sizeQuality.second+1.e-6f>=sizeOptions.qualityP05Floor) {
+         sizeQuality.second+1.e-6f>=sizeOptions.qualityP05Floor && endpointQualitySafe(sizeMesh)) {
         local=std::move(sizeMesh);
         result.report=sizeReport;
         result.sizeRecovery=true;
@@ -473,7 +707,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
           strictSizeReport.maxEdgeLengthRatio<result.report.maxEdgeLengthRatio*.8f;
       if(strictSizeOk && strictSizeReport.selectedCycle>=0 && strictSizeReduced &&
          strictQuality.first+1.e-6f>=strictSizeOptions.qualityMeanFloor &&
-         strictQuality.second+1.e-6f>=strictSizeOptions.qualityP05Floor) {
+         strictQuality.second+1.e-6f>=strictSizeOptions.qualityP05Floor && endpointQualitySafe(strictSizeMesh)) {
         local=std::move(strictSizeMesh);
         result.report=strictSizeReport;
         result.sizeRecovery=true;
@@ -483,7 +717,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
         result.retryReason=strictSizeError;
       }
     }
-    if(initialOk && result.report.maxEdgeLengthRatio>16.f) {
+    if(config.enableCollapse && initialOk && result.report.maxEdgeLengthRatio>16.f) {
       // For genuinely extreme slivers, run a collapse-first local pass before
       // the conforming midpoint fallback. It is scoped to this packed task,
       // preserves frozen patch boundaries, and accepts quality loss only if
@@ -526,7 +760,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       if(collapseOk && collapseReport.collapses>0 &&
          (afterCollapse.first<beforeCollapse.first || afterCollapse.second<beforeCollapse.second-1.e-4f ||
           qualityAfterCollapse.first>qualityBeforeCollapse.first+1.e-5f ||
-          qualityAfterCollapse.second>qualityBeforeCollapse.second+1.e-5f)) {
+          qualityAfterCollapse.second>qualityBeforeCollapse.second+1.e-5f) && endpointQualitySafe(collapseMesh)) {
         local=std::move(collapseMesh);
         result.report.collapses+=collapseReport.collapses;
         result.report.flips+=collapseReport.flips;
@@ -537,6 +771,13 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
         result.error.clear();
         improved=true;
       }
+    }
+    if(!legacyCoverageAcceptance && !improved && provisionalValid) {
+      local=std::move(provisionalMesh);
+      result.report=provisionalReport;
+      result.provisional=true;
+      result.error.clear();
+      improved=true; // Assembly eligibility only; qualityAccepted is separate.
     }
     if(!improved && initialOk &&
        initialQuality.first+1.e-6f>=localQualityFloor.first &&
@@ -566,6 +807,9 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       if(a<0 || b<0 || !required.erase(edgeKey(a,b)))throw std::runtime_error("unexpected patch boundary");
     }
     if(!required.empty())throw std::runtime_error("missing patch boundary edge");
+    result.qualityAccepted=qualityEndpointMask(sourceRegionQuality,evaluateRegionQuality(local,config,lowQualityThreshold))==0;
+    result.provisional=!result.qualityAccepted;
+    if(!legacyCoverageAcceptance && requireQualityImprovement)result.unchanged=!meshChanged(originalLocal,local);
     result.outputFaces=local.faceCount();result.accepted=true;job.succeeded=true;
     if(result.unchanged) {
       for(int patch=job.firstPatch;patch<job.firstPatch+job.patchCount;++patch)
@@ -577,11 +821,25 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     job.sizeRecovery=result.sizeRecovery;
     job.output=std::move(local);
   } catch(const std::exception &e) {result.error=e.what();result.outputFaces=result.inputFaces;}
-  if(!result.accepted && job.patchCount>1) {
+  const bool compareChildren=result.accepted && result.provisional && job.patchCount>1 &&
+      exploreProvisionalChildren && !legacyCoverageAcceptance;
+  Job incumbent;
+  RawPatchResult incumbentResult;
+  std::vector<RemeshReport> comparisonChildReports;
+  std::vector<RegionQuality> comparisonIncumbentPatches;
+  std::vector<uint8_t> comparisonGenerated;
+  const auto comparisonStart=Clock::now();
+  if(compareChildren) {
+    incumbent=job;incumbentResult=result;comparisonChildReports.resize(job.patchCount);
+    comparisonIncumbentPatches=evaluatePatchQuality(incumbent.output,config,lowQualityThreshold);
+    comparisonGenerated.resize(job.patchCount,0);
+  }
+  if((!result.accepted || compareChildren) && job.patchCount>1) {
     result.retried=true;
     result.retryReason=result.error;
     job.children.resize(job.patchCount);
     bool allAccepted=true;
+    bool allQualityAccepted=true;
     int outputFaces=0;
     bool anySizeRecovery=false;
     std::string failures;
@@ -591,9 +849,20 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       child.firstPatch=job.firstPatch+k;child.patchCount=1;child.bytes=job.bytes;
       for(int f:job.faces)if(source.facePatchId[f]==uint32_t(child.firstPatch))child.faces.push_back(f);
       RawPatchResult childResult;
-      execute(child,source,config,stopWhenIdle,smoothPasses,collapsePasses,flipPasses,
-              strictFlipQuality,requireQualityImprovement,childResult);
+      const bool healthy=compareChildren && comparisonIncumbentPatches[k].lowQualityFaces==0 &&
+          qualityEndpointMask(originalPatchQuality[k],comparisonIncumbentPatches[k])==0;
+      if(healthy) {
+        auto retained=extractIncumbentPatch(incumbent,k);retained.faces=child.faces;child=std::move(retained);
+        childResult.accepted=true;childResult.qualityAccepted=true;
+        childResult.outputFaces=child.output.faceCount();
+      } else {
+        execute(child,source,config,stopWhenIdle,smoothPasses,collapsePasses,flipPasses,
+                strictFlipQuality,requireQualityImprovement,legacyCoverageAcceptance,false,trackRegionCandidates,lowQualityThreshold,childResult);
+        if(compareChildren)comparisonGenerated[k]=1;
+      }
+      if(compareChildren)comparisonChildReports[k]=childResult.report;
       allAccepted &= childResult.accepted;
+      allQualityAccepted &= childResult.qualityAccepted;
       outputFaces+=childResult.outputFaces;
       anySizeRecovery|=childResult.sizeRecovery;
       result.unchangedPatchIds.insert(result.unchangedPatchIds.end(),
@@ -605,6 +874,7 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       combined.splits+=r.splits;combined.collapses+=r.collapses;
       combined.flips+=r.flips;combined.smoothMoves+=r.smoothMoves;
       combined.geometryErrorMax=std::max(combined.geometryErrorMax,r.geometryErrorMax);
+      combined.geometryErrorReverseMax=std::max(combined.geometryErrorReverseMax,r.geometryErrorReverseMax);
       combined.maxEdgeLengthRatio=std::max(combined.maxEdgeLengthRatio,r.maxEdgeLengthRatio);
       combined.overlongEdges+=r.overlongEdges;
       combined.secondsSetup+=r.secondsSetup;combined.secondsSplit+=r.secondsSplit;
@@ -621,6 +891,8 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
       }
     }
     result.accepted=allAccepted;
+    result.qualityAccepted=allAccepted && allQualityAccepted;
+    result.provisional=allAccepted && !allQualityAccepted;
     std::sort(result.unchangedPatchIds.begin(),result.unchangedPatchIds.end());
     result.unchangedPatchIds.erase(std::unique(result.unchangedPatchIds.begin(),
         result.unchangedPatchIds.end()),result.unchangedPatchIds.end());
@@ -630,6 +902,140 @@ void execute(Job &job,const SemanticMesh &source,const RemeshConfig &config,
     result.error=allAccepted?std::string{}:failures;
     result.report=combined;
     result.sizeRecovery=anySizeRecovery;
+  }
+  if(compareChildren) {
+    bool selected=false;
+    int selectedPatches=0;
+    int boundaryTargetChanges=0;
+    std::vector<int> chosenPatches;
+    std::string comparisonReason="child_geometry_or_boundary_failure";
+    bool evaluated=false;
+    RegionQuality comparisonBefore,comparisonAfter;
+    float comparisonSizingMean=0,comparisonSizingP95=0;
+    // Construct a bounded candidate without changing the live assembly aliases.
+    // Only immutable source anchor IDs are welded; coincident interior points
+    // are kept distinct. Each child already passed geometry and boundary checks.
+    try { if(job.children.size()==size_t(incumbent.patchCount)) {
+      // Select ownership regions independently, then check their connected
+      // union. Failed exploration retains that region's legal incumbent.
+      const auto &incumbentPatches=comparisonIncumbentPatches;
+      for(int p=0;p<incumbent.patchCount;++p) {
+        auto &child=job.children[p];bool choose=false;
+        if(child.succeeded && comparisonGenerated[p]) {
+          const int targetChanges=boundaryTargetMismatchCount(incumbent.output,incumbent.aliases,child.output,child.aliases);
+          boundaryTargetChanges+=targetChanges;
+          const auto after=evaluateRegionQuality(child.output,config,lowQualityThreshold);
+          const auto &before=incumbentPatches[p];
+          choose=targetChanges==0 && qualityEndpointMask(before,after)==0 &&
+              after.longEdges<=before.longEdges && after.shortEdges<=before.shortEdges;
+        }
+        if(choose) {++selectedPatches;chosenPatches.push_back(p);}
+        else {
+          auto retained=extractIncumbentPatch(incumbent,p);
+          retained.faces=child.faces;child=std::move(retained);
+        }
+      }
+      SemanticMesh candidate;candidate.patches=incumbent.output.patches;
+      candidate.LocalSizing=incumbent.output.LocalSizing;
+      std::map<int,int> anchors;
+      for(const auto &child:job.children) {
+        std::vector<int> ids(child.output.vertexCount());
+        for(int v=0;v<child.output.vertexCount();++v) {
+          const int anchor=child.aliases[v];
+          auto found=anchor>=0?anchors.find(anchor):anchors.end();
+          if(found!=anchors.end())ids[v]=found->second;
+          else {
+            ids[v]=candidate.addVertex(child.output.position(v),
+                child.firstPatch-job.firstPatch+child.output.vertexPatchId[v],
+                VertexConstraint(child.output.vertexConstraint[v]));
+            if(anchor>=0)anchors.emplace(anchor,ids[v]);
+          }
+          float &target=candidate.targetLength[ids[v]];
+          const float childTarget=child.output.targetLength[v];
+          target=target>0?std::min(target,childTarget):childTarget;
+        }
+        for(int f=0;f<child.output.faceCount();++f)if(child.output.faceAlive[f]) {
+          auto t=child.output.face(f);
+          const auto patch=child.firstPatch-job.firstPatch+child.output.facePatchId[f];
+          candidate.addFace(ids[t[0]],ids[t[1]],ids[t[2]],patch,candidate.patches[patch].type);
+        }
+        for(auto feature:child.output.featureEdges)
+          candidate.featureEdges[edgeKey(ids[int(feature.first>>32)],ids[int(uint32_t(feature.first))])]=feature.second;
+      }
+      candidate.rebuildTopology();
+      if(candidate.LocalSizing)candidate.LocalSizing->apply(candidate,true);
+      std::string why;
+      if(candidate.validate(&why)) {
+        const auto before=evaluateRegionQuality(incumbent.output,config,lowQualityThreshold);
+        const auto after=evaluateRegionQuality(candidate,config,lowQualityThreshold);
+        comparisonBefore=before;comparisonAfter=after;evaluated=true;
+        std::vector<float> sizing;
+        double sizingSum=0;
+        for(const auto &edge:candidate.edges) {
+          const float h=.5f*(candidate.targetLength[edge.v0]+candidate.targetLength[edge.v1]);
+          if(!(h>0))continue;
+          const float error=std::abs(distance(candidate.position(edge.v0),candidate.position(edge.v1))/h-1.f);
+          sizing.push_back(error);sizingSum+=error;
+        }
+        if(!sizing.empty()) {
+          comparisonSizingMean=float(sizingSum/sizing.size());
+          const size_t p95=sizing.size()*95/100;
+          std::nth_element(sizing.begin(),sizing.begin()+p95,sizing.end());comparisonSizingP95=sizing[p95];
+        }
+        selected=selectedPatches>0 && qualityEndpointMask(before,after)==0 &&
+            after.longEdges<=before.longEdges && after.shortEdges<=before.shortEdges;
+        comparisonReason="global_quality_mask_"+std::to_string(qualityEndpointMask(before,after));
+        if(after.longEdges>before.longEdges || after.shortEdges>before.shortEdges)
+          comparisonReason+="_size_regression";
+        const auto beforePatches=evaluatePatchQuality(incumbent.output,config,lowQualityThreshold);
+        const auto afterPatches=evaluatePatchQuality(candidate,config,lowQualityThreshold);
+        for(size_t p=0;selected && p<beforePatches.size();++p) {
+          selected=qualityNonRegression(beforePatches[p],afterPatches[p]) &&
+              afterPatches[p].longEdges<=beforePatches[p].longEdges &&
+              afterPatches[p].shortEdges<=beforePatches[p].shortEdges;
+          if(!selected)comparisonReason="patch_"+std::to_string(job.firstPatch+p)+
+              "_quality_mask_"+std::to_string(qualityRegressionMask(beforePatches[p],afterPatches[p]))+"_or_size_regression";
+        }
+        if(selected)comparisonReason="selected";
+      } else comparisonReason="child_topology_failure";
+    }} catch(const std::exception &) {selected=false;comparisonReason="child_evaluation_failure";}
+    // A failed or regressing exploration restores the legal incumbent, never
+    // the poor original input. Endpoint success remains a separate report.
+    if(!selected) {job=std::move(incumbent);result=std::move(incumbentResult);}
+    else {
+      // Endpoint status is decided by the assembled regional audit. Attempted
+      // operation counts do not certify the selected mixed geometry.
+      result=incumbentResult;result.accepted=true;result.qualityAccepted=false;result.provisional=true;
+      result.outputFaces=0;result.unchangedPatchIds.clear();
+      for(const auto &child:job.children) {
+        result.outputFaces+=child.output.faceCount();
+        if(child.unchanged)result.unchangedPatchIds.push_back(uint32_t(child.firstPatch));
+      }
+      result.unchanged=result.unchangedPatchIds.size()==size_t(job.patchCount);
+      result.retried=true;
+      result.report.qualityMean=comparisonAfter.mean;result.report.qualityP05=comparisonAfter.p05;
+      result.report.qualityMin=comparisonAfter.minimum;
+      result.report.overlongEdges=comparisonAfter.longEdges;
+      result.report.maxEdgeLengthRatio=comparisonAfter.edgeRatioMax;
+      result.report.sizingErrorMean=comparisonSizingMean;result.report.sizingErrorP95=comparisonSizingP95;
+      for(int p:chosenPatches) {
+        result.report.splits+=comparisonChildReports[p].splits;
+        result.report.collapses+=comparisonChildReports[p].collapses;
+        result.report.flips+=comparisonChildReports[p].flips;
+        result.report.smoothMoves+=comparisonChildReports[p].smoothMoves;
+        result.report.geometryErrorMax=std::max(result.report.geometryErrorMax,comparisonChildReports[p].geometryErrorMax);
+        result.report.geometryErrorReverseMax=std::max(result.report.geometryErrorReverseMax,comparisonChildReports[p].geometryErrorReverseMax);
+      }
+    }
+    result.childCandidateCompared=true;result.childCandidateSelected=selected;
+    result.childComparisonReason=comparisonReason;
+    result.childCandidateEvaluated=evaluated;
+    result.childGeneratedPatches=int(std::count(comparisonGenerated.begin(),comparisonGenerated.end(),uint8_t(1)));
+    result.childBoundaryTargetChanges=boundaryTargetChanges;
+    result.childSelectedPatches=selected?selectedPatches:0;
+    result.childIncumbentQuality=std::move(comparisonBefore);
+    result.childCandidateQuality=std::move(comparisonAfter);
+    result.secondsChildComparison=std::chrono::duration<double>(Clock::now()-comparisonStart).count();
   }
   result.seconds=std::chrono::duration<double>(Clock::now()-start).count();
   result.report.seconds=result.seconds;
@@ -642,8 +1048,17 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
   try {
     if(options.workers<1 || options.workers>32 || options.gpuConcurrency<1 || options.gpuConcurrency>8 || options.patchesPerTask<0 || options.patchesPerTask>32 || options.smoothPasses<1 || options.smoothPasses>12 || options.collapsePasses<1 || options.collapsePasses>8 || options.flipPasses<1 || options.flipPasses>8 || !(cfg.constantLength>0) || !std::isfinite(cfg.constantLength) || !(cfg.maxGeometryError>0) || !std::isfinite(cfg.maxGeometryError) || cfg.maxIterations<1 || cfg.adaptive)
       throw std::runtime_error("invalid batch worker count or sizing configuration");
+    if(options.selectFinalRegions && options.legacyCoverageAcceptance)
+      throw std::runtime_error("regional refinement selection requires quality acceptance");
     SemanticMesh source=input;source.rebuildTopology();
+    if(!std::isfinite(options.lowQualityThreshold) || options.lowQualityThreshold<0 || options.lowQualityThreshold>1)
+      throw std::runtime_error("low quality threshold must be in [0,1]");
+    const float lowQualityThreshold=options.lowQualityThreshold>0?options.lowQualityThreshold:qualitySummary(source).second;
+    report.sourceQuality=evaluateRegionQuality(source,cfg,lowQualityThreshold);
     if(options.autoPartitionSinglePatch)AutoPartitionSinglePatch(source,options.workers);
+    const auto sourceQualityAuditStart=Clock::now();
+    report.sourcePatchQuality=evaluatePatchQuality(source,cfg,lowQualityThreshold);
+    report.secondsQualityAudit=std::chrono::duration<double>(Clock::now()-sourceQualityAuditStart).count();
     const bool semanticPatches=std::any_of(source.patches.begin(),source.patches.end(),
         [](const PatchRecord &patch){return patch.type!=PatchType::Unknown;});
     const int patchesPerTask=options.patchesPerTask?options.patchesPerTask:
@@ -656,9 +1071,50 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
     // Both incident patches receive exactly the same new vertices. This runs
     // once before creating jobs, never independently inside a patch worker.
     const auto boundaryStart=Clock::now();
-    report.boundarySplits=refinePartitionBoundary(source,cfg);
+    report.boundarySplits=refinePartitionBoundary(source,cfg,&report.boundaryEdgesDeferred);
+    if(report.boundaryEdgesDeferred>0) {
+      // A partially subdivided boundary can create zero-area children on
+      // extremely short or skinny source triangles. Roll back the whole
+      // global subdivision stage to the known-valid input, then let the
+      // patch workers operate with the original shared edges locked.
+      source=input;
+      source.rebuildTopology();
+      for(const auto &edge:source.edges) {
+        if(edge.flags&(EdgePatchBoundary|EdgeMeshBoundary))
+          source.vertexConstraint[edge.v0]=source.vertexConstraint[edge.v1]=uint8_t(VertexConstraint::Locked);
+      }
+      report.boundarySplits=0;
+      report.boundaryEdgesDeferred=0;
+      for(const auto &edge:source.edges) {
+        if(!(edge.flags&(EdgePatchBoundary|EdgeMeshBoundary|EdgeSharp)))continue;
+        const Vec3 a=source.position(edge.v0),b=source.position(edge.v1),mid=(a+b)*0.5f;
+        float target=cfg.constantLength;
+        if((edge.flags&EdgeSharp) && cfg.featureEdgeLength>0.f)
+          target=std::min(target,cfg.featureEdgeLength);
+        for(uint32_t patch:{edge.patchLeft,edge.patchRight}) if(source.LocalSizing && patch<source.patches.size()) {
+          target=std::min(target,source.LocalSizing->evaluate(patch,a));
+          target=std::min(target,source.LocalSizing->evaluate(patch,b));
+          target=std::min(target,source.LocalSizing->evaluate(patch,mid));
+        }
+        if(target>0.f && distance(a,b)>cfg.splitRatio*target*(1.f+1.e-5f))
+          ++report.boundaryEdgesDeferred;
+      }
+    }
     report.secondsBoundary=std::chrono::duration<double>(Clock::now()-boundaryStart).count();
     if(!source.validate(&problem))throw std::runtime_error("refined source: "+problem);
+    if(report.boundaryEdgesDeferred>0) {
+      // A boundary that exceeds the safety budget signals that local sizing
+      // would require an unusually large job. Preserve the valid input as a
+      // reviewable candidate instead of launching a GPU batch with unbounded
+      // output growth. The CLI reports this as a partial result (exit 3).
+      output=source;
+      report.outputQuality=evaluateRegionQuality(output,cfg,lowQualityThreshold);
+      report.outputPatchQuality=report.sourcePatchQuality;
+      report.topologyValid=true;
+      report.boundariesHeld=true;
+      report.seconds=std::chrono::duration<double>(Clock::now()-start).count();
+      return true;
+    }
     std::vector<Job> jobs((source.patches.size()+patchesPerTask-1)/patchesPerTask);
     for(size_t i=0;i<jobs.size();++i) {
       jobs[i].id=int(i);
@@ -705,7 +1161,8 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
           report.peakActive=std::max(report.peakActive,active);report.peakReserved=std::max(report.peakReserved,reserved);
         }
         execute(jobs[id],source,cfg,options.stopWhenIdle,options.smoothPasses,options.collapsePasses,options.flipPasses,options.strictFlipQuality,
-                options.requireQualityImprovement,report.patches[id]);
+                options.requireQualityImprovement,options.legacyCoverageAcceptance,options.exploreProvisionalChildren,
+                options.trackRegionCandidates,lowQualityThreshold,report.patches[id]);
         {std::lock_guard<std::mutex> lock(mutex);reserved-=jobs[id].bytes;--active;}
         changed.notify_all();
       }
@@ -743,6 +1200,7 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
     };
     for(int repair=0;repair<=int(jobs.size());++repair) {
       merged=SemanticMesh{};merged.patches=source.patches;merged.featureEdges=source.featureEdges;
+      merged.LocalSizing=source.LocalSizing;
       for(int v=0;v<source.vertexCount();++v)
         merged.addVertex(source.position(v),source.vertexPatchId[v],VertexConstraint(source.vertexConstraint[v]));
       for(auto &h:merged.targetLength)h=cfg.constantLength;
@@ -750,6 +1208,7 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
           report.qualitySplitRegions=report.meanRecoveryRegions=report.fallback=0;
       for(auto &job:jobs)appendJob(job);
       merged.rebuildTopology();
+      if(merged.LocalSizing)merged.LocalSizing->apply(merged,true);
       std::set<uint64_t> outputSeams;
       for(auto e:merged.edges)if(e.flags&(EdgePatchBoundary|EdgeMeshBoundary))outputSeams.insert(edgeKey(e.v0,e.v1));
       for(auto e:source.edges)if(e.flags&(EdgePatchBoundary|EdgeMeshBoundary))
@@ -810,20 +1269,19 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
       // Include every patch returned unchanged by the local GPU pass. Some
       // have acceptable edge lengths but were still never modified because
       // no cycle passed the old quality gate.
-      coarsePatches.insert(patch.unchangedPatchIds.begin(),patch.unchangedPatchIds.end());
-      coveragePatches.insert(patch.unchangedPatchIds.begin(),patch.unchangedPatchIds.end());
-      // The remesher may return a changed mesh that still contains extreme
-      // long edges. Include every source patch in such a task for the size
-      // recovery passes, not only tasks that were wholly unchanged.
-      if(patch.report.maxEdgeLengthRatio>cfg.splitRatio*(1.f+1.e-4f)) {
-        const int first=int(task)*patchesPerTask;
-        const int last=std::min(int(source.patches.size()),first+patchesPerTask);
-        for(int id=first;id<last;++id)coarsePatches.insert(uint32_t(id));
+      if(options.legacyCoverageAcceptance) {
+        coarsePatches.insert(patch.unchangedPatchIds.begin(),patch.unchangedPatchIds.end());
+        coveragePatches.insert(patch.unchangedPatchIds.begin(),patch.unchangedPatchIds.end());
       }
     }
+    // Assembly combines endpoint targets using their minimum. Its defects can
+    // therefore be absent from every local task report. Select actual incident
+    // patches, rather than whole packed tasks selected by stale local ratios.
+    const auto assembledCoarse=longEdgePatches(merged,cfg);
+    coarsePatches.insert(assembledCoarse.begin(),assembledCoarse.end());
     if(!coarsePatches.empty()) {
       auto selectedSize=[&](const SemanticMesh &candidate) {
-        int count=0;float maxRatio=0.f;
+        int count=0;float maxRatio=0.f;double excessSquared=0;
         for(const auto &edge:candidate.edges) {
           const bool selected=(edge.face0>=0&&coarsePatches.count(candidate.facePatchId[edge.face0])) ||
                               (edge.face1>=0&&coarsePatches.count(candidate.facePatchId[edge.face1]));
@@ -832,38 +1290,53 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
           if(!(h>0.f))continue;
           const float ratio=distance(candidate.position(int(edge.v0)),candidate.position(int(edge.v1)))/h;
           maxRatio=std::max(maxRatio,ratio);
-          if(ratio>cfg.splitRatio*(1.f+1.e-4f))++count;
+          if(ratio>cfg.splitRatio*(1.f+1.e-4f)) {
+            ++count;const double excess=double(ratio)-cfg.splitRatio;
+            excessSquared+=excess*excess;
+          }
         }
-        return std::pair<int,float>{count,maxRatio};
+        return SizeDefectSummary{count,maxRatio,excessSquared};
       };
-      auto before=selectedSize(merged);
       GeometryProjector refineProjector;
-      refineProjector.build(merged);
+      SemanticMesh refinementBase;
+      if(options.selectFinalRegions)refinementBase=merged;
+      auto refineCandidate=[&](bool feasibleSplits) {
+      auto before=selectedSize(merged);
       // Evaluate and commit one subdivision level at a time. The old code
       // built up to eight levels and rejected the entire result if the final
       // tail of refinement crossed a quality floor, discarding even useful
       // early levels and leaving the original oversized patches untouched.
       TriangleRefineStats refineTotal;
       refineTotal.InputFaces=merged.faceCount();
+      report.finalSizeRefineStopReason="level_limit";
       for(int level=0;level<8;++level) {
         SemanticMesh refined;
         TriangleRefineStats refineStep;
         std::string refineError;
         const bool refineOk=refineMidpointConforming(merged,cfg,refineProjector,refined,refineStep,
                                      &refineError,&coarsePatches,false,
-                                     level==0?&coveragePatches:nullptr);
+                                     options.legacyCoverageAcceptance && level==0?&coveragePatches:nullptr,
+                                     feasibleSplits);
         if(!refineOk) {
+          report.finalSizeRefineStopReason="refine_error: "+refineError;
           break;
         }
-        if(refineStep.SplitEdges==0 && refineStep.InsertedVertices==0)break;
+        if(refined.LocalSizing)refined.LocalSizing->apply(refined,true);
+        if(refineStep.SplitEdges==0 && refineStep.InsertedVertices==0) {
+          report.finalSizeRefineStopReason=before.count>0?"no_safe_selected_split":"selected_size_satisfied";
+          break;
+        }
         const auto after=selectedSize(refined);
-        const bool sizeImproved=after.first<before.first ||
-                                after.second<before.second-1.e-4f;
+        report.finalSizeExcessBefore=before.excessSquared;report.finalSizeExcessAfter=after.excessSquared;
+        const bool sizeImproved=sizeDefectProgress(before,after,feasibleSplits);
         // The first pass deliberately subdivides each still-unchanged patch
         // once, even when its sizing field was already within the edge limit.
         // Other selected patches are split only when overlong. Further passes
         // are size-driven; topology and degeneracy remain validated.
-        if(!sizeImproved && level!=0)break;
+        if(!sizeImproved && !(options.legacyCoverageAcceptance && level==0)) {
+          report.finalSizeRejectedSplits=refineStep.SplitEdges;
+          report.finalSizeRefineStopReason="no_selected_size_progress";break;
+        }
         merged=std::move(refined);
         before=after;
         refineTotal.SplitEdges+=refineStep.SplitEdges;
@@ -874,6 +1347,31 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
         for(int i=0;i<8;++i)refineTotal.MaskCounts[i]+=refineStep.MaskCounts[i];
         refineTotal.touchedPatches.insert(refineStep.touchedPatches.begin(),
                                           refineStep.touchedPatches.end());
+      }
+      return refineTotal;
+      };
+      auto refineTotal=refineCandidate(options.selectFinalRegions?false:options.sizeFeasibleFinalRefine);
+      if(options.selectFinalRegions) {
+        SemanticMesh incumbent=std::move(merged);const auto incumbentStats=refineTotal;
+        merged=refinementBase;const auto alternativeStart=Clock::now();
+        const auto alternativeStats=refineCandidate(true);SemanticMesh alternative=std::move(merged);
+        report.secondsFinalAlternativeRefine=std::chrono::duration<double>(Clock::now()-alternativeStart).count();
+        std::string selectionError;
+        if(!selectRefinementRegions(refinementBase,incumbent,alternative,cfg,lowQualityThreshold,
+              merged,report.finalRegionSelection,&selectionError)) {
+          merged=std::move(incumbent);refineTotal=incumbentStats;
+        } else {
+          refineTotal=incumbentStats;
+          refineTotal.OutputFaces=merged.faceCount();
+          refineTotal.InsertedVertices=merged.vertexCount()-refinementBase.vertexCount();
+          refineTotal.SplitEdges=refineTotal.InsertedVertices;
+          refineTotal.Levels=std::max(incumbentStats.Levels,alternativeStats.Levels);
+          refineTotal.touchedPatches.clear();
+          for(int f=0;f<merged.faceCount();++f)if(merged.faceAlive[f])
+            for(int v:merged.face(f))if(v>=refinementBase.vertexCount()) {
+              refineTotal.touchedPatches.insert(merged.facePatchId[f]);break;
+            }
+        }
       }
       if(refineTotal.Levels>0) {
           report.finalSizeRefineSplits=refineTotal.SplitEdges;
@@ -897,8 +1395,23 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
               [](const RawPatchResult &patch){return patch.accepted && patch.unchanged;}));
       }
     }
+    if(cfg.featureEdgeLength>0.f) {
+      SemanticMesh beforeCircularPlanes=merged;
+      const auto beforeCircularTaskReports=report.patches;
+      const int beforeCircularUnchanged=report.unchanged;
+      remeshCircularPlaneInteriors(merged,cfg,report);
+      std::string circularError;
+      if(!merged.validate(&circularError)) {
+        merged=std::move(beforeCircularPlanes);
+        report.patches=beforeCircularTaskReports;
+        report.unchanged=beforeCircularUnchanged;
+        report.circularPlaneRemeshed=report.circularPlaneAddedFaces=0;
+        report.circularPlaneSkipped=0;
+      }
+    }
     merged.rebuildTopology();
     report.longEdgesAfterRefine=0;report.maxOutputEdgeRatio=0.f;
+    if(merged.LocalSizing)merged.LocalSizing->apply(merged,true);
     for(const auto &edge:merged.edges) {
       const float h=.5f*(merged.targetLength[edge.v0]+merged.targetLength[edge.v1]);
       if(!(h>0.f))continue;
@@ -906,11 +1419,31 @@ bool remeshRawCudaPatches(const SemanticMesh &input,SemanticMesh &output,const R
       report.maxOutputEdgeRatio=std::max(report.maxOutputEdgeRatio,ratio);
       if(ratio>cfg.splitRatio*(1.f+1.e-4f)) {
         ++report.longEdgesAfterRefine;
+        const bool selected=(edge.face0>=0&&coarsePatches.count(merged.facePatchId[edge.face0])) ||
+                            (edge.face1>=0&&coarsePatches.count(merged.facePatchId[edge.face1]));
+        if(!selected)++report.finalSizeUnselectedLongEdges;
       }
     }
     merged.compact();merged.rebuildTopology();merged.computeVertexNormals();
     if(!merged.validate(&problem))throw std::runtime_error("assembled mesh: "+problem);
     report.topologyValid=report.boundariesHeld=true;
+    report.outputQuality=evaluateRegionQuality(merged,cfg,lowQualityThreshold);
+    report.qualityAccepted=qualityEndpointMask(report.sourceQuality,report.outputQuality)==0;
+    const auto qualityAuditStart=Clock::now();
+    report.outputPatchQuality=evaluatePatchQuality(merged,cfg,lowQualityThreshold);
+    for(size_t p=0;p<report.sourcePatchQuality.size();++p)if(report.sourcePatchQuality[p].area>0) {
+      const auto mask=qualityEndpointMask(report.sourcePatchQuality[p],report.outputPatchQuality[p]);
+      if(mask)report.pendingPatchIds.push_back(uint32_t(p));
+      if(mask&UnresolvedInputDefect)report.unresolvedPatchIds.push_back(uint32_t(p));
+      if(mask&~uint32_t(UnresolvedInputDefect))report.regressedPatchIds.push_back(uint32_t(p));
+    }
+    // A changed healthy patch may lose a small amount of mean/P05 while the
+    // complete mesh makes genuine progress. The opt-in policy uses the same
+    // global non-regression and connected-defect gate above, and still reports
+    // every pending patch. The default strict gate is unchanged.
+    report.qualityAccepted=batchQualityEndpointAccepted(report.sourceQuality,report.outputQuality,
+                                                         report.pendingPatchIds.size(),options.globalQualityAcceptance);
+    report.secondsQualityAudit+=std::chrono::duration<double>(Clock::now()-qualityAuditStart).count();
     report.secondsAssembly=std::chrono::duration<double>(Clock::now()-boundaryStart).count()-
         report.secondsBoundary-report.secondsTasks;
     report.seconds=std::chrono::duration<double>(Clock::now()-start).count();

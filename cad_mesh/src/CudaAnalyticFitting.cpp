@@ -7,6 +7,7 @@
 #include "CadMesh/CudaAnalyticFitting.h"
 #include "CudaAnalyticKernels.h"
 #include "CudaRemeshKernels.h"
+#include "CudaWallThicknessKernels.h"
 #include "CudaChartKernels.h"
 #include "CadMesh/CudaChartRemesher.h"
 
@@ -620,6 +621,41 @@ public:
                   "copy remesh midpoints from CUDA");
   }
 
+  void findWallThicknessRaySeeds(
+      const std::vector<std::array<double,3>> &vertices,
+      const std::vector<std::array<double,3>> &inwardNormals,
+      const std::vector<std::array<int,3>> &triangles,
+      const std::vector<CudaThicknessBvhNode> &nodes,
+      const std::vector<int> &leafFaceIds,
+      std::vector<CudaThicknessRaySeed> &seeds) {
+    if(vertices.size()!=inwardNormals.size()||vertices.size()>std::size_t(std::numeric_limits<int>::max())||
+       triangles.size()>std::size_t(std::numeric_limits<int>::max())||nodes.empty())
+      throw std::runtime_error("invalid CUDA thickness ray-seed input");
+    CurrentContext current(mDriver,mContext);
+    struct Buffers {
+      DriverApi &Driver;std::vector<CUdeviceptr> Data;
+      explicit Buffers(DriverApi &d):Driver(d){}
+      ~Buffers(){for(auto p:Data)Driver.MemFree(p);}
+      CUdeviceptr alloc(std::size_t n){CUdeviceptr p=0;Driver.check(Driver.MemAlloc(&p,n),"allocate CUDA thickness buffers");Data.push_back(p);return p;}
+    } buffers(mDriver);
+    const auto vb=vertices.size()*sizeof(vertices[0]),tb=triangles.size()*sizeof(triangles[0]);
+    const auto nb=nodes.size()*sizeof(nodes[0]),fb=leafFaceIds.size()*sizeof(leafFaceIds[0]);
+    const auto sb=vertices.size()*sizeof(CudaThicknessRaySeed);
+    auto dv=buffers.alloc(vb),dn=buffers.alloc(vb),dt=buffers.alloc(tb);
+    auto dnodes=buffers.alloc(nb),df=buffers.alloc(fb),ds=buffers.alloc(sb);
+    mDriver.check(mDriver.CopyToDevice(dv,vertices.data(),vb),"copy thickness vertices to CUDA");
+    mDriver.check(mDriver.CopyToDevice(dn,inwardNormals.data(),vb),"copy thickness normals to CUDA");
+    mDriver.check(mDriver.CopyToDevice(dt,triangles.data(),tb),"copy thickness triangles to CUDA");
+    mDriver.check(mDriver.CopyToDevice(dnodes,nodes.data(),nb),"copy thickness BVH nodes to CUDA");
+    mDriver.check(mDriver.CopyToDevice(df,leafFaceIds.data(),fb),"copy thickness BVH faces to CUDA");
+    int count=int(vertices.size());
+    void *args[]={&dv,&dn,&dt,&dnodes,&df,&count,&ds};
+    mDriver.check(mDriver.Launch(mThicknessRayFunction,unsigned((vertices.size()+255)/256),1,1,
+                                 256,1,1,0,nullptr,args,nullptr),"launch CUDA thickness ray seeds");
+    seeds.resize(vertices.size());
+    mDriver.check(mDriver.CopyToHost(seeds.data(),ds,sb),"copy thickness ray seeds from CUDA");
+  }
+
   void rebuildCharts(std::vector<CudaPlanarChart> &charts, double &milliseconds) {
     CurrentContext current(mDriver, mContext);
     if (charts.empty()) return;
@@ -796,6 +832,7 @@ private:
     for (const char *part : AnalyticSeedKernelSourceParts) source += part;
     source += std::string("\n") + RemeshKernelSource;
     source += std::string("\n") + ChartKernelSource;
+    source += std::string("\n") + WallThicknessRayKernelSource;
     const std::string target = "--gpu-architecture=compute_" + std::to_string(architecture);
     const char *options[] = {target.c_str(), "--std=c++14", "--fmad=false", "--ftz=false",
                              "--prec-div=true", "--prec-sqrt=true"};
@@ -879,6 +916,9 @@ private:
                   "resolve cadmesh_classify_long_edges");
     mDriver.check(mDriver.ModuleFunction(&mChartFunction,mModule,"cadmesh_chart_step"),
                   "resolve cadmesh_chart_step");
+    mDriver.check(mDriver.ModuleFunction(&mThicknessRayFunction,mModule,
+                                         "cadmesh_wall_thickness_ray_seeds"),
+                  "resolve cadmesh_wall_thickness_ray_seeds");
     break;
     }
     bool cacheWritten = false;
@@ -910,6 +950,7 @@ private:
   CUfunction mFunction = nullptr;
   CUfunction mRemeshFunction = nullptr;
   CUfunction mChartFunction = nullptr;
+  CUfunction mThicknessRayFunction = nullptr;
   CUevent mKernelStart = nullptr, mKernelEnd = nullptr;
   std::array<CUevent, 6> mTypeStart{}, mTypeEnd{};
   CUdeviceptr mSamples = 0, mParameters = 0, mValid = 0;
@@ -939,6 +980,12 @@ public:
                          std::vector<unsigned char> &,
                          std::vector<std::array<double, 3>> &) {
     throw std::runtime_error("CUDA remesh runtime is unavailable on this platform");
+  }
+  void findWallThicknessRaySeeds(const std::vector<std::array<double,3>> &,
+      const std::vector<std::array<double,3>> &,const std::vector<std::array<int,3>> &,
+      const std::vector<CudaThicknessBvhNode> &,const std::vector<int> &,
+      std::vector<CudaThicknessRaySeed> &) {
+    throw std::runtime_error("CUDA wall-thickness runtime is unavailable on this platform");
   }
   std::string description() const { return "unavailable"; }
 };
@@ -1135,6 +1182,23 @@ bool ClassifyLongEdgesCudaRuntime(
     Runtime.reset();
     error = failure.what();
     return false;
+  }
+}
+
+bool FindWallThicknessRaySeedsCuda(
+    const std::vector<std::array<double,3>> &vertices,
+    const std::vector<std::array<double,3>> &inwardNormals,
+    const std::vector<std::array<int,3>> &triangles,
+    const std::vector<CudaThicknessBvhNode> &nodes,
+    const std::vector<int> &leafFaceIds,
+    std::vector<CudaThicknessRaySeed> &seeds,std::string &error) {
+  try {
+    if(!Runtime){auto runtime=std::make_unique<CudaRuntime>();runtime->initialize();Runtime=std::move(runtime);}
+    Runtime->findWallThicknessRaySeeds(vertices,inwardNormals,triangles,nodes,leafFaceIds,seeds);
+    error.clear();return true;
+  } catch(const std::exception &failure) {
+    Runtime.reset();
+    error=failure.what();return false;
   }
 }
 } // namespace CadMesh

@@ -19,6 +19,11 @@ struct RawCudaOptions {
   bool optimizeSplitPoint=false;
   float splitQualityRatio=0.f;
   float qualityMeanFloor=0,qualityP05Floor=0;
+  bool trackRegionCandidates=false;
+  float lowQualityThreshold=0;
+  // All retries of one region must use the same original surface. The caller
+  // owns this mesh for the duration of the synchronous remesh call.
+  const SemanticMesh *referenceMesh=nullptr;
   size_t workspaceBytes=0; // 0: unlimited; includes cached device buffers
 };
 bool remeshRawCuda(SemanticMesh&,const RemeshConfig&,RemeshReport&,const RawCudaOptions&);

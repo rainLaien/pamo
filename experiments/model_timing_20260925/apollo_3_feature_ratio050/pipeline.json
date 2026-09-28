@@ -1,0 +1,16 @@
+{
+  "partition_and_packaging_seconds": 0.0,
+  "strict_flip_quality": true,
+  "snapshot": "F:\\work\\laien_work\\pamo\\experiments\\rxmesh-remesh\\results\\model_timing_20260925\\apollo_3_partitioned\\input.cadpart",
+  "iterations": 20,
+  "flip_passes": 8,
+  "auto_partition_single_patch": false,
+  "exit_code": 3,
+  "gpu_concurrency": 8,
+  "patches_per_task_override": 0,
+  "workers": 8,
+  "total_seconds": 46.6531401,
+  "collapse_passes": 8,
+  "smooth_passes": 12,
+  "compute_regions": 0
+}

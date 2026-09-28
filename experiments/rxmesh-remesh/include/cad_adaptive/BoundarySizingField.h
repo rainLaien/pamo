@@ -61,9 +61,12 @@ public:
   static std::shared_ptr<const BoundarySizingField> create(
       const SemanticMesh &reference, const RemeshConfig &config,
       float gradation = 0.35f, bool curvatureSizing = false,
-      const std::vector<float> &patchTargetLengths = {});
+      const std::vector<float> &patchTargetLengths = {}, bool respectBoundarySampling = true);
+  // Preserve the immutable spatial field while remapping a packed GPU task's
+  // patch IDs to [0,count). No field is rebuilt from its edited triangles.
+  std::shared_ptr<const BoundarySizingField> subset(uint32_t first,uint32_t count) const;
   float evaluate(uint32_t patchId, Vec3 point) const;
-  void apply(SemanticMesh &mesh) const;
+  void apply(SemanticMesh &mesh,bool preserveFinerTargets=false) const;
   float gradation() const { return mGradation; }
   const std::vector<BoundarySizingSeed> &seeds() const { return mSeeds; }
   const std::vector<BoundarySizingNode> &nodes() const { return mNodes; }

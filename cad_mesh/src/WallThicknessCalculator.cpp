@@ -1,8 +1,9 @@
 // Adapted from Apollo algorithm/thickness/wall_thickness_calculator.cpp.
-// Face rolling-ball search, containment and representative refinement retained.
+// Vertex rolling-ball queries over a read-only indexed mesh and BVH.
 // Native geometry/BVH backend; no VCGLib dependency.
 // Apollo model/UI/export and vertex display reconstruction are not included.
 #include "CadMesh/WallThicknessCalculator.h"
+#include "CadMesh/CudaAnalyticFitting.h"
 #include "RemeshWorkerPool.h"
 #include "WallThicknessGeometry.h"
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -160,7 +162,8 @@ struct MeshPoint {
   FacePredicate notIncidentFaces;  ///< predicate that returns true for mesh faces not-incident to the point
   FacePredicate sphereConstraintFaces;  ///< also admits incident faces at sharp features
   FacePredicate sharpIncidentFaces;  ///< sharp incident faces bypass smooth-sheet direction filtering
-
+  int raySeedFace=-1;
+  double raySeedDistance=0,raySeedU=0,raySeedV=0;
 };
 
 void findMaxVectorDim(int& dimX, int& dimY, int& dimZ, const Vector& dir) {
@@ -517,17 +520,36 @@ void findTrisInBall(Mesh& m, Bvh& tree, SearchBall ball, const Callback& foundCa
     return res;
   };
 
-  ThicknessTraversalStack subtasks;
+  // Carry the box distance with each pending node. The previous traversal
+  // recalculated it as soon as the node was popped, doubling the three-axis
+  // AABB distance work for every visited node (and more when the ball shrinks).
+  struct BallTask { Node* node; double distanceSq; };
+  std::array<BallTask,64> localTasks{};
+  std::vector<BallTask> overflowTasks;
+  std::size_t taskCount=0;
+  auto pushTask=[&](BallTask task) {
+    if(taskCount<localTasks.size())localTasks[taskCount]=task;
+    else overflowTasks.push_back(task);
+    ++taskCount;
+  };
+  auto popTask=[&]() {
+    if(taskCount>localTasks.size()) {
+      --taskCount;
+      auto task=overflowTasks.back();overflowTasks.pop_back();return task;
+    }
+    --taskCount;
+    return localTasks[taskCount];
+  };
   auto addSubTask = [&](Node* node, double distanceSq) {
-    if (distanceSq < ball.radiusSq) subtasks.push_back(node);
+    if (distanceSq < ball.radiusSq) pushTask({node,distanceSq});
   };
 
   addSubTask(aabbTree.pRoot, boxDistSq(aabbTree.pRoot));
 
-  while (!subtasks.empty()) {
-    Node* node = subtasks.back();
-    subtasks.pop_back();
-    if (!(boxDistSq(node) < ball.radiusSq)) continue;
+  while (taskCount) {
+    const auto task=popTask();
+    Node* node=task.node;
+    if (!(task.distanceSq < ball.radiusSq)) continue;
 
     if (node->IsLeaf()) {
       for (auto si = (node)->oBegin; si != (node)->oEnd; ++si) {
@@ -655,24 +677,32 @@ InSphere findInSphereImpl(Mesh& mesh, Bvh& tree, const MeshPoint& m,
   std::size_t rayBoundCount=0;
   constexpr double boxDiagonalToMinimumDimensionLimit = 1.7320508076;
   const double raySearchLength = 2.0 * res.radius * boxDiagonalToMinimumDimensionLimit;
-  for (const auto& rayDirection : rayDirections) {
+  auto addRayCandidate=[&](Face* face,const Vector& hit,const TriPointf& bary,double distance,
+                           const Vector& rayDirection) {
+    if(!isSuitableRayOppositeFace(face,rayDirection))return;
+    MeshProjectionResult candidate;
+    candidate.proj.face=face;candidate.proj.point=hit;candidate.mtp.bary=bary;
+    candidate.distSq=distance*distance;
+    if(!isSuitableSphereConstraintFace(face))return;
+    const auto d=hit-m.pt;const auto dn=m.inDir.dot(d);
+    if(!(dn>0.0)||!std::isfinite(dn))return;
+    const auto radius=d.dot(d)/(2.0*dn);
+    if(!(radius>0.0)||!std::isfinite(radius))return;
+    rayStorage[rayBoundCount++]={radius,candidate};
+  };
+  if(m.raySeedFace>=0&&rayDirections.size()==1&&m.raySeedDistance<=raySearchLength){
+    auto& face=mesh.face[std::size_t(m.raySeedFace)];
+    const auto& dir=rayDirections[0];
+    const auto hit=m.pt+dir*m.raySeedDistance;
+    addRayCandidate(&face,hit,TriPointf{m.raySeedU,m.raySeedV},m.raySeedDistance,dir);
+  } else for (const auto& rayDirection : rayDirections) {
     const FacePredicate reliableOppositeFaces = [&](Face* face) {
       return isSuitableRayOppositeFace(face, rayDirection);
     };
     auto isec = rayInsideIntersect(mesh, tree, m, rayDirection, raySearchLength, reliableOppositeFaces);
     if (!isec) continue;
-
-    MeshProjectionResult rayCandidate;
-    rayCandidate.proj   = isec.proj;
-    rayCandidate.mtp    = isec.mtp;
-    rayCandidate.distSq = isec.distanceAlongLine * isec.distanceAlongLine;
-    if (!isSuitableSphereConstraintFace(rayCandidate.proj.face)) continue;
-    const auto d  = rayCandidate.proj.point - m.pt;
-    const auto dn = m.inDir.dot(d);
-    if (!(dn > 0.0) || !std::isfinite(dn)) continue;
-    const auto rayBoundRadius = d.dot(d) / (2.0 * dn);
-    if (!(rayBoundRadius > 0.0) || !std::isfinite(rayBoundRadius)) continue;
-    rayStorage[rayBoundCount++]={rayBoundRadius, rayCandidate};
+    addRayCandidate(isec.proj.face,isec.proj.point,isec.mtp.bary,
+                    isec.distanceAlongLine,rayDirection);
   }
   auto rayBounds=rayStorage.first(rayBoundCount);
   if (!rayBounds.empty()) {
@@ -945,6 +975,11 @@ bool WallThicknessCalculator::compute(const std::vector<std::array<double,3>>& v
         error="wall thickness input has a degenerate face: "+std::to_string(i);return false;
       }
       face.normal=cross/twiceArea;
+      for(int k=0;k<3;++k) {
+        const auto first=face.points[(k+1)%3]-face.points[k];
+        const auto second=face.points[(k+2)%3]-face.points[k];
+        face.cornerAngles[k]=std::atan2((first^second).Norm(),first.dot(second));
+      }
     }
     const double minDimension=std::min({mesh.bbox.DimX(),mesh.bbox.DimY(),mesh.bbox.DimZ()});
     if(!(minDimension>0)||!std::isfinite(minDimension)){
@@ -956,25 +991,59 @@ bool WallThicknessCalculator::compute(const std::vector<std::array<double,3>>& v
     const double minimum=options.MinimumThickness>0?options.MinimumThickness:minDimension*.0075;
     const double maximum=2*settings.maxRadius;
     Bvh tree;BuildThicknessAabbTree(mesh,tree);
-    const std::size_t count=faces.size();
+    const std::size_t count=vertices.size();
     result.Values.assign(count,std::numeric_limits<float>::quiet_NaN());
     result.Status.assign(count,ThicknessStatus::InvalidNormal);result.Samples.resize(count);
-    std::vector<double> areas(count,0);
+    std::vector<Vector> vertexNormals(count);
+    std::vector<int> incidentFaces(count,-1);
+    for(std::size_t fi=0;fi<faces.size();++fi)for(int k=0;k<3;++k){
+      const auto vi=std::size_t(faces[fi][k]);
+      // Area-weighted vertex normal; use the first incident face to exclude
+      // the source triangle from its own contact search.
+      vertexNormals[vi]+=mesh.face[fi].normal*mesh.face[fi].cornerAngles[k];
+      if(incidentFaces[vi]<0)incidentFaces[vi]=int(fi);
+    }
+    std::vector<CudaThicknessRaySeed> raySeeds;
+    if(options.UseCudaRaySeeds){
+      ThicknessGeometry::FlatBvh flat;flat.initialize(tree);
+      std::vector<CudaThicknessBvhNode> packedNodes(flat.nodes.size());
+      for(std::size_t i=0;i<flat.nodes.size();++i){
+        const auto& from=flat.nodes[i];auto& to=packedNodes[i];
+        for(int axis=0;axis<3;++axis){to.Bounds[axis]=from.box.min[axis];to.Bounds[axis+3]=from.box.max[axis];}
+        to.Children[0]=from.children[0];to.Children[1]=from.children[1];
+        to.FirstFace=from.firstFace;to.FaceCount=from.faceCount;
+      }
+      std::vector<std::array<double,3>> directions(count);
+      for(std::size_t i=0;i<count;++i){const auto n=vertexNormals[i].normalized()*-1.0;
+        directions[i]={n[0],n[1],n[2]};}
+      std::string cudaError;
+      if(!FindWallThicknessRaySeedsCuda(vertices,directions,faces,packedNodes,flat.faceIds,raySeeds,cudaError)){
+        raySeeds.clear();
+        std::clog << "[CadMesh] CUDA thickness ray initialization unavailable; using CPU ray queries: "
+                  << cudaError << '\n';
+      } else result.CudaRaySeedsUsed=true;
+    }
     const auto samplingStart=Clock::now();
     result.PreparationSeconds=std::chrono::duration<double>(samplingStart-start).count();
     auto sample=[&](std::size_t i){
-      auto& f=mesh.face[i];
-      areas[i]=((f.cP(1)-f.cP(0))^(f.cP(2)-f.cP(0))).Norm()*.5;
-      if(!(f.N().SquaredNorm()>std::numeric_limits<float>::epsilon()))return;
+      if(incidentFaces[i]<0){result.Status[i]=ThicknessStatus::InvalidNormal;return;}
+      const auto normal=vertexNormals[i].normalized();
+      if(!(normal.SquaredNorm()>std::numeric_limits<float>::epsilon()))return;
+      auto& f=mesh.face[std::size_t(incidentFaces[i])];
       MeshPoint point;
-      point.triPoint=MeshTriPoint{{1.0/3.0,1.0/3.0}};
-      point.pt=f.cP(0)+((f.cP(1)-f.cP(0))+(f.cP(2)-f.cP(0)))/3.0;
-      point.sourceFace=&f;point.inDir=-f.cN();
-      point.notIncidentFaces=[&f](Face* other){return other && other!=&f;};
+      const auto& v=vertices[i];point.pt=Vector(v[0],v[1],v[2]);
+      point.sourceFace=&f;point.inDir=-normal;
+      if(raySeeds.size()==count){point.raySeedFace=raySeeds[i].Face;
+        point.raySeedDistance=raySeeds[i].Distance;point.raySeedU=raySeeds[i].U;point.raySeedV=raySeeds[i].V;}
+      point.notIncidentFaces=[&,i](Face* other){
+        if(!other)return false;
+        const auto faceId=std::size_t(other->id);
+        if(faceId>=faces.size())return true;
+        const auto& tri=faces[faceId];
+        return tri[0]!=int(i)&&tri[1]!=int(i)&&tri[2]!=int(i);
+      };
       point.sphereConstraintFaces=point.notIncidentFaces;
       auto sphere=findInSphere(mesh,tree,point,settings);
-      int attempts=0;double referenceRadius=0;
-      sphere=refineFaceRepresentative(mesh,tree,point,std::move(sphere),settings,attempts,referenceRadius);
       const double thickness=2*sphere.radius;auto& status=result.Status[i];
       if(!sphere.contained){status=ThicknessStatus::PenetratingSphere;return;}
       if(sphere.converged&&!sphere.wallContact){status=ThicknessStatus::LocalSurfaceContact;return;}
@@ -985,10 +1054,10 @@ bool WallThicknessCalculator::compute(const std::vector<std::array<double,3>>& v
       if(thickness<=minimum){status=ThicknessStatus::BelowMinimum;return;}
       if(thickness>maximum*(1+1e-5)){status=ThicknessStatus::AboveMaximum;return;}
       result.Values[i]=float(thickness);
-      status=sphere.sourceRelocated?ThicknessStatus::FeatureSample:ThicknessStatus::Measured;
+      status=ThicknessStatus::Measured;
       result.Samples[i]=sphere.sample;
     };
-    // Bounded queue: one task per worker; each claims 32 faces at a time.
+    // Bounded queue: one task per worker; each claims 32 vertices at a time.
     std::atomic<std::size_t> next{0};
     const auto workerCount=std::min(std::size_t(options.Workers),(count+31)/32);
     RemeshWorkerPool pool(workerCount);
@@ -1000,16 +1069,16 @@ bool WallThicknessCalculator::compute(const std::vector<std::array<double,3>>& v
     }));
     for(auto& future:pending)future.get();
     result.SamplingSeconds=std::chrono::duration<double>(Clock::now()-samplingStart).count();
-    double totalArea=0,validArea=0,sum=0;
+    double sum=0;
     for(std::size_t i=0;i<count;++i){
-      totalArea+=areas[i];if(!std::isfinite(result.Values[i]))continue;
+      if(!std::isfinite(result.Values[i]))continue;
       const double value=result.Values[i];
-      if(result.ValidFaces==0)result.Minimum=result.Maximum=value;
+      if(result.ValidVertices==0)result.Minimum=result.Maximum=value;
       else {result.Minimum=std::min(result.Minimum,value);result.Maximum=std::max(result.Maximum,value);}
-      ++result.ValidFaces;validArea+=areas[i];sum+=value*areas[i];
+      ++result.ValidVertices;sum+=value;
     }
-    result.ValidAreaFraction=totalArea>0?validArea/totalArea:0;
-    result.AreaWeightedAverage=validArea>0?sum/validArea:0;
+    result.ValidVertexFraction=count?double(result.ValidVertices)/count:0;
+    result.Average=result.ValidVertices?sum/result.ValidVertices:0;
     return true;
   }catch(const std::exception& exception){
     result={};error=std::string("wall thickness: ")+exception.what();return false;

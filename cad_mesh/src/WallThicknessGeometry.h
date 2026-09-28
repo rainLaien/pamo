@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <vector>
 
@@ -55,6 +56,7 @@ struct Box {
 struct Face {
   std::array<Vector,3> points;
   Vector normal;
+  std::array<double,3> cornerAngles{};
   int id=-1;
   const Vector& cP(int i)const{return points[i];}
   const Vector& cN()const{return normal;}
@@ -70,20 +72,21 @@ struct Node {
 class Bvh {
   std::vector<Node> nodes;
   std::vector<Face*> ordered;
+  std::vector<Vector> centroids;
   Node* build(std::size_t first,std::size_t last){
     const auto index=nodes.size();nodes.emplace_back();
     Box bounds,centers;
     for(auto i=first;i<last;++i){
       const auto& f=*ordered[i];for(const auto& p:f.points)bounds.add(p);
-      centers.add((f.points[0]+f.points[1]+f.points[2])/3);
+      centers.add(centroids[std::size_t(f.id)]);
     }
     nodes[index].box=bounds;
     if(last-first<=2){nodes[index].oBegin=ordered.data()+first;nodes[index].oEnd=ordered.data()+last;return &nodes[index];}
     int axis=0;for(int k=1;k<3;++k)if(centers.max[k]-centers.min[k]>centers.max[axis]-centers.min[axis])axis=k;
     const auto middle=first+(last-first)/2;
-    std::nth_element(ordered.begin()+first,ordered.begin()+middle,ordered.begin()+last,[axis](const Face* a,const Face* b){
-      const double x=(a->points[0][axis]+a->points[1][axis]+a->points[2][axis])/3;
-      const double y=(b->points[0][axis]+b->points[1][axis]+b->points[2][axis])/3;
+    std::nth_element(ordered.begin()+first,ordered.begin()+middle,ordered.begin()+last,[this,axis](const Face* a,const Face* b){
+      const double x=centroids[std::size_t(a->id)][axis];
+      const double y=centroids[std::size_t(b->id)][axis];
       return x==y?a->id<b->id:x<y;
     });
     nodes[index].children[0]=build(first,middle);nodes[index].children[1]=build(middle,last);
@@ -93,13 +96,45 @@ public:
   Node* pRoot=nullptr;
   Bvh()=default;Bvh(const Bvh&)=delete;Bvh& operator=(const Bvh&)=delete;
   void initialize(Mesh& mesh){
-    ordered.clear();nodes.clear();pRoot=nullptr;
-    for(auto& face:mesh.face)ordered.push_back(&face);
+    ordered.clear();nodes.clear();centroids.resize(mesh.face.size());pRoot=nullptr;
+    for(auto& face:mesh.face){
+      ordered.push_back(&face);
+      centroids[std::size_t(face.id)]=(face.points[0]+face.points[1]+face.points[2])/3;
+    }
     nodes.reserve(ordered.size()*2);
     if(!ordered.empty())pRoot=build(0,ordered.size());
   }
   bool Empty()const{return pRoot==nullptr;}
   const Bvh& Tree()const{return *this;}
+};
+// Pointer-free BVH representation for transfer to CUDA device memory. Leaf
+// ranges index FaceIds, whose values are stable mesh face indices.
+struct FlatBvhNode {
+  Box box;
+  int children[2]{-1,-1};
+  int firstFace=0,faceCount=0;
+};
+struct FlatBvh {
+  std::vector<FlatBvhNode> nodes;
+  std::vector<int> faceIds;
+  void initialize(const Bvh& source) {
+    nodes.clear();faceIds.clear();
+    std::function<int(const Node*)> append=[&](const Node* node)->int {
+      const int index=int(nodes.size());nodes.emplace_back();
+      nodes[index].box=node->box;
+      if(node->IsLeaf()){
+        nodes[index].firstFace=int(faceIds.size());
+        for(auto it=node->oBegin;it!=node->oEnd;++it)faceIds.push_back((*it)->id);
+        nodes[index].faceCount=int(faceIds.size())-nodes[index].firstFace;
+      } else {
+        const int left=append(node->children[0]);
+        const int right=append(node->children[1]);
+        nodes[index].children[0]=left;nodes[index].children[1]=right;
+      }
+      return index;
+    };
+    if(source.pRoot)append(source.pRoot);
+  }
 };
 inline bool rayBoxEntry(const Box& box,const Line& ray,double& entry){
   double lo=0,hi=std::numeric_limits<double>::infinity();

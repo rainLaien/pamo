@@ -12,6 +12,9 @@ tests/*
 !tests/test_raw_projection.cu
 !tests/test_raw_batch.cpp
 !tests/test_repair_narrow_strips.py
+!tests/test_region_quality.cpp
+!tests/test_phase1_cli.py
+!tests/test_phase1_audit.py
 
 # One-off development patch scripts and scratch files
 patch_*.py

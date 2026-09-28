@@ -7,12 +7,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(cad_adaptive
     src/SemanticMesh.cpp
     src/PartitionInput.cpp
+    src/ConstraintAudit.cpp
     src/CylinderFilletInitializer.cpp
     src/RemeshField.cpp
     src/BoundarySizingField.cpp
     src/RemeshPolicy.cpp
     src/AnalyticProjector.cpp
     src/RemeshMetrics.cpp
+    src/RegionQuality.cpp
+    src/RegionCandidateSelection.cpp
     src/RelaxProject.cpp
     src/MultiSegmentRefineBackend.cpp
     src/TriangleRefineBackend.cpp
@@ -32,6 +35,17 @@ endif()
 
 option(CAD_ADAPTIVE_RXMESH "Build the isolated RXMesh GPU backend" OFF)
 include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_constraint_audit tests/test_constraint_audit.cpp)
+    target_link_libraries(test_constraint_audit PRIVATE cad_adaptive)
+    add_test(NAME constraint_audit COMMAND test_constraint_audit)
+    add_executable(test_region_quality tests/test_region_quality.cpp)
+    target_link_libraries(test_region_quality PRIVATE cad_adaptive)
+    add_test(NAME region_quality COMMAND test_region_quality)
+    add_executable(test_region_candidate_selection tests/test_region_candidate_selection.cpp)
+    target_link_libraries(test_region_candidate_selection PRIVATE cad_adaptive)
+    add_test(NAME region_candidate_selection COMMAND test_region_candidate_selection)
+endif()
 set(CAD_ADAPTIVE_RXMESH_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../RXMesh"
     CACHE PATH "Pinned RXMesh source (e468c34)")
 

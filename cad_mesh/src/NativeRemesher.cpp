@@ -1703,16 +1703,19 @@ bool NativeRemesher::remesh(const CadMeshPatchSegmenter &segmenter,
       << ", accepted=" << stats.AnalyticPatchesRebuilt << '/' << stats.AnalyticPatchesAttempted
       << "; global postprocessing and rollback skipped" << std::endl;
   if(config.ComputeWallThickness){
-    if(config.Verbose)std::clog << "[CadMesh] wall thickness: sampling final mesh, workers="
+    if(config.Verbose)std::clog << "[CadMesh] wall thickness: sampling final vertices, workers="
                               << config.ThicknessOptions.Workers << std::endl;
     std::vector<std::array<double,3>> thicknessPositions;
     thicknessPositions.reserve(result.Vertices.size());
     for(const auto& p:result.Vertices)thicknessPositions.push_back({p[0],p[1],p[2]});
-    if(!WallThicknessCalculator::compute(thicknessPositions,result.Triangles,config.ThicknessOptions,result.Thickness,error))return false;
+    auto thicknessOptions=config.ThicknessOptions;
+    thicknessOptions.UseCudaRaySeeds=!config.DisableCuda;
+    if(!WallThicknessCalculator::compute(thicknessPositions,result.Triangles,thicknessOptions,result.Thickness,error))return false;
     if(config.Verbose){const auto& t=result.Thickness;
-      std::clog << "[CadMesh] wall thickness: valid=" << t.ValidFaces << '/' << result.Triangles.size()
-        << ", valid_area_fraction=" << t.ValidAreaFraction << ", min=" << t.Minimum << ", max=" << t.Maximum
-        << ", area_weighted_mean=" << t.AreaWeightedAverage
+      std::clog << "[CadMesh] wall thickness: valid_vertices=" << t.ValidVertices << '/' << result.Vertices.size()
+        << ", valid_vertex_fraction=" << t.ValidVertexFraction << ", min=" << t.Minimum << ", max=" << t.Maximum
+        << ", mean=" << t.Average
+        << ", cuda_ray_seeds=" << (t.CudaRaySeedsUsed?"yes":"no")
         << ", preparation_s=" << t.PreparationSeconds << ", sampling_s=" << t.SamplingSeconds << std::endl;
     }
   }
@@ -1725,9 +1728,9 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
                               std::string &error) {
   const auto &patches=result.OutputPatches.empty()?inputPatches:result.OutputPatches;
   const bool hasThickness=!result.Thickness.Values.empty();
-  if(hasThickness && (result.Thickness.Values.size()!=result.Triangles.size() ||
-                      result.Thickness.Status.size()!=result.Triangles.size())){
-    error="wall thickness face count does not match output mesh";return false;
+  if(hasThickness && (result.Thickness.Values.size()!=result.Vertices.size() ||
+                      result.Thickness.Status.size()!=result.Vertices.size())){
+    error="wall thickness vertex count does not match output mesh";return false;
   }
   std::error_code filesystemError;
   if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), filesystemError);
@@ -1741,17 +1744,23 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
          "\ncomment surface_type_ids 0=Unknown 1=Plane 2=Cylinder 3=Cone 4=Sphere 5=Torus 6=Freeform"
          "\ncomment feature_role_ids 0=Ordinary 1=Fillet 2=FilletCandidate\nelement vertex "
       << result.Vertices.size()
-      << "\nproperty double x\nproperty double y\nproperty double z\nelement face "
-      << result.Triangles.size()
+      << "\nproperty double x\nproperty double y\nproperty double z\n";
+  if(hasThickness)out << "comment wall_thickness is vertex rolling_ball_diameter_in_model_units; invalid=nan\n"
+    "comment thickness_status valid=0_measured; see WALL_THICKNESS.md\n"
+    "property float wall_thickness\nproperty uchar thickness_valid\nproperty uchar thickness_status\n";
+  out << "element face " << result.Triangles.size()
       << "\nproperty list uchar int vertex_indices\nproperty int patch_id"
          "\nproperty int source_patch_id\nproperty int primitive_type\nproperty uchar red\nproperty uchar green"
          "\nproperty uchar blue\nproperty int feature_role\nproperty uchar remeshed\nproperty uchar remesh_reason\n";
-  if(hasThickness)out << "comment wall_thickness is rolling_ball_diameter_in_model_units; invalid=nan\n"
-    "comment thickness_status valid=0_measured_or_9_feature_sample; see WALL_THICKNESS.md\n"
-    "property float wall_thickness\nproperty uchar thickness_valid\nproperty uchar thickness_status\n";
   out << "end_header\n" << std::setprecision(17);
-  for (const auto &vertex : result.Vertices)
-    out << vertex.X() << ' ' << vertex.Y() << ' ' << vertex.Z() << '\n';
+  for (std::size_t i=0;i<result.Vertices.size();++i) {
+    const auto &vertex=result.Vertices[i];
+    out << vertex.X() << ' ' << vertex.Y() << ' ' << vertex.Z();
+    if(hasThickness){const auto status=result.Thickness.Status[i];const bool valid=status==ThicknessStatus::Measured;
+      out << ' ';if(valid)out << result.Thickness.Values[i];else out << "nan";
+      out << ' ' << int(valid) << ' ' << int(status);}
+    out << '\n';
+  }
   for (std::size_t i = 0; i < result.Triangles.size(); ++i) {
     const int patchId = result.PatchIds[i];
     const MeshPatch *patch = patchId >= 0 && patchId < int(patches.size()) ? &patches[patchId] : nullptr;
@@ -1770,13 +1779,6 @@ bool NativeRemesher::writePly(const NativeRemeshResult &result,
         << (i<result.FaceReasons.size() ? int(result.FaceReasons[i]) :
             (patchId>=0 && std::size_t(patchId)<result.PatchReasons.size()
                 ? int(result.PatchReasons[patchId]) : int(PatchRemeshReason::Unknown)));
-    if(hasThickness){
-      const auto status=result.Thickness.Status[i];
-      const bool valid=status==ThicknessStatus::Measured || status==ThicknessStatus::FeatureSample;
-      out << ' ';
-      if(valid)out << result.Thickness.Values[i];else out << "nan";
-      out << ' ' << int(valid) << ' ' << int(status);
-    }
     out << '\n';
   }
   out.flush();

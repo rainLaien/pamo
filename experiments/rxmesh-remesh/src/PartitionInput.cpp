@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <set>
+#include <map>
 #include <unordered_map>
 
 namespace cad_adaptive {
@@ -51,9 +52,11 @@ int refinePartitionBoundary(SemanticMesh &mesh, float maxLength) {
 }
 
 
-int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
+int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config,int *deferredEdges) {
+  if(deferredEdges)*deferredEdges=0;
   int total=0;
-  for(int round=0;round<64;++round) {
+  constexpr int splitBudget=100000;
+  for(int round=0;round<=64;++round) {
     mesh.rebuildTopology();
     std::vector<uint8_t> claimed(mesh.faceCount(),0);
     std::vector<EdgeRec> selected;
@@ -79,7 +82,16 @@ int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
       mesh.compact(); if(mesh.LocalSizing) mesh.LocalSizing->apply(mesh); mesh.computeVertexNormals();
       return total;
     }
-    if(size_t(total)+selected.size()>100000u) throw std::runtime_error("local boundary subdivision budget exceeded");
+    // Keep the source usable when a dense or highly graded boundary exceeds
+    // the safety budget. Process the affordable prefix and leave the
+    // remaining shared edges intact for the patch remesher. They stay
+    // constrained on both incident patches and are reported as deferred work.
+    if(round==64 || total>=splitBudget) {
+      if(deferredEdges)*deferredEdges=int(selected.size());
+      break;
+    }
+    const size_t remaining=size_t(splitBudget-total);
+    if(selected.size()>remaining)selected.resize(remaining);
     for(const auto &e:selected) {
       const bool sharp=(e.flags&EdgeSharp)!=0;
       const bool boundary=(e.flags&(EdgePatchBoundary|EdgeMeshBoundary))!=0;
@@ -111,7 +123,8 @@ int refinePartitionBoundary(SemanticMesh &mesh,const RemeshConfig &config) {
       ++total;
     }
   }
-  throw std::runtime_error("local boundary subdivision did not converge");
+  mesh.compact(); if(mesh.LocalSizing)mesh.LocalSizing->apply(mesh); mesh.computeVertexNormals();
+  return total;
 }
 
 
@@ -192,7 +205,8 @@ bool validatePartitionOutput(const SemanticMesh &source, const SemanticMesh &out
   return true;
 }
 
-bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string *error, bool referenceOnly) {
+bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string *error, bool referenceOnly,
+                        ConstraintAudit* audit) {
   try {
     std::ifstream in(path, std::ios::binary);
     auto read = [&](auto &value) {
@@ -223,10 +237,21 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
       for (int k=0;k<3;++k)
         result.vertexPatchId[t[k]]=std::min(result.vertexPatchId[t[k]],t[3]);
     }
+    std::vector<SourcePatchEvidence> patchEvidence;
+    if(audit)patchEvidence.reserve(np);
     for (uint32_t p=0;p<np;++p) {
       uint32_t h[5]; read(h);
       if (h[3]!=counts[p] || h[4]>np) throw std::runtime_error("partition ownership mismatch");
-      for (uint32_t s=0;s<h[4];++s) { uint32_t id; read(id); if(id>=np) throw std::runtime_error("invalid support patch"); }
+      SourcePatchEvidence evidence;
+      if(audit) {
+        if(h[2]>1)throw std::runtime_error("invalid source feature role");
+        evidence.patchId=p;evidence.type=PatchType(h[0]);evidence.producerFeatureRole=uint8_t(h[2]);
+        evidence.supportPatchIds.reserve(h[4]);
+      }
+      for (uint32_t s=0;s<h[4];++s) {
+        uint32_t id; read(id); if(id>=np) throw std::runtime_error("invalid support patch");
+        if(audit)evidence.supportPatchIds.push_back(id);
+      }
       double params[9]; read(params);
       if (h[0]>uint32_t(PatchType::Freeform) || h[1]>1) throw std::runtime_error("invalid patch type or target");
       if (!referenceOnly && (h[1]!=1 || (h[0]!=uint32_t(PatchType::Plane) && h[0]!=uint32_t(PatchType::Cylinder))))
@@ -240,8 +265,10 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
       if (!referenceOnly && (length2(rec.axis)<1e-12f || (rec.type==PatchType::Cylinder && !(rec.radius>0))))
         throw std::runtime_error("invalid analytic surface");
       result.patches.push_back(rec);
+      if(audit)patchEvidence.push_back(std::move(evidence));
     }
     std::vector<std::array<uint32_t, 2>> featureEdges;
+    std::map<uint64_t,std::pair<uint32_t,uint8_t>> supplied;
     for (uint32_t e=0;e<ne;++e) {
       uint32_t r[4]; read(r);
       if (r[1]>=nv || r[2]>=nv || r[1]==r[2] || r[3]>1) throw std::runtime_error("invalid feature edge");
@@ -249,6 +276,12 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
       result.vertexConstraint[r[1]]=uint8_t(VertexConstraint::Locked);
       result.vertexConstraint[r[2]]=uint8_t(VertexConstraint::Locked);
       featureEdges.push_back({r[1],r[2]});
+      if(audit) {
+        const uint64_t key=(uint64_t(std::min(r[1],r[2]))<<32)|std::max(r[1],r[2]);
+        auto [where,inserted]=supplied.emplace(key,std::make_pair(r[0],uint8_t(r[3])));
+        if(!inserted && where->second!=std::make_pair(r[0],uint8_t(r[3])))
+          throw std::runtime_error("conflicting source constraint records");
+      }
       if(referenceOnly) result.featureEdges[(uint64_t(std::min(r[1],r[2]))<<32)|std::max(r[1],r[2])]=r[0];
     }
     if (in.peek()!=std::char_traits<char>::eof()) throw std::runtime_error("trailing partition data");
@@ -271,6 +304,24 @@ bool loadPartitionInput(const std::string &path, SemanticMesh &mesh, std::string
     }
     result.computeVertexNormals();
     if (!result.validate(error)) return false;
+    if(audit) {
+      ConstraintAudit collected;collected.sourceVertices=nv;collected.sourceFaces=nf;
+      collected.sourcePatches=std::move(patchEvidence);
+      for(const auto& e:result.edges) {
+        const uint64_t key=(uint64_t(e.v0)<<32)|e.v1;
+        const auto entry=supplied.find(key);
+        SourceConstraint record;record.v0=e.v0;record.v1=e.v1;
+        record.patchLeft=e.patchLeft;record.patchRight=e.patchRight;
+        if(entry!=supplied.end()) {
+          record.featureId=entry->second.first;record.evidence|=SuppliedRecord;
+          if(entry->second.second)record.evidence|=InputHard;
+        }
+        if(e.flags&EdgeMeshBoundary)record.evidence|=IntrinsicOpen;
+        if(e.flags&EdgePatchBoundary)record.evidence|=PatchInterface;
+        if(record.evidence)collected.sourceEdges.push_back(record);
+      }
+      *audit=std::move(collected);
+    }
     mesh=std::move(result);
     return true;
   } catch(const std::exception &e) { if(error) *error=e.what(); return false; }

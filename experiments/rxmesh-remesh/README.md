@@ -239,6 +239,148 @@ edges, or inconsistent interior-edge orientation; the original 81 open edges,
 one connected component and Euler characteristic -1 were retained. This is one
 validated model/run, not a guarantee for all CAD inputs.
 
+### Faster `2.stl` run
+
+```powershell
+.\experiments\rxmesh-remesh\run_raw_partition.ps1 `
+  -InputMesh .\examples\2.stl `
+  -OutputDirectory .\experiments\rxmesh-remesh\results\2stl-fast `
+  -ModelSeeds 250 -Iterations 12 -SmoothPasses 3
+```
+
+`-ModelSeeds` controls the analytic recognition seed budget when creating a
+fresh partition. Its default remains 2500. Lowering it changes the partition;
+unrecognized surfaces continue through the Freeform path. The residual search
+budget, geometry tolerance, boundary constraints and final oversized-edge
+recovery remain enabled. The faster settings are a measured tradeoff for this
+input, not a universal replacement for the default settings.
+
+Strip repair now indexes source faces once and reuses the source topology
+audit across neighbor expansion. It also reuses local reconstruction only when
+the target, tolerance and shared slicing grid match exactly. The original
+2500-seed snapshot repair fell from 19.60 s to 9.71 s with byte-identical output.
+The GPU smoother now retains ownership of its final vertex buffer for odd pass
+counts, enabling the three-pass configuration without a freed-buffer access.
+
+For the supplied `examples/3.stl` / 浇道 model, the user-facing script can
+enable cylinder and cone curvature sizing while retaining the same global
+target and original-STL geometry budget:
+
+```powershell
+& experiments/rxmesh-remesh/run_remesh.ps1 -InputMesh examples/3.stl -CurvedSurfaceSizing -TargetLength 8.9206295 -MaxError 1.7841259
+```
+
+This option uses one patch per task. If the protected-boundary subdivision
+budget is exceeded, the user-facing runner retries the repaired snapshot
+with feature-aware sizing and 16 patches per task. This mode refines sampled
+curvature and protected feature lines with a bounded local target. The feature
+field now relaxes over four regular target lengths by default
+(`-FeatureTransitionWidthRatio` controls this), so local sizes change
+gradually instead of jumping across one triangle. Convex, near-circular plane
+patches also receive a new layered interior triangulation while their shared
+contours remain fixed; each local result must preserve or improve mean and
+lower-tail triangle quality. If that
+candidate fails the topology, boundary, global-quality or edge-size guards,
+the runner retries uniform sizing. The summary records the effective sizing
+mode, transition quality, and planar coverage. The ordinary uniform mode remains the default
+for other inputs; `-FeatureAwareSizing` selects feature-driven sizing directly.
+For `examples/2.stl`, a direct graded run is:
+
+```powershell
+& .\experiments\rxmesh-remesh\run_remesh.ps1 -InputMesh .\examples\2.stl -FeatureAwareSizing -TargetLength 7.6237063 -MaxError 1.5247413
+```
+
+The user-facing runner exits with code 0 once it has saved the mesh and
+`summary.json`, including when size or regional quality targets remain unmet.
+`summary.json` records `acceptance_code` and `result_status`; `run.log` retains
+the unresolved counts. Optional size, coverage, and visual audits are reported
+separately and do not discard a completed mesh.
+
+The coverage audit compares per-patch triangle geometry with the partition
+snapshot, and identifies planar patches whose source tessellation remains.
+Those patches require a separate shared-contour coarsening strategy; the
+runner reports them instead of treating a valid global mesh as complete
+coverage.
+See [CONE_WALL_PREVIEW.md](CONE_WALL_PREVIEW.md) for the latest
+same-input quality, geometry, feature, orientation and size comparison.
+
+On the RTX 3060, a fresh run from the original `examples/2.stl` completed in
+**85.37 s**, versus the earlier 142.79 s default run. This includes segmentation
+and packaging (44.87 s), strip repair (9.48 s), GPU batch processing (28.50 s),
+loading, Python startup and output. It does not reuse a saved partition.
+The 227 strip repairs and all 426 GPU tasks were accepted, with zero rejected
+strip repairs, unchanged tasks, fallback tasks or oversized output edges.
+The output has 257,297 faces, max edge/target ratio 1.33322, mean quality 0.448142
+(previously 0.460707) and P05 quality 0.0231339 (previously 0.0231345).
+The native topology, geometry and boundary checks passed. This is a single
+complete timed run with about 4.6 s margin, not a hard runtime guarantee.
+Artifacts: `results/2stl_speed_20260926/full_fast/pipeline.json`,
+`remeshed.ply.json` and `remeshed.ply` in the same directory.
+
+### Phase 1 regional quality acceptance
+
+The default batch policy now separates a geometrically valid candidate from an
+accepted quality endpoint. `accepted` in the task report means it can be
+assembled; `quality_accepted` and `provisional` state its local quality outcome.
+Changed topology or coordinates alone do not stop recovery. Existing recovery
+strategies are tried with the same endpoint guard, and a valid provisional
+candidate is kept when they cannot meet that guard. Quality failure alone does
+not fall back to the complete source task. Hard topology/geometry failures still
+use the existing safe fallback. No GPU operators or partition/seam scheduling
+were replaced in this phase.
+
+`RegionQuality` reports the original mean and order-statistic P05, area-weighted
+mean, low-quality area, and connected low-quality regions. Components connect
+across patch interfaces. All components contribute to totals; only the largest
+32 are serialized with bounds and patch IDs. Long and short edges, components of
+faces incident to those edges, and target-size transition ratios are also
+reported. Short edges use the existing collapse ratio as a diagnostic cutoff;
+they are not all assumed removable near constrained geometry.
+
+`--low-quality-threshold` / `-LowQualityThreshold` specify a diagnostic cutoff.
+The default is the immutable batch input P05, derived once before boundary
+refinement and held across repair rounds. It locates the input's poor tail;
+it is not a universal quality target. Both sides of a comparison use this same
+cutoff. Endpoint acceptance conservatively requires non-regression of mean,
+P05, area-weighted mean, bad area and largest bad component, globally AND for
+every original patch in the final assembled output. Tolerances of 1e-6 for
+quality and 1e-6 times source area accommodate numerical comparisons; the old
+percentage quality-loss allowances cannot certify final success.
+If the input region has detected poor faces, non-regression alone is insufficient:
+at least one of those quality/area measurements must improve measurably. A poor
+unchanged region follows recovery and remains pending when no candidate helps.
+
+`pending_patch_ids` identifies remaining work, with endpoint measurements and
+`failure_mask`: mean=1, P05=2, area-weighted mean=4, bad area=8, largest bad
+region=16, invalid faces=32, winding=64, unresolved input defect=128. The original patch guard also protects
+against improvements in one region hiding regression in another. An artificial
+cut may subdivide these per-patch comparisons, so the cross-interface connected
+region audit remains necessary. These guards establish non-regression, not an
+application-calibrated absolute quality certificate.
+
+Constraint roles are orthogonal: persistent feature, intrinsic open boundary,
+and partition interface. `ConstraintMotion` describes the current movement
+classification without changing operator constraints. CADPART1 does not encode
+whether an interface is a true geometric edge or a computation cut, or whether
+all persistent features are true CAD features; the audit explicitly leaves
+that provenance unknown. Corner/locked vertices remain fixed. Resolving that
+provenance and opening pure computation seams is deferred. `regressed_patch_ids`
+and `unresolved_patch_ids` distinguish regression from a pre-existing defect that
+still lacks measurable quality progress; both remain pending.
+
+An endpoint that fails quality is saved and returns **4**. The runner continues
+supported residual repair, ranks quality before size, and keeps the candidate
+and diagnostics if no additional supported repair exists. It no longer forces
+centroid subdivision merely to eliminate `unchanged`. `-LegacyCoverageAcceptance`
+(`--legacy-coverage-acceptance` for the executable) restores the previous
+acceptance and coverage-refinement decisions for comparison or rollback; the
+new audits still run. It is not a way to certify a rejected endpoint.
+
+Independent comparison, targeted tests, timing and reproduction details for
+this change are in `PHASE1_REVIEW.md`. Independent distance samples and nearest
+reference-normal checks are not proofs of Hausdorff distance or absence of
+self-intersection.
+
 The independent shared-boundary and input-preservation regression checks run as:
 
 ```powershell
@@ -331,6 +473,31 @@ unconstrained. This bridge does not replace PAMO's native remesher.
 
 ## CPU tests (001.0–001.4 + 002.0, no CUDA)
 
+### Regional candidate experiments
+
+`-UnifiedRegionalSizing` is an optional CPU/GPU shared size-field experiment,
+used with explicit regional targets and a reference output. See
+[PHASE6_SIZING.md](PHASE6_SIZING.md) for rejected results and reproduction.
+The existing `-ComputeRegions 256` path reached 83.42 seconds on one complete
+STL run, but failed quality and size checks; it is not an accepted solution.
+See [PHASE7_COMPUTE.md](PHASE7_COMPUTE.md).
+
+`-ExploreProvisionalChildren` (CLI `--explore-provisional-children`) optionally
+compares a legal provisional packed-task candidate with single-patch recovery.
+The current policy first chooses nonregressing ownership regions, retaining
+their legal incumbents elsewhere, then checks the connected union globally.
+The comparison checks defect quality per patch and globally, plus long and
+short edge counts. Already healthy nonregressing regions reuse their incumbent.
+Rejected exploration retains the legal incumbent.
+It does not certify endpoint quality or the 90-second performance target.
+All three options are off by default.
+
+Final size recovery now selects regions from the actual assembled endpoint
+targets, rather than packed-task ratio summaries. This removes a known omission
+of 394 local-target long edges, but can worsen regional shape quality; endpoint
+failure remains explicit. See [PHASE10_CONTRACT.md](PHASE10_CONTRACT.md) for
+full timing, rejected quality tradeoffs, and the PLY coordinate-type audit fix.
+
 ```powershell
 cmake -S experiments/rxmesh-remesh -B experiments/rxmesh-remesh/build -G Ninja
 cmake --build experiments/rxmesh-remesh/build
@@ -356,3 +523,44 @@ Recorded on RTX 3060 (plane grid, constant `h`): 100K GPU 2.2s / CPU 4.5s; 1M GP
 Those scale results are from 001. The 002 1M comparison records topology-stage
 time of 3.900s → 2.816s, but total remesh time of 16.43s → 18.06s with different
 finite-iteration outputs. See the ticket for the full report and measurement caveats.
+
+Optional `-TrackRegionCandidates` / `--track-region-candidates` audits intermediate cycles against an immutable reference and only restores a snapshot if it does not regress the completed run. It remains disabled: the full experiment failed quality acceptance and took 105.89 s. See [PHASE11_CANDIDATES.md](PHASE11_CANDIDATES.md).
+
+Optional `-SizeFeasibleFinalRefine` / `--size-feasible-final-refine` prioritizes size-feasible child edges and checks parent/child orientation. It remains disabled: 100.95 s full runtime, four explicit size defects and regional quality regressions. See [PHASE12_FEASIBLE.md](PHASE12_FEASIBLE.md).
+
+The optional size-feasible refinement now reports residual selection/stopping, allows measurable intermediate severity reduction and searches a bounded finer candidate grid only after coarse candidates fail. The full result has zero size-long edges but still fails regional quality at 102.06 s; it remains disabled. See [PHASE13_RESIDUAL.md](PHASE13_RESIDUAL.md).
+
+Optional `-SelectFinalRegions` / `--select-final-regions` compares both final refinement strategies and selects nonregressing connected groups with stable anchor identities. Ten actual regions passed independent quality checks, but the full endpoint remains unsatisfied at 109.49 s. Host defect-area comparisons now use their own metric scale and declared float coordinates are evaluated in double precision. CADPART1 also carries a partial hard-feature declaration currently ignored by the experimental loader; see [PHASE14_SELECTION.md](PHASE14_SELECTION.md).
+
+## 阶段 15：完成态区域试验
+
+见 [PHASE15_FLAT.md](PHASE15_FLAT.md)。严格平面合并在 2.stl 无可合并接口；完成态平面对角线仅改善普通平面，主要坏区域不变，因此未接入默认流程。新增 `repair_narrow_strips.py --only-requested-regions` 用于显式区域和必要接缝邻居的阶段重建，默认关闭，不能把复用输出的耗时当作完整流程。总质量和 90 秒目标尚未达到。
+
+## 阶段 16：精度来源与邻区约束
+
+见 [PHASE16_POLYGON.md](PHASE16_POLYGON.md)。完成态参考精度恢复保持 float32 输出坐标不变；两窄带联合重建可生成合法候选，但全局和邻区质量仍有退化，未采用。8 工作线程从原始 2.stl 完整流程为 107.39 秒，输出与 4 线程对照逐字节一致，终点质量与 90 秒目标均未达到。
+
+
+## Optional constraint and native-size evidence
+
+`run_raw_partition.ps1 -AuditFields` (`cad_raw_partition_cli --audit-fields`) writes immutable input constraint evidence and final native vertex/edge sizing sidecars. `pipeline.json` records which round contains the selected sidecars; input and output vertex IDs are different domains. No movement permission changes. See [PHASE19_CONSTRAINTS.md](PHASE19_CONSTRAINTS.md) for verification, full timing, and limitations.
+The version-2 audit also exports `*.source_patches.tsv`: producer patch type,
+Fillet role, and support patch IDs, independently checked against CADPART1.
+This records model-recognition evidence without certifying a CAD curve or
+unlocking any boundary; see [PHASE34_PATCH_PROVENANCE.md](PHASE34_PATCH_PROVENANCE.md).
+
+
+## Optional joint-region tradeoff policy
+
+`-RegionalQualityPolicy` and `-NativeSizeEvidence` enable an explicit bounded regional transaction policy. Neighbor means and P05 become advisory; feature/topology/original-geometry and native-size checks still gate adoption. No production loss budget is assumed. See [PHASE20_JOINT.md](PHASE20_JOINT.md) for measured candidate gains, costs, and remaining checks.
+
+`tools/try_original_region_recovery.py` is a separate, optional candidate
+tool for at most two explicitly selected source patches. It remeshes from the
+original repaired snapshot, requires an exact boundary graph, reconstructs
+native targets by vertex identity, and checks a supplied quality policy,
+feature/seam/open chains, topology, direction and sampled original-STL error.
+It never overwrites the incumbent. On `2.stl`, patches 4501/4510 reduce
+low-quality area by 15.50 but take an additional 35.90 s; the complete
+original-STL run with audit export and recovery takes 144.92 s. This is not
+enabled by default and does not meet the 90 s target. See
+[PHASE40_ORIGINAL_REGION_RECOVERY.md](PHASE40_ORIGINAL_REGION_RECOVERY.md).

@@ -4,6 +4,7 @@
 // CUDA conflict selection, storage and orchestration are implemented here.
 #include "cad_adaptive/RawCudaRemesher.h"
 #include "cad_adaptive/RemeshMetrics.h"
+#include "cad_adaptive/RegionQuality.h"
 #include "cad_adaptive/gpu/ReferenceSurfaceGpu.cuh"
 #include <algorithm>
 #include <chrono>
@@ -332,7 +333,7 @@ __device__ bool changedFaceSafe(MeshView m, Triangle t, int a, int b,
     for (int k = 0; k < 3; ++k)
       if (t.v[k] != a && t.v[k] != b) {
         float midSizing=ref.regularLength;
-        if(ref.sizingCount) {
+        if(hasSizing(ref)) {
           midSizing=sizingAt(ref,mul3(add3(dest,after[k]),.5f),t.patch);
           if((changedIndex==0&&k==1)||(changedIndex==1&&k==0))sizingAB=midSizing;
           else if((changedIndex==1&&k==2)||(changedIndex==2&&k==1))sizingBC=midSizing;
@@ -340,7 +341,7 @@ __device__ bool changedFaceSafe(MeshView m, Triangle t, int a, int b,
         }
         if (dist2(dest, after[k]) >
               high * high *
-                  (ref.sizingCount
+                  (hasSizing(ref)
                        ? powf(fminf(midSizing,
                                     .5f * (destSizing + m.v[t.v[k]].target)) /
                                   ref.regularLength,
@@ -393,7 +394,7 @@ __device__ bool changedFaceLengthSafe(MeshView m,Triangle t,int a,int b,float3 d
   for(int k=0;k<3;++k) if(t.v[k]!=a && t.v[k]!=b) {
     const float3 otherP=m.v[t.v[k]].p;
     const float edgeDist2=dist2(dest,otherP);
-    if(!ref.sizingCount) {
+    if(!hasSizing(ref)) {
       if(edgeDist2>high*high)return false;
       continue;
     }
@@ -431,7 +432,7 @@ __global__ void splitVertices(MeshView m, Vertex *out, int *marked, float high,
   auto e = m.e[i];
   const auto midpoint = mul3(add3(m.v[e.a].p, m.v[e.b].p), .5f);
   float target = sizingAt(ref, midpoint,m.f[e.f0].patch);
-  high *= ref.sizingCount
+  high *= hasSizing(ref)
               ? fminf(target, .5f * (m.v[e.a].target + m.v[e.b].target)) /
                     ref.regularLength
               : 1.f;
@@ -501,7 +502,7 @@ __global__ void collapsePrefilter(MeshView m, Candidate *out, int *flags,
   if(e.f0<0)return;
   int a=e.a,b=e.b;
   float edgeLow=low;
-  if(ref.sizingCount) {
+  if(hasSizing(ref)) {
     edgeLow*=fminf(sizingAt(ref,mul3(add3(m.v[a].p,m.v[b].p),.5f),m.f[e.f0].patch),
                    .5f*(m.v[a].target+m.v[b].target))/ref.regularLength;
   }
@@ -583,7 +584,7 @@ __device__ int edgeBetween(MeshView m,int a,int b) {
   const auto collapseEdge=m.e[id];
   const int a=collapseEdge.a,b=collapseEdge.b;
   const float3 dest=out[id].p;
-  const float destSizing=ref.sizingCount
+  const float destSizing=hasSizing(ref)
       ? (out[id].destSizing>0.f?out[id].destSizing:sizingAt(ref,dest,m.f[collapseEdge.f0].patch))
       : ref.regularLength;
   out[id].destSizing=destSizing;
@@ -603,7 +604,7 @@ __device__ int edgeBetween(MeshView m,int a,int b) {
       if(side==1 && neighbor(m,a,u))continue;
       const float3 otherP=m.v[u].p;
       const float edgeDist2=dist2(dest,otherP);
-      if(!ref.sizingCount) {
+      if(!hasSizing(ref)) {
         if(edgeDist2>high2){out[id].keep=-1;return;}
         continue;
       }
@@ -752,7 +753,7 @@ __device__ bool collapseChosenSafe(MeshView m,Candidate &x,int id,float high,
   const auto e=m.e[id];
   const int a=e.a,b=e.b;
   const float3 dest=x.p;
-  const float destSizing=x.destSizing>0.f?x.destSizing:(ref.sizingCount?sizingAt(ref,dest,m.f[e.f0].patch):ref.regularLength);
+  const float destSizing=x.destSizing>0.f?x.destSizing:(hasSizing(ref)?sizingAt(ref,dest,m.f[e.f0].patch):ref.regularLength);
   x.destSizing=destSizing;
   for(int side=0;side<2;++side) {
     const int v=side?a:b;
@@ -782,7 +783,7 @@ __device__ bool collapseChosenSafe(MeshView m,Candidate &x,int id,float high,
   const auto e=m.e[id];
   const int a=e.a,b=e.b;
   const float3 dest=x.p;
-  const float destSizing=x.destSizing>0.f?x.destSizing:(ref.sizingCount?sizingAt(ref,dest,m.f[e.f0].patch):ref.regularLength);
+  const float destSizing=x.destSizing>0.f?x.destSizing:(hasSizing(ref)?sizingAt(ref,dest,m.f[e.f0].patch):ref.regularLength);
   const float destTolerance=ref.sizingCount?fminf(ref.tolerance,.08f*destSizing):ref.tolerance;
   if(!referenceNearWithTolerance(ref,m.f[e.f0].patch,dest,destTolerance))return false;
   for(int side=0;side<2;++side) {
@@ -1121,6 +1122,21 @@ __global__ void auditGeometry(MeshView m, ReferenceSurfaceGpu ref,
   }
 }
 
+
+__global__ void auditReferenceCoverage(ReferenceSurfaceGpu source,
+                                      ReferenceSurfaceGpu output,unsigned int *maximum) {
+  const int f=blockIdx.x*blockDim.x+threadIdx.x;
+  if(f>=source.count)return;
+  const auto t=source.triangles[f];
+  const float3 points[7]={t.a,t.b,t.c,mul3(add3(t.a,t.b),.5f),
+      mul3(add3(t.b,t.c),.5f),mul3(add3(t.c,t.a),.5f),
+      mul3(add3(add3(t.a,t.b),t.c),1.f/3.f)};
+  for(auto p:points) {
+    float3 q;
+    const float error=projectReference(output,t.patch,p,q)?sqrtf(dist2(p,q)):FLT_MAX;
+    atomicMax(maximum,__float_as_uint(error));
+  }
+}
 
 // Preserve the legacy seven-per-face sample set, evaluating shared samples once.
 // Isolated vertices are excluded: the legacy face traversal never visits them.
@@ -1642,6 +1658,9 @@ int smooth(SemanticMesh &mesh, ReferenceSurfaceGpu ref, float lambda,
       if(profileSmoothParts){sync();std::cout << " revert_ms=" << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-smoothPartMark).count() << std::endl;}
       std::swap(m.v,next.p);
     }
+    // An odd pass count leaves the result in the temporary buffer. Transfer
+    // ownership before it is destroyed or the device mesh keeps a freed pointer.
+    d.vertices.p=m.v;
     sync();
     const double kernelSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-kernelStart).count();
     int localRejectError=0,localRejectQuality=0;
@@ -1750,10 +1769,11 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
   collapseTiming = {};
   flipTiming = {};
   try {
-    if (mesh.LocalSizing || (cfg.adaptive && !(cfg.featureEdgeLength > 0)))
+    const auto localSizing=options.referenceMesh?options.referenceMesh->LocalSizing:mesh.LocalSizing;
+    if ((cfg.adaptive && !(cfg.featureEdgeLength > 0)) ||
+        (localSizing && cfg.featureEdgeLength>0))
       throw std::runtime_error(
-          "raw CUDA supports uniform sizing or explicit featureEdgeLength; CAD "
-          "LocalSizing is unsupported");
+          "raw CUDA requires uniform, curvature, or explicit immutable local sizing separately");
     mesh.rebuildTopology();
     std::string error;
     if (!mesh.validate(&error))
@@ -1804,11 +1824,14 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
     }
     const auto setupFeatureSeconds=std::chrono::duration<double>(Clock::now()-setupFeatureStart).count();
     const auto setupReferenceStart=Clock::now();
+    const SemanticMesh &referenceMesh=options.referenceMesh?*options.referenceMesh:mesh;
+    if(referenceMesh.patches.size()!=mesh.patches.size())
+      throw std::runtime_error("immutable reference patch ownership mismatch");
     std::vector<ReferenceTriangleGpu> triangles;
-    for (int f = 0; f < mesh.faceCount(); ++f)
-      triangles.push_back({point(mesh.facePoint(f, 0)),
-                           point(mesh.facePoint(f, 1)),
-                           point(mesh.facePoint(f, 2)), int(mesh.facePatchId[f])});
+    for (int f = 0; f < referenceMesh.faceCount(); ++f)if(referenceMesh.faceAlive[f])
+      triangles.push_back({point(referenceMesh.facePoint(f, 0)),
+                           point(referenceMesh.facePoint(f, 1)),
+                           point(referenceMesh.facePoint(f, 2)), int(referenceMesh.facePatchId[f])});
     std::vector<ReferenceBvhNode> tree;
     std::vector<int> sourceIds;
     buildReferenceBvh(triangles,mesh.bboxDiagonal()*1.e-6f,tree,sourceIds);
@@ -1847,13 +1870,26 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
         !(e.flags&(EdgeSharp|EdgeMeshBoundary|EdgePatchBoundary))) {
       const int a=regionRoot[e.face0], b=regionRoot[e.face1];
       if(a!=b) {addSmoothNeighbor(a,b);addSmoothNeighbor(b,a);}
-    }    if (refine)
+    }
+    if (refine)
       for (auto e : mesh.edges) {
         const auto a = mesh.position(e.v0), b = mesh.position(e.v1);
         float local = h;
-        // A crease is a geometric constraint, not a curvature sample. In
-        // particular, plane/plane intersections must retain the regular size.
-        if (!(e.flags & (EdgeSharp | EdgeMeshBoundary | EdgePatchBoundary)) && e.face0 >= 0 && e.face1 >= 0) {
+        // A real crease or an open contour needs a fine target on both
+        // incident surfaces. A coplanar partition seam is only bookkeeping.
+        bool protectedFeature=(e.flags&(EdgeSharp|EdgeMeshBoundary))!=0;
+        if(!protectedFeature && (e.flags&EdgePatchBoundary) && e.face0>=0 && e.face1>=0)
+          protectedFeature=dot(normals[e.face0],normals[e.face1])<
+              std::cos(cfg.featureAngleDegrees*.01745329252f);
+        if(protectedFeature) {
+          const int patch0=e.face0>=0?int(mesh.facePatchId[e.face0]):int(e.patchLeft);
+          const int patch1=e.face1>=0?int(mesh.facePatchId[e.face1]):int(e.patchRight);
+          seeds.push_back({point(a),point(b),fine,patch0});
+          if(e.face1>=0 && patch1!=patch0)
+            seeds.push_back({point(a),point(b),fine,patch1});
+          continue;
+        }
+        if (!(e.flags & EdgePatchBoundary) && e.face0 >= 0 && e.face1 >= 0) {
           const auto n0 = normals[e.face0];
           const auto n1 = normals[e.face1];
           const float angle = std::acos(clampf(dot(n0, n1), -1.f, 1.f));
@@ -1886,18 +1922,29 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
     buildReferenceBvh(seedBounds,mesh.bboxDiagonal()*1.e-6f,sizeTree,sizeIds,&seedTargets);
     Buffer<ReferenceBvhNode> sizingBvh(sizeTree);Buffer<int> sizingIds(sizeIds);
     Buffer<SizingSegmentGpu> sizing(seeds);
+    Buffer<BoundarySizingPatch> boundaryPatches(localSizing?localSizing->patches():std::vector<BoundarySizingPatch>{});
+    Buffer<BoundarySizingNode> boundaryNodes(localSizing?localSizing->nodes():std::vector<BoundarySizingNode>{});
+    Buffer<BoundarySizingSeed> boundarySeeds(localSizing?localSizing->seeds():std::vector<BoundarySizingSeed>{});
     ReferenceSurfaceGpu ref{reference.p, int(reference.n), cfg.maxGeometryError,
                             sizing.p,    int(sizing.n),    h,
                             band};
     ref.sizingNodes=sizingBvh.p;ref.sizingNodeCount=int(sizeTree.size());ref.sizingIds=sizingIds.p;
     ref.nodes=bvh.p;ref.nodeCount=int(tree.size());ref.triangleIds=triangleIds.p;
+    if(localSizing) {
+      if(localSizing->patches().size()!=mesh.patches.size())
+        throw std::runtime_error("local sizing patch ownership mismatch");
+      ref.boundaryPatches=boundaryPatches.p;ref.boundaryNodes=boundaryNodes.p;
+      ref.boundarySeeds=boundarySeeds.p;ref.boundaryPatchCount=int(boundaryPatches.n);
+      ref.boundaryGradation=localSizing->gradation();
+    }
     const auto setupSizingBvhSeconds=std::chrono::duration<double>(Clock::now()-setupSizingBvhStart).count();
     const auto setupTargetStart=Clock::now();
     refreshHostTargets(mesh,ref);
+    if(localSizing)localSizing->apply(mesh); // shared vertices use all incident patch supports
     const auto setupTargetSeconds=std::chrono::duration<double>(Clock::now()-setupTargetStart).count();
     if(!options.quiet) std::cout<<"reference_query=bvh nodes="<<ref.nodeCount<<std::endl;
     if(!options.quiet) std::cout << "raw_sizing="
-              << (refine ? "curvature_only" : "uniform")
+              << (localSizing ? "immutable_local" : (refine ? "curvature_only" : "uniform"))
               << " seeds=" << seeds.size()
               << " feature_length=" << (refine ? fine : h)
               << " transition_band=" << band << std::endl;
@@ -1953,6 +2000,27 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       return std::tuple<int,float,float>{overlong,maxRatio,p95};
     };
     SemanticMesh bestMesh;
+    auto coverageError=[&](const SemanticMesh &candidate) {
+      std::vector<ReferenceTriangleGpu> triangles;
+      triangles.reserve(candidate.faceCount());
+      for(int f=0;f<candidate.faceCount();++f)if(candidate.faceAlive[f])
+        triangles.push_back({point(candidate.facePoint(f,0)),point(candidate.facePoint(f,1)),
+                             point(candidate.facePoint(f,2)),int(candidate.facePatchId[f])});
+      std::vector<ReferenceBvhNode> tree;std::vector<int> ids;
+      buildReferenceBvh(triangles,candidate.bboxDiagonal()*1.e-6f,tree,ids);
+      Buffer<ReferenceTriangleGpu> outputBuffer(triangles);Buffer<ReferenceBvhNode> nodes(tree);Buffer<int> order(ids);
+      ReferenceSurfaceGpu outputRef;outputRef.triangles=outputBuffer.p;outputRef.count=int(triangles.size());
+      outputRef.nodes=nodes.p;outputRef.nodeCount=int(tree.size());outputRef.triangleIds=order.p;
+      Buffer<unsigned int> maximum(1);checked(streamZero(maximum.p,0,sizeof(unsigned int)));
+      auditReferenceCoverage<<<(ref.count+127)/128,128,0,executionStream>>>(ref,outputRef,maximum.p);
+      sync();const auto bits=maximum.read()[0];float result;std::memcpy(&result,&bits,sizeof(float));return result;
+    };
+    const bool regionTracking=options.freezeBoundary && options.trackRegionCandidates;
+    const float regionCutoff=regionTracking?(options.lowQualityThreshold>0?
+        options.lowQualityThreshold:qualitySummary(mesh).second):0.f;
+    const auto sourceRegion=regionTracking?evaluateRegionQuality(mesh,cfg,regionCutoff):RegionQuality{};
+    RegionQuality bestRegion;bool bestRegionValid=false;
+    int consecutiveGeometryFailures=0;
     float bestMean=-1,bestP05=-1;
     int bestOverlong=std::numeric_limits<int>::max();
     float bestMaxRatio=std::numeric_limits<float>::max(),bestSizingP95=std::numeric_limits<float>::max();
@@ -1960,6 +2028,39 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       const auto [mean,p05]=qualitySummary(mesh);
       if(mean+1.e-6f<options.qualityMeanFloor || p05+1.e-6f<options.qualityP05Floor)
         return std::pair<float,float>{mean,p05};
+      if(regionTracking) {
+        const auto evaluationStart=Clock::now();
+        const auto candidate=evaluateRegionQuality(mesh,cfg,regionCutoff);
+        // Poor input is not the incumbent. Keep the first legal changed cycle
+        // provisionally, then require region and size nonregression to replace it.
+        // The batch endpoint audit still decides whether its quality is success.
+        const bool eligible=selected<0?
+            (sourceRegion.lowQualityFaces==0 && sourceRegion.longEdges==0 &&
+             sourceRegion.shortEdges==sourceRegion.shortConstrainedEdges):
+            ((report.splits+report.collapses+report.flips+report.smoothMoves)>0 &&
+             (!bestRegionValid || (qualityEndpointMask(bestRegion,candidate)==0 &&
+             candidate.longEdges<=bestRegion.longEdges && candidate.shortEdges<=bestRegion.shortEdges)));
+        if(eligible) {
+          ++report.candidateGeometryChecks;
+          float forward=0,ratio=0;
+          {
+            DeviceMesh d(mesh,ref);auto m=d.view();Buffer<unsigned int> maximum(2);
+            checked(streamZero(maximum.p,0,2*sizeof(unsigned int)));RunGeometryAudit(m,ref,maximum.p);
+            sync();const auto values=maximum.read();
+            std::memcpy(&forward,&values[0],sizeof(float));std::memcpy(&ratio,&values[1],sizeof(float));
+          }
+          const float reverse=coverageError(mesh);
+          RemeshReport analytic;analytic.geometryErrorMax=forward;
+          fillMeshMetrics(mesh,cfg,analytic,true);
+          if(ratio<=1.001f && analytic.geometryErrorMax<=cfg.maxGeometryError+mesh.bboxDiagonal()*1.e-6f &&
+             reverse<=cfg.maxGeometryError) {
+            bestMesh=mesh;bestRegion=candidate;bestRegionValid=true;
+            bestMean=mean;bestP05=p05;report.selectedCycle=selected;consecutiveGeometryFailures=0;
+          } else {++report.candidateGeometryRejected;++consecutiveGeometryFailures;}
+        }
+        report.secondsCandidateEvaluation+=std::chrono::duration<double>(Clock::now()-evaluationStart).count();
+        return std::pair<float,float>{mean,p05};
+      }
       const auto [overlong,maxRatio,sizingP95]=sizeSummary(mesh);
       const bool sizeBetter=overlong<bestOverlong ||
           (overlong==bestOverlong && (maxRatio<bestMaxRatio-1.e-5f ||
@@ -1977,7 +2078,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       return std::pair<float,float>{mean,p05};
     };
     const bool trackQuality=options.freezeBoundary &&
-        (options.qualityMeanFloor>0.f || options.qualityP05Floor>0.f);
+        (options.qualityMeanFloor>0.f || options.qualityP05Floor>0.f || regionTracking);
     if(trackQuality)considerBest(-1);
     int severeQualityStallCycles=0;
     for (int cycle = 0; cycle < cfg.maxIterations; ++cycle) {
@@ -2077,6 +2178,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
           std::chrono::duration<double>(Clock::now() - mark).count();
       if(trackQuality) {
         const auto [cycleMean,cycleP05]=considerBest(cycle);
+        if(regionTracking && consecutiveGeometryFailures>=3)break;
         if(cycleMean<.75f*options.qualityMeanFloor &&
            cycleP05<.01f*options.qualityP05Floor)
           ++severeQualityStallCycles;
@@ -2098,7 +2200,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       // reference, sizing field and constraints. Avoid repeating the full
       // CUDA setup and validation on converged regions of a partition batch.
       if (options.stopWhenIdle && ns==0 && nc==0 && nf==0 && nm==0) break;
-      if(trackQuality && report.selectedCycle>=0 && cycle>=10 &&
+      if(trackQuality && !regionTracking && report.selectedCycle>=0 && cycle>=10 &&
          cycle-report.selectedCycle>=5)break;
       } catch(const std::exception &cycleError) {
         const std::string message=cycleError.what();
@@ -2115,7 +2217,16 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
         break;
       }
     }
-    if(trackQuality && bestP05>=0)mesh=std::move(bestMesh);
+    if(trackQuality && bestP05>=0) {
+      // A provisional early snapshot must not replace a better completed run.
+      // Compare after allowing the remaining cycles to repair quality and sizing.
+      const auto completed=regionTracking?evaluateRegionQuality(mesh,cfg,regionCutoff):RegionQuality{};
+      if(!regionTracking || (qualityNonRegression(completed,bestRegion) &&
+          bestRegion.longEdges<=completed.longEdges && bestRegion.shortEdges<=completed.shortEdges))
+        mesh=std::move(bestMesh);
+      else
+        report.selectedCycle=report.cyclesExecuted-1;
+    }
     validate();
     float localErrorRatio=0;
     {
@@ -2132,7 +2243,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       static_assert(sizeof(bits) == sizeof(report.geometryErrorMax));
       std::memcpy(&report.geometryErrorMax, &bits, sizeof(bits));
     }
-    if (refine) {
+    if (refine || localSizing) {
       DeviceMesh d(mesh, ref);
       sync();
       const auto vertices = d.vertices.read();
@@ -2140,7 +2251,29 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
         mesh.targetLength[v] = vertices[v].target;
     }
     const float referenceAuditError=report.geometryErrorMax;
-    fillMeshMetrics(mesh, cfg, report, refine);
+    {
+      // The forward distance alone permits removal of a curved source region
+      // whose replacement is close to some other part of the source surface.
+      std::vector<ReferenceTriangleGpu> outputTriangles;
+      outputTriangles.reserve(mesh.faceCount());
+      for(int f=0;f<mesh.faceCount();++f)if(mesh.faceAlive[f])
+        outputTriangles.push_back({point(mesh.facePoint(f,0)),point(mesh.facePoint(f,1)),
+                                   point(mesh.facePoint(f,2)),int(mesh.facePatchId[f])});
+      std::vector<ReferenceBvhNode> outputTree;std::vector<int> outputIds;
+      buildReferenceBvh(outputTriangles,mesh.bboxDiagonal()*1.e-6f,outputTree,outputIds);
+      Buffer<ReferenceTriangleGpu> outputBuffer(outputTriangles);
+      Buffer<ReferenceBvhNode> outputNodes(outputTree);Buffer<int> outputOrder(outputIds);
+      ReferenceSurfaceGpu outputRef;outputRef.triangles=outputBuffer.p;
+      outputRef.count=int(outputTriangles.size());outputRef.nodes=outputNodes.p;
+      outputRef.nodeCount=int(outputTree.size());outputRef.triangleIds=outputOrder.p;
+      Buffer<unsigned int> maximum(1);checked(streamZero(maximum.p,0,sizeof(unsigned int)));
+      auditReferenceCoverage<<<(ref.count+127)/128,128,0,executionStream>>>(ref,outputRef,maximum.p);
+      sync();const auto bits=maximum.read()[0];
+      std::memcpy(&report.geometryErrorReverseMax,&bits,sizeof(float));
+    }
+    mesh.LocalSizing=localSizing;
+    if(localSizing)localSizing->apply(mesh);
+    fillMeshMetrics(mesh, cfg, report, refine || bool(localSizing));
     report.topologyValid = true;
     for (auto p : lockedBefore) {
       bool found = false;
@@ -2155,7 +2288,8 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
     report.constraintsHeld =
         report.movedLockedVertices == 0 && localErrorRatio <= 1.001f &&
         report.geometryErrorMax <=
-            cfg.maxGeometryError + mesh.bboxDiagonal() * 1.e-6f;
+            cfg.maxGeometryError + mesh.bboxDiagonal() * 1.e-6f &&
+        report.geometryErrorReverseMax <= cfg.maxGeometryError;
     report.seconds =
         std::chrono::duration<double>(Clock::now() - start).count();
     if(!options.quiet) {
@@ -2189,6 +2323,7 @@ bool remeshRawCuda(SemanticMesh &mesh, const RemeshConfig &cfg,
       *options.error="final raw CUDA geometry or locked-vertex constraints failed: reference="+
         std::to_string(referenceAuditError)+" analytic="+std::to_string(report.geometryErrorMax)+
         " locked="+std::to_string(report.movedLockedVertices)+
+        " reverse="+std::to_string(report.geometryErrorReverseMax)+
         " ratio="+std::to_string(localErrorRatio);
     return report.constraintsHeld;
   } catch (const std::exception &e) {

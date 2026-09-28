@@ -8,6 +8,15 @@
 namespace cad_adaptive {
 namespace {
 uint64_t EdgeKey(uint32_t a,uint32_t b){if(a>b)std::swap(a,b);return(uint64_t(a)<<32)|b;}
+bool SameOrientation(Vec3 a,Vec3 b,Vec3 c,Vec3 x,Vec3 y,Vec3 z){
+  const auto normal=[](Vec3 p,Vec3 q,Vec3 r){
+    const double u[3]={double(q.x)-p.x,double(q.y)-p.y,double(q.z)-p.z};
+    const double v[3]={double(r.x)-p.x,double(r.y)-p.y,double(r.z)-p.z};
+    return std::array<double,3>{u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]};
+  };
+  const auto n=normal(a,b,c),m=normal(x,y,z);
+  return n[0]*m[0]+n[1]*m[1]+n[2]*m[2]>0.;
+}
 }
 
 bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
@@ -15,7 +24,8 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
                               SemanticMesh& out,TriangleRefineStats& st,std::string* error,
                               const std::unordered_set<uint32_t>* onlyPatches,
                               bool projectNewVertices,
-                              const std::unordered_set<uint32_t>* forcePatches){
+                              const std::unordered_set<uint32_t>* forcePatches,
+                              bool sizeFeasibleSplits){
   st={}; st.InputFaces=in.faceCount();
   std::unordered_set<uint64_t> marked;
   for(const auto&e:in.edges){
@@ -46,11 +56,17 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
     if(!marked.count(key))continue;
     const Vec3 a=in.position(int(edge.v0)),b=in.position(int(edge.v1));
     float bestScore=-1.f;
+    float bestChildRatio=std::numeric_limits<float>::max();
+    bool bestFeasible=false;
     Vec3 bestPoint{};
-    for(float t:splitFractions) {
+    std::vector<float> fractions(std::begin(splitFractions),std::end(splitFractions));
+    const float h0=in.targetLength[edge.v0],h1=in.targetLength[edge.v1],hm=.5f*(h0+h1);
+    if(sizeFeasibleSplits && h0+h1>0)
+      fractions.push_back((h0+hm)/(h0+h1+2.f*hm));
+    auto considerFraction=[&](float t) {
       const Vec3 point=a+(b-a)*t;
       if((point.x==a.x&&point.y==a.y&&point.z==a.z) ||
-         (point.x==b.x&&point.y==b.y&&point.z==b.z))continue;
+         (point.x==b.x&&point.y==b.y&&point.z==b.z))return;
       float score=std::numeric_limits<float>::max();
       for(int f:{edge.face0,edge.face1}) {
         if(f<0)continue;
@@ -59,12 +75,36 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
         for(int v:tri)if(v!=int(edge.v0)&&v!=int(edge.v1)){opposite=v;break;}
         if(opposite<0)continue;
         const Vec3 c=in.position(opposite);
+        if(sizeFeasibleSplits && (!SameOrientation(a,b,c,a,point,c) ||
+                                  !SameOrientation(a,b,c,point,b,c))) {score=-1.f;break;}
         score=std::min(score,triangleQuality(a,point,c));
         score=std::min(score,triangleQuality(point,b,c));
       }
       // Slightly prefer a balanced split when child quality is comparable.
       score*=1.f-.05f*std::abs(t-.5f);
-      if(score>bestScore){bestScore=score;bestPoint=point;}
+      if(score<=0.f)return;
+      const float leftTarget=.5f*(h0+hm),rightTarget=.5f*(h1+hm);
+      const float childRatio=leftTarget>0 && rightTarget>0?
+          std::max(distance(a,point)/leftTarget,distance(point,b)/rightTarget):
+          std::numeric_limits<float>::max();
+      const bool feasible=childRatio<=cfg.splitRatio*(1.f+1.e-4f);
+      // Avoid repeatedly splitting a residual long child when a one-level
+      // solution exists. For a genuinely very long edge, first minimize the
+      // largest child ratio. Quality breaks ties and ranks feasible points.
+      const bool better=!sizeFeasibleSplits?score>bestScore:
+          (bestScore<0 || (feasible && !bestFeasible) ||
+           (feasible==bestFeasible && (feasible?score>bestScore:
+             childRatio<bestChildRatio-1.e-5f ||
+             (std::abs(childRatio-bestChildRatio)<=1.e-5f && score>bestScore))));
+      if(better){bestScore=score;bestPoint=point;bestChildRatio=childRatio;bestFeasible=feasible;}
+    };
+    for(float t:fractions)considerFraction(t);
+    if(sizeFeasibleSplits && !(bestScore>0.f)) {
+      // Float-coordinate slivers can have disconnected intervals of safe
+      // split positions. Exhausting a coarse grid is not a geometric proof
+      // that no split exists. Search a bounded finer dyadic grid before
+      // retaining this edge for another regional strategy.
+      for(int sample=1;sample<64;++sample)considerFraction(float(sample)/64.f);
     }
     if(!(bestScore>0.f))marked.erase(key);
     else splitPoints.emplace(key,bestPoint);
@@ -97,8 +137,11 @@ bool refineMidpointConforming(const SemanticMesh& in,const RemeshConfig& cfg,
         local[1][1]=local[2][0];
       }
     }
-    for(int q=0;q<refineTriNum[mask];++q)
+    for(int q=0;q<refineTriNum[mask];++q) {
       if(!(triangleQuality(p[local[q][0]],p[local[q][1]],p[local[q][2]])>0.f))return false;
+      if(sizeFeasibleSplits && !SameOrientation(p[0],p[1],p[2],
+          p[local[q][0]],p[local[q][1]],p[local[q][2]]))return false;
+    }
     return true;
   };
   bool removedUnsafe=true;

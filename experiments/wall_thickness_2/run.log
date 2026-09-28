@@ -1,0 +1,31 @@
+[CadMesh] CPU mode: CUDA disabled for fitting, boundaries and charts
+[CadMesh] STL import: 0.464231 s
+[CadMesh] topology: 15.0437 s
+[CadMesh] model neighbors: 0.278713 s
+[CadMesh] smooth components=360, certified=345
+[CadMesh] whole component fits: 159.146 s
+[CadMesh] provisional planar cells=561932
+[CadMesh] planar cells: 1.99042 s
+[CadMesh] narrow sampling links=65171 (soft partition barriers; mesh edges unchanged)
+[CadMesh] narrow sampling links: 1.75888 s
+[CadMesh] ruled strip candidates: attempts=256, support_faces=5200, accepted=141
+[CadMesh] ruled strip candidates: 126.322 s
+[CadMesh] cylinder/cone ring absorption: rounds=12, absolute_distance_limit=0.02, accepted_faces=4685, evaluations=8869, ambiguous=0, normal_limit_deg=10, relaxed_faces=6, normal_rejections=372, distance_rejections=3800, unreliable_rejections=0, stop=round_limit, budget_reached=yes
+[CadMesh] early cylinder/cone absorption: 0.0680595 s
+[CadMesh] after mother planes=2928
+[CadMesh] strict planar cores: 2.48113 s
+[CadMesh] analytic seeds=1000, patches=3257
+[CadMesh] analytic seeds=2000, patches=3527
+[CadMesh] analytic seeds=2500, after analytic growth=3663
+[CadMesh] analytic seed budget reached (2500); continuing with spatial residual reserve
+[CadMesh] analytic seed search: 5270.14 s
+[CadMesh] exposed component probes cumulative after analytic seed search: probes=2592, over_budget=581, over_budget_reuses=333, traversed_faces=2627526, traversal_seconds=1.20072, repeated_face_sets=1354, different_order=1354, exact_failure_reuses=0, selector_calls=2011, selector_seconds=4465.7, cached_components=645
+[CadMesh] after mother planes=3928
+[CadMesh] mother planes: 1.33954 s
+[CadMesh] residual reserve seeds=1250/1250, spatial components=281, committed=221
+[CadMesh] residual seed search: 2583.86 s
+[CadMesh] exposed component probes cumulative after residual seed search: probes=3238, over_budget=634, over_budget_reuses=363, traversed_faces=3118337, traversal_seconds=1.39693, repeated_face_sets=1706, different_order=1697, exact_failure_reuses=9, selector_calls=2595, selector_seconds=5572.66, cached_components=736
+[CadMesh] cylinder/cone ring absorption: rounds=12, absolute_distance_limit=0.02, accepted_faces=17700, evaluations=43625, ambiguous=10, normal_limit_deg=10, relaxed_faces=44, normal_rejections=2045, distance_rejections=23754, unreliable_rejections=0, stop=round_limit, budget_reached=yes
+[CadMesh] residual cylinder/cone absorption: 0.285378 s
+[CadMesh] long-side sliver assignments=704
+[CadMesh] long-side sliver assignment: 0.0380272 s

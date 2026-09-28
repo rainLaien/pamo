@@ -18,6 +18,16 @@ struct AnalyticSeedBatch {
   int Iterations = 0;
 };
 
+struct CudaThicknessBvhNode {
+  double Bounds[6]{};
+  int Children[2]{-1,-1};
+  int FirstFace=0,FaceCount=0;
+};
+struct CudaThicknessRaySeed {
+  int Face=-1;
+  double Distance=0,U=0,V=0;
+};
+
 // A session enables CUDA nonlinear seed refinement for this thread only.
 // Small model initialization solves and full geometric certificates stay in
 // the existing fitters. No CUDA SDK is needed to build the C++ library.
@@ -57,5 +67,15 @@ bool ClassifyLongEdgesCudaRuntime(
     const std::vector<std::array<int, 2>> &edges, double maximumEdgeLength,
     std::vector<unsigned char> &selected,
     std::vector<std::array<double, 3>> &midpoints, std::string &error);
+
+// One GPU thread per vertex finds the first nonincident triangle along its
+// inward normal. CPU sphere shrinking and certification consume these seeds.
+bool FindWallThicknessRaySeedsCuda(
+    const std::vector<std::array<double,3>> &vertices,
+    const std::vector<std::array<double,3>> &inwardNormals,
+    const std::vector<std::array<int,3>> &triangles,
+    const std::vector<CudaThicknessBvhNode> &nodes,
+    const std::vector<int> &leafFaceIds,
+    std::vector<CudaThicknessRaySeed> &seeds,std::string &error);
 
 } // namespace CadMesh
